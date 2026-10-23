@@ -1,0 +1,382 @@
+import os
+import sys
+import time
+import json
+import hashlib
+import subprocess
+from datetime import datetime
+
+try:
+    import requests
+except ImportError:
+    print("กำลังติดตั้งไลบรารี requests...")
+    subprocess.run([sys.executable, "-m", "pip", "install", "requests"])
+    import requests
+
+# ================= ตั้งค่าสีหน้าจอ =================
+CYAN = "\033[96m"
+BRIGHT_CYAN = "\033[1;96m"
+BOLD_WHITE = "\033[1;97m"
+GREEN = "\033[92m"
+YELLOW = "\033[93m"
+RED = "\033[91m"
+RESET = "\033[0m"
+
+CONFIG_FILE = "original_config.json"
+PACKAGE_NAME = "com.roblox.client"
+
+DEFAULT_CONFIG = {
+    "place_id": "",
+    "vip_link_code": "",
+    "webhook_url": "",
+    "screenshot_minutes": 10,
+    "check_interval": 15,
+    "freeze_limit": 3  # จำนวนรอบที่ภาพนิ่งสนิทติดต่อกันถึงจะถือว่าเกมค้าง (3 รอบ x 15 วิ = 45 วินาที)
+}
+
+# ================= จัดการการตั้งค่าและคำสั่ง Root =================
+def load_config():
+    if os.path.exists(CONFIG_FILE):
+        try:
+            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                for k, v in DEFAULT_CONFIG.items():
+                    if k not in data:
+                        data[k] = v
+                return data
+        except Exception:
+            return DEFAULT_CONFIG.copy()
+    return DEFAULT_CONFIG.copy()
+
+def save_config(cfg):
+    with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+        json.dump(cfg, f, indent=4, ensure_ascii=False)
+
+def log(msg, color=CYAN):
+    now = datetime.now().strftime("%H:%M:%S")
+    print(f"{color}[{now}] {msg}{RESET}")
+
+def run_root_text(cmd):
+    """รันคำสั่งด้วยสิทธิ์ Root และคืนค่าเป็นข้อความ"""
+    try:
+        res = subprocess.run(
+            ["su", "-c", cmd],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=15
+        )
+        return res.stdout.strip()
+    except Exception:
+        return ""
+
+# ================= ระบบแคปหน้าจอและส่ง Webhook =================
+def capture_screenshot_bytes():
+    """แคปหน้าจอมือถือผ่านสิทธิ์ Root"""
+    try:
+        cmd = "screencap -p /sdcard/orig_screen.png && cat /sdcard/orig_screen.png"
+        res = subprocess.run(
+            ["su", "-c", cmd],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=20
+        )
+        if res.returncode == 0 and res.stdout:
+            return res.stdout
+    except Exception as e:
+        log(f"แคปหน้าจอไม่สำเร็จ: {e}", RED)
+    return None
+
+def send_webhook_report(cfg, message, include_screenshot=False):
+    """ส่งแจ้งเตือนและภาพแคปหน้าจอเข้า Discord"""
+    url = cfg.get("webhook_url", "").strip()
+    if not url:
+        return
+
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    content = (
+        f"🤖 **[ORIGINAL REPORT]** (`{now_str}`)\n"
+        f"📌 **สถานะ:** {message}\n"
+        f"🎮 **Place ID:** `{cfg.get('place_id') or '-'}`"
+    )
+
+    try:
+        if include_screenshot:
+            img_bytes = capture_screenshot_bytes()
+            if img_bytes:
+                files = {"file": ("screenshot.png", img_bytes, "image/png")}
+                data = {"content": content}
+                requests.post(url, data=data, files=files, timeout=20)
+                log("ส่งรายงานพร้อมรูปแคปหน้าจอเข้า Discord แล้ว", GREEN)
+                return
+
+        requests.post(url, json={"content": content}, timeout=15)
+        log("ส่งข้อความแจ้งเตือนเข้า Discord แล้ว", GREEN)
+    except Exception as e:
+        log(f"ส่ง Webhook ไม่สำเร็จ: {e}", RED)
+
+# ================= ระบบตรวจเช็คสถานะเชิงลึก (Advanced Detection) =================
+def check_internet_connection():
+    """1. เช็คว่าเน็ตมือถือหลุดหรือไม่"""
+    res = run_root_text("ping -c 1 -W 3 8.8.8.8")
+    return "1 received" in res or "1 packets received" in res
+
+def is_roblox_running():
+    """2. เช็คว่าโปรเซสเกมยังเปิดอยู่หรือไม่"""
+    pid = run_root_text(f"pidof {PACKAGE_NAME}")
+    return bool(pid)
+
+def get_latest_roblox_log():
+    """ดึงข้อมูล 150 บรรทัดสุดท้ายจากไฟล์ Log ของ Roblox โดยตรง"""
+    cmd = (
+        f"LOG_DIR=/data/data/{PACKAGE_NAME}/files/appData/logs; "
+        f"LATEST=$(ls -t $LOG_DIR/*.log 2>/dev/null | head -n 1); "
+        f"if [ -n \"$LATEST\" ]; then tail -n 150 \"$LATEST\"; fi"
+    )
+    return run_root_text(cmd)
+
+def analyze_game_health(cfg, freeze_state):
+    """
+    วิเคราะห์อาการผิดปกติของเกมทุกชนิด:
+    คืนค่า (สถานะปกติหรือไม่: bool, สาเหตุที่หลุด: str)
+    """
+    target_place_id = str(cfg.get("place_id", "")).strip()
+
+    # 1. เช็คแอปเด้งปิดตัวไปเอง
+    if not is_roblox_running():
+        return False, "แอป Roblox ปิดตัวลง (App Crashed / Closed)"
+
+    # 2. เช็คอาการแอปค้างระดับระบบ Android (ANR / Not Responding)
+    dumpsys_focus = run_root_text("dumpsys window windows | grep -E 'mCurrentFocus|mFocusedApp'")
+    if "Application Not Responding" in dumpsys_focus:
+        return False, "ตัวเกมค้างไม่ตอบสนอง (System ANR)"
+    if PACKAGE_NAME not in dumpsys_focus and "com.roblox" not in dumpsys_focus:
+        return False, "หน้าจอหลุดโฟกัสจากเกม Roblox (เด้งออกหน้าโฮม/แอปอื่นทับ)"
+
+    # 3. ตรวจสอบจากไฟล์ Log เชิงลึกของ Roblox (แม่นยำที่สุด)
+    log_text = get_latest_roblox_log()
+    if log_text:
+        log_lower = log_text.lower()
+
+        # 3.1 เช็คคนเข้าไอดีซ้อน (Error 273 / Same account launched)
+        if "273" in log_lower and ("same account" in log_lower or "different device" in log_lower or "disconnect" in log_lower):
+            return False, "ตรวจพบการเข้าไอดีซ้อนจากเครื่องอื่น! (Error Code: 273)"
+
+        # 3.2 เช็คโดนเตะ / แบน / Error 267, 268
+        if "error code: 267" in log_lower or "kicked from experience" in log_lower or "you were kicked" in log_lower:
+            return False, "ถูกเตะออกจากแมพ (Error Code: 267 / Kicked)"
+        if "error code: 268" in log_lower or "unexpected client behavior" in log_lower:
+            return False, "เซิร์ฟเวอร์เตะเนื่องจากพฤติกรรมไคลเอนต์ (Error Code: 268)"
+
+        # 3.3 เช็คเน็ตกระตุก / เซิร์ฟเวอร์ตัดการเชื่อมต่อ (Error 277, 279)
+        disconnect_signals = [
+            "lost connection to the game server",
+            "connection attempt failed",
+            "disconnected from game",
+            "idledisconnect",
+            "error code: 277",
+            "error code: 279"
+        ]
+        for sig in disconnect_signals:
+            if sig in log_lower:
+                return False, f"หลุดออกจากเซิร์ฟเวอร์ ({sig})"
+
+        # 3.4 เช็คว่าเด้งกลับออกมาหน้า Lobby (LuaApp) หรือเข้าผิดแมพหรือไม่
+        if "leaving game" in log_lower or "destructing datamodel" in log_lower:
+            # เช็คว่าบรรทัดล่างสุดหลังจาก Leaving game ได้เข้าแมพใหม่หรือยัง
+            last_lines = "\n".join(log_lower.splitlines()[-30:])
+            if "joining game" not in last_lines and "placeid" not in last_lines:
+                return False, "ตัวละครเด้งออกกลับมาหน้าล็อบบี้หลักของ Roblox"
+
+        # 3.5 เช็คว่าเข้าถูก Place ID หรือไม่ (กรณีโดนเทเลพอร์ตไปแมพอื่นที่ไม่ต้องการ)
+        if target_place_id:
+            # ค้นหาบรรทัดที่ระบุ placeId ล่าสุดใน Log
+            for line in reversed(log_text.splitlines()):
+                if "placeId:" in line or "placeid=" in line.lower():
+                    if target_place_id not in line:
+                        # ตรวจสอบว่าไม่ใช่ Place ID ที่ตั้งไว้
+                        return False, f"ตรวจพบการอยู่ในแมพอื่นที่ไม่ใช่ Place ID: {target_place_id}"
+                    break
+
+    # 4. เช็คหน้าต่างแจ้งเตือนบนหน้าจอ (UI Dump เสริมกรณี Log ยังไม่อัปเดต)
+    ui_xml = run_root_text("uiautomator dump /sdcard/orig_ui.xml && cat /sdcard/orig_ui.xml")
+    if ui_xml:
+        ui_lower = ui_xml.lower()
+        if "same account" in ui_lower or "273" in ui_lower:
+            return False, "ตรวจพบคนเข้าไอดีซ้อนบนหน้าจอ (Error 273)"
+        for kw in ["disconnected", "reconnect", "error code", "ตัดการเชื่อมต่อ", "เชื่อมต่อใหม่", "รหัสข้อผิดพลาด"]:
+            if kw in ui_lower:
+                return False, f"ตรวจพบหน้าต่างแจ้งเตือนหลุดออกจากเกม ({kw})"
+
+    # 5. เช็คภาพหน้าจอค้างนิ่งสนิท (Screen Freeze Detection)
+    img_bytes = capture_screenshot_bytes()
+    if img_bytes:
+        current_hash = hashlib.md5(img_bytes).hexdigest()
+        if current_hash == freeze_state["last_hash"]:
+            freeze_state["count"] += 1
+            log(f"เตือน: ภาพหน้าจอนิ่งสนิทไม่ขยับ ({freeze_state['count']}/{cfg['freeze_limit']})", YELLOW)
+            if freeze_state["count"] >= cfg["freeze_limit"]:
+                freeze_state["count"] = 0
+                return False, "ภาพหน้าจอเกมค้างนิ่งสนิทเกินเวลาที่กำหนด (Game Frozen)"
+        else:
+            freeze_state["last_hash"] = current_hash
+            freeze_state["count"] = 0
+
+    return True, "ปกติ"
+
+# ================= คำสั่งดึงเข้าเกมใหม่ (Rejoin) =================
+def join_roblox(cfg):
+    place_id = cfg.get("place_id", "").strip()
+    vip_code = cfg.get("vip_link_code", "").strip()
+
+    log("กำลังบังคับปิดเกมและเคลียร์ไฟล์ Log เก่า...", YELLOW)
+    run_root_text(f"am force-stop {PACKAGE_NAME}")
+    # ลบไฟล์ Log เก่าเพื่อไม่ให้บอทอ่านเจอข้อความ Error ซ้ำของรอบที่แล้ว
+    run_root_text(f"rm -rf /data/data/{PACKAGE_NAME}/files/appData/logs/*.log")
+    time.sleep(3)
+
+    if vip_code:
+        deep_link = f"roblox://placeId={place_id}&linkCode={vip_code}"
+    else:
+        deep_link = f"roblox://placeId={place_id}"
+
+    cmd = f'am start -a android.intent.action.VIEW -d "{deep_link}" {PACKAGE_NAME}'
+    run_root_text(cmd)
+    log(f"ยิงคำสั่งเข้าแมพ {place_id} สำเร็จ! รอโหลดเข้าเกม 35 วินาที...", GREEN)
+    time.sleep(35)
+
+# ================= หน้าตาเมนูหลัก (ORIGINAL) =================
+def print_ui(cfg):
+    os.system("clear")
+    banner = f"""{BRIGHT_CYAN} ██████╗ ██████╗ ██╗ ██████╗ ██╗███╗   ██╗ █████╗ ██╗     
+██╔═══██╗██╔══██╗██║██╔════╝ ██║████╗  ██║██╔══██╗██║     
+██║   ██║██████╔╝██║██║  ███╗██║██╔██╗ ██║███████║██║     
+██║   ██║██╔══██╗██║██║   ██║██║██║╚██╗██║██╔══██║██║     
+╚██████╔╝██║  ██║██║╚██████╔╝██║██║ ╚████║██║  ██║███████╗
+ ╚═════╝ ╚═╝  ╚═╝╚═╝ ╚═════╝ ╚═╝╚═╝  ╚═══╝╚═╝  ╚═╝╚══════╝{RESET}
+{BOLD_WHITE}R O B L O X   S M A R T   R E J O I N{RESET}
+{CYAN}Termux  •  Rooted  •  Android{RESET}
+{BRIGHT_CYAN}──────────────────────────────────────────────────────────{RESET}
+{CYAN}• Place ID ปัจจุบัน :{RESET} {BOLD_WHITE}{cfg['place_id'] or 'ยังไม่ได้ตั้งค่า'}{RESET}
+{CYAN}• Webhook รายงานผล:{RESET} {BOLD_WHITE}{'ตั้งค่าแล้ว' if cfg['webhook_url'] else 'ยังไม่ได้ตั้งค่า'} (แคปจอทุกๆ {cfg['screenshot_minutes']} นาที){RESET}
+{CYAN}• ระบบตรวจจับ      :{RESET} {GREEN}แอปเด้ง | เน็ตหลุด | เกมค้าง | เข้าซ้อน | ผิดแมพ (No Anti-AFK){RESET}
+{BRIGHT_CYAN}──────────────────────────────────────────────────────────{RESET}
+
+{BOLD_WHITE}1) ตั้งค่าแมพที่จะ Rejoin (ใส่ Place ID / VIP Server)
+2) ตั้งค่า Discord Webhook และเวลาแคปหน้าจอรายงานผล
+3) เริ่มการทำงานโปรแกรม Auto Rejoin
+0) ออกจากโปรแกรม{RESET}
+"""
+    print(banner)
+
+# ================= การทำงานของทั้ง 3 เมนู =================
+def menu_1_set_map(cfg):
+    print(f"\n{BRIGHT_CYAN}--- [1] ตั้งค่าแมพสำหรับ Rejoin ---{RESET}")
+    pid = input(f"ใส่เลข Place ID [{cfg['place_id']}]: ").strip()
+    if pid:
+        cfg['place_id'] = pid
+
+    vip = input("ใส่ VIP Link Code (ถ้าเข้าเซิร์ฟปกติให้กด Enter ข้าม): ").strip()
+    cfg['vip_link_code'] = vip
+
+    save_config(cfg)
+    print(f"{GREEN}✔ บันทึก Place ID: {cfg['place_id']} เรียบร้อย!{RESET}")
+    time.sleep(1.5)
+
+def menu_2_set_webhook(cfg):
+    print(f"\n{BRIGHT_CYAN}--- [2] ตั้งค่า Discord Webhook แคปหน้าจอ ---{RESET}")
+    url = input("วางลิงก์ Discord Webhook (กด Enter เพื่อใช้ค่าเดิม): ").strip()
+    if url:
+        cfg['webhook_url'] = url
+
+    mins = input(f"ต้องการให้แคปหน้าจอส่งรายงานทุกๆ กี่นาที [{cfg['screenshot_minutes']}]: ").strip()
+    if mins.isdigit() and int(mins) > 0:
+        cfg['screenshot_minutes'] = int(mins)
+
+    save_config(cfg)
+    print(f"{GREEN}✔ บันทึกการตั้งค่าเรียบร้อย (แคปจอทุกๆ {cfg['screenshot_minutes']} นาที){RESET}")
+
+    if cfg['webhook_url']:
+        test = input("ต้องการทดสอบแคปหน้าจอส่งเข้า Discord ตอนนี้เลยไหม? (y/n): ").strip().lower()
+        if test == "y":
+            log("กำลังแคปหน้าจอและส่งไปที่ Discord...", YELLOW)
+            send_webhook_report(cfg, "ทดสอบระบบแคปหน้าจอจากโปรแกรม ORIGINAL", include_screenshot=True)
+            input("\nกด Enter เพื่อกลับสู่เมนูหลัก...")
+
+def menu_3_start_rejoin(cfg):
+    if not cfg['place_id']:
+        print(f"\n{RED}✘ กรุณาตั้งค่า Place ID ในเมนูที่ 1 ก่อนเริ่มทำงานครับ!{RESET}")
+        time.sleep(2)
+        return
+
+    print(f"\n{BRIGHT_CYAN}--- [3] เริ่มระบบ Smart Auto Rejoin ---{RESET}")
+    print(f"{YELLOW}(กดปุ่ม Ctrl + C เพื่อหยุดการทำงานและกลับสู่เมนู){RESET}\n")
+
+    subprocess.run(["termux-wake-lock"], stderr=subprocess.DEVNULL)
+
+    screenshot_interval_sec = cfg['screenshot_minutes'] * 60
+    last_screenshot_time = time.time()
+    freeze_state = {"last_hash": "", "count": 0}
+
+    # ถ้าตอนกดเริ่ม เกมยังไม่ได้เปิด ให้สั่งเปิดเข้าแมพทันที
+    if not is_roblox_running():
+        log("ยังไม่ได้เปิดเกม กำลังสั่งเข้าแมพครั้งแรก...", CYAN)
+        join_roblox(cfg)
+
+    send_webhook_report(cfg, "🟢 เริ่มเดินระบบเฝ้าจอ Smart Auto Rejoin แล้ว", include_screenshot=True)
+
+    try:
+        while True:
+            # 1. เช็คการเชื่อมต่ออินเทอร์เน็ตของเครื่องก่อน
+            if not check_internet_connection():
+                log("⚠️ ตรวจพบว่าอินเทอร์เน็ตของมือถือหลุด! กำลังรอสัญญาณเน็ตกลับมา...", RED)
+                time.sleep(10)
+                continue
+
+            # 2. ตรวจเช็คสุขภาพของเกมทุกด้าน (เด้ง, ค้าง, เน็ตเกมหลุด, เข้าซ้อน, ผิดแมพ)
+            is_healthy, reason = analyze_game_health(cfg, freeze_state)
+
+            if not is_healthy:
+                log(f"⚠️ ตรวจพบปัญหา: {reason}", RED)
+                send_webhook_report(cfg, f"⚠️ **ตรวจพบปัญหา:** {reason}\n🔄 กำลังทำการ Rejoin เข้าแมพใหม่...", include_screenshot=True)
+
+                # สั่งดึงเข้าเกมใหม่
+                join_roblox(cfg)
+                freeze_state = {"last_hash": "", "count": 0}
+
+                send_webhook_report(cfg, f"✅ **Rejoin สำเร็จแล้ว** (สาเหตุก่อนหน้า: {reason})", include_screenshot=True)
+                last_screenshot_time = time.time()
+                continue
+
+            # 3. เช็คเวลาแคปหน้าจอส่งรายงานเข้า Discord ตามรอบนาทีที่ตั้งไว้
+            if cfg['webhook_url'] and (time.time() - last_screenshot_time >= screenshot_interval_sec):
+                log(f"ครบกำหนด {cfg['screenshot_minutes']} นาที กำลังแคปหน้าจอส่งรายงาน...", CYAN)
+                send_webhook_report(cfg, f"📸 รายงานสถานะหน้าจอประจำรอบ ({cfg['screenshot_minutes']} นาที) - เกมทำงานปกติ", include_screenshot=True)
+                last_screenshot_time = time.time()
+
+            time.sleep(cfg['check_interval'])
+
+    except KeyboardInterrupt:
+        subprocess.run(["termux-wake-unlock"], stderr=subprocess.DEVNULL)
+        log("หยุดการทำงานกลับสู่เมนูหลัก...", YELLOW)
+        time.sleep(1)
+
+# ================= ลูปหลักของโปรแกรม =================
+def main():
+    cfg = load_config()
+    while True:
+        print_ui(cfg)
+        choice = input(f"{BOLD_WHITE}เลือกเมนู: {RESET}").strip()
+
+        if choice == "1":
+            menu_1_set_map(cfg)
+        elif choice == "2":
+            menu_2_set_webhook(cfg)
+        elif choice == "3":
+            menu_3_start_rejoin(cfg)
+        elif choice == "0":
+            print(f"\n{CYAN}ออกจากโปรแกรม ORIGINAL เรียบร้อย{RESET}")
+            sys.exit(0)
+
+if __name__ == "__main__":
+    main()
