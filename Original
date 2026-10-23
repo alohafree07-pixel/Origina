@@ -187,7 +187,7 @@ def print_ui(cfg):
 
 {BOLD_WHITE}1) ตั้งค่าแมพที่จะ Rejoin (ใส่ Place ID / VIP Server)
 2) ตั้งค่า Discord Bot Token & Channel ID
-3) เริ่มเดินระบบบอทเฝ้าจอ (มีปุ่มสั่งการผ่าน Discord)
+3) เริ่มเดินระบบบอทเฝ้าจอ (มี 9 ปุ่มกดใน Discord)
 4) ตั้งค่าเวลา Auto Clear RAM (กันเกมเด้ง)
 0) ออกจากโปรแกรม{RESET}
 """
@@ -265,31 +265,7 @@ def menu_3_start_bot(cfg):
             await join_roblox_async(cfg)
             await send_bot_report(channel, f"✅ เปลี่ยนเป็นแมพ `{cfg['place_id']}` เสร็จสิ้น", True)
 
-    # ================= หน้าต่าง Popup สำหรับแก้ไขการตั้งค่ารวม =================
-    class SettingsModal(discord.ui.Modal, title='⚙️ แก้ไขการตั้งค่าโปรแกรม (Settings)'):
-        def __init__(self):
-            super().__init__()
-            self.inp_pid = discord.ui.TextInput(label='Place ID ปัจจุบัน', default=str(cfg.get('place_id', '')), required=True)
-            self.inp_sm = discord.ui.TextInput(label='รอบแคปหน้าจอส่งเข้าดิส (นาที)', default=str(cfg.get('screenshot_minutes', 10)), required=True)
-            self.inp_rh = discord.ui.TextInput(label='รอบ Auto Clear RAM (ชั่วโมง)', default=str(cfg.get('clear_ram_hours', 1.0)), required=True)
-            
-            self.add_item(self.inp_pid)
-            self.add_item(self.inp_sm)
-            self.add_item(self.inp_rh)
-
-        async def on_submit(self, interaction: discord.Interaction):
-            cfg['place_id'] = self.inp_pid.value
-            try: cfg['screenshot_minutes'] = int(self.inp_sm.value)
-            except: pass
-            try: cfg['clear_ram_hours'] = float(self.inp_rh.value)
-            except: pass
-            save_config(cfg)
-            
-            summary = f"✅ **อัปเดตการตั้งค่าเรียบร้อย! (มีผลทันที)**\n🎮 Place ID: `{cfg['place_id']}`\n📸 แคปจอทุก: `{cfg['screenshot_minutes']}` นาที\n🧹 เคลียร์ RAM ทุก: `{cfg['clear_ram_hours']}` ชั่วโมง"
-            await interaction.response.send_message(summary, ephemeral=True)
-            log("อัปเดตการตั้งค่าระบบผ่าน Discord สำเร็จ", GREEN)
-
-    # ================= คลาสสำหรับสร้างปุ่มกด 10 ปุ่ม =================
+    # ================= คลาสสำหรับสร้างปุ่มกด 9 ปุ่ม =================
     class ControlView(discord.ui.View):
         def __init__(self):
             super().__init__(timeout=None) 
@@ -360,11 +336,6 @@ def menu_3_start_bot(cfg):
             run_root_text(f"rm -rf /data/data/{PACKAGE_NAME}/files/appData/logs/*.log")
             await interaction.response.send_message("🗑️ ลบไฟล์ขยะ Log ของเกม Roblox เรียบร้อย ได้พื้นที่คืน!", ephemeral=True)
 
-        # --- แถวที่ 4: ปุ่ม Settings (แก้ไขการตั้งค่า) ---
-        @discord.ui.button(label="⚙️ Edit Settings", style=discord.ButtonStyle.secondary, row=3, custom_id="btn_settings")
-        async def btn_settings(self, interaction: discord.Interaction, button: discord.ui.Button):
-            await interaction.response.send_modal(SettingsModal())
-
     async def send_bot_report(channel, message, include_screenshot=False):
         now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         pause_tag = " ⏸️ `[PAUSED]`" if state["paused"] else ""
@@ -398,7 +369,9 @@ def menu_3_start_bot(cfg):
 
     @tasks.loop(seconds=cfg['check_interval'])
     async def game_monitor_loop():
-        if state.get("paused", False): return
+        # ถ้าระบบอยู่ในสถานะ Paused ให้ข้ามการทำงานเช็คเน็ต/เกมเด้งไปเลย
+        if state.get("paused", False):
+            return
 
         channel = bot.get_channel(int(cfg['channel_id']))
         
