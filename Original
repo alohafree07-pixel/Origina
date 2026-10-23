@@ -134,7 +134,8 @@ def analyze_game_health(cfg, freeze_state):
 
     dumpsys_focus = run_root_text("dumpsys window windows | grep -E 'mCurrentFocus|mFocusedApp'")
     if "Application Not Responding" in dumpsys_focus: return False, "ตัวเกมค้างไม่ตอบสนอง (System ANR)"
-    if PACKAGE_NAME not in dumpsys_focus and "com.roblox" not in dumpsys_focus: return False, "หน้าจอหลุดโฟกัสจากเกม (เด้งออกแอปอื่นทับ)"
+    
+    # ❌ ลบการเช็คหน้าจอหลุดโฟกัสออกไปแล้ว เพื่อไม่ให้ตีกันกับหน้าต่างของ Executor / Script ❌
 
     log_text = get_latest_roblox_log()
     if log_text:
@@ -182,23 +183,6 @@ def analyze_game_health(cfg, freeze_state):
             freeze_state["count"] = 0
 
     return True, "ปกติ"
-
-def join_roblox(cfg):
-    place_id = cfg.get("place_id", "").strip()
-    vip_code = cfg.get("vip_link_code", "").strip()
-
-    log("กำลังบังคับปิดเกมและเคลียร์ไฟล์ Log เก่า...", YELLOW)
-    run_root_text(f"am force-stop {PACKAGE_NAME}")
-    run_root_text(f"rm -rf /data/data/{PACKAGE_NAME}/files/appData/logs/*.log")
-    time.sleep(3)
-
-    if vip_code: deep_link = f"roblox://placeId={place_id}&linkCode={vip_code}"
-    else: deep_link = f"roblox://placeId={place_id}"
-
-    cmd = f'am start -a android.intent.action.VIEW -d "{deep_link}" {PACKAGE_NAME}'
-    run_root_text(cmd)
-    log(f"ยิงคำสั่งเข้าแมพ {place_id} สำเร็จ! รอโหลดเข้าเกม 35 วินาที...", GREEN)
-    time.sleep(35)
 
 # ================= หน้าตาเมนูหลัก (ORIGINAL) =================
 def print_ui(cfg):
