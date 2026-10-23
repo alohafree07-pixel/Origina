@@ -85,7 +85,7 @@ def capture_screenshot_bytes():
     except: pass
     return None
 
-# ================= ระบบ Discord Bot =================
+# ================= ดึงข้อมูลสถานะเครื่อง =================
 def get_discord_embed(dev_name):
     try:
         with open('/proc/stat', 'r') as f: s1 = [int(i) for i in f.readline().split()[1:8]]
@@ -112,7 +112,7 @@ def get_discord_embed(dev_name):
         uptime_hrs = round(up_sec / 3600, 2)
     except: uptime_hrs = 0
 
-    embed = discord.Embed(color=0x3498db) # สีฟ้า
+    embed = discord.Embed(color=0x3498db)
     embed.add_field(name="🔹 Device Name", value=f"`{dev_name}`", inline=True)
     embed.add_field(name="⚙️ CPU Usage", value=f"`{cpu_usage}%`", inline=True)
     embed.add_field(name="💾 Memory Usage", value=f"`{mem_usage_pct}%`", inline=True)
@@ -185,7 +185,7 @@ def print_ui(cfg):
 
 {BOLD_WHITE}1) ตั้งค่าแมพที่จะ Rejoin (ใส่ Place ID / VIP Server)
 2) ตั้งค่า Discord Bot Token & Channel ID
-3) เริ่มเดินระบบบอทเฝ้าจอ (รับคำสั่งผ่าน Discord)
+3) เริ่มเดินระบบบอทเฝ้าจอ (มีปุ่มกดใน Discord)
 4) ตั้งค่าเวลา Auto Clear RAM (กันเกมเด้ง)
 0) ออกจากโปรแกรม{RESET}
 """
@@ -226,13 +226,12 @@ def menu_4_ram(cfg):
 
 def menu_3_start_bot(cfg):
     if not cfg['place_id'] or not cfg['bot_token'] or not cfg['channel_id']:
-        print(f"\n{RED}✘ กรุณาตั้งค่า Place ID และ Bot Token ในเมนูที่ 1 และ 2 ก่อนครับ!{RESET}")
+        print(f"\n{RED}✘ กรุณาตั้งค่า Place ID และ Bot Token ก่อนครับ!{RESET}")
         time.sleep(2)
         return
 
     print(f"\n{BRIGHT_CYAN}--- [3] เริ่มระบบ Discord Bot Auto Rejoin ---{RESET}")
-    print(f"{YELLOW}บอทกำลังรัน... คุณสามารถพิมพ์คำสั่งใน Discord ได้เลย{RESET}")
-    print(f"{YELLOW}(คำสั่ง: !status, !rejoin, !setmap, !stopgame){RESET}")
+    print(f"{YELLOW}บอทกำลังรัน... คุณสามารถกดปุ่มสั่งงานใน Discord ได้เลย{RESET}")
     print(f"{YELLOW}(กดปุ่ม CTRL + c บน Termux เพื่อหยุดบอทและกลับสู่เมนูหลัก){RESET}\n")
 
     subprocess.run(["termux-wake-lock"], stderr=subprocess.DEVNULL)
@@ -242,25 +241,49 @@ def menu_3_start_bot(cfg):
     intents.message_content = True
     bot = commands.Bot(command_prefix="!", intents=intents)
 
-    # Variables for loops
     state = {
         "last_screenshot": time.time(),
         "last_ram_clear": time.time()
     }
 
+    # ================= คลาสสำหรับสร้างปุ่มกด (Discord UI) =================
+    class ControlView(discord.ui.View):
+        def __init__(self):
+            super().__init__(timeout=None) # ปุ่มจะไม่หมดอายุ
+
+        @discord.ui.button(label="📊 Get Stats", style=discord.ButtonStyle.primary, custom_id="btn_stats")
+        async def btn_stats(self, interaction: discord.Interaction, button: discord.ui.Button):
+            log("ได้รับคำสั่งเช็คสถานะจากปุ่มกด", YELLOW)
+            await interaction.response.defer() # ป้องกันบอทขึ้น Interaction failed
+            await send_bot_report(interaction.channel, "📊 สถานะปัจจุบัน (เรียกดูจากปุ่มกด)", True)
+
+        @discord.ui.button(label="🔄 Force Rejoin", style=discord.ButtonStyle.success, custom_id="btn_rejoin")
+        async def btn_rejoin(self, interaction: discord.Interaction, button: discord.ui.Button):
+            log("ได้รับคำสั่ง Rejoin จากปุ่มกด", YELLOW)
+            await interaction.response.send_message("🔄 กำลังบังคับ Rejoin เข้าเกมใหม่...", ephemeral=True)
+            await join_roblox_async(cfg)
+            await send_bot_report(interaction.channel, "✅ บังคับ Rejoin จากปุ่มกดเสร็จสิ้น", True)
+
+        @discord.ui.button(label="🛑 Stop Game", style=discord.ButtonStyle.danger, custom_id="btn_stop")
+        async def btn_stop(self, interaction: discord.Interaction, button: discord.ui.Button):
+            log("ได้รับคำสั่งหยุดเกมจากปุ่มกด", YELLOW)
+            run_root_text(f"am force-stop {PACKAGE_NAME}")
+            await interaction.response.send_message("🛑 สั่งบังคับปิดแอป Roblox แล้ว (บอทยังออนไลน์รอคำสั่ง)", ephemeral=True)
+
     async def send_bot_report(channel, message, include_screenshot=False):
         now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         content = f"🤖 **[ORIGINAL REPORT]** (`{now_str}`)\n📌 **สถานะ:** {message}\n🎮 **Place ID:** `{cfg['place_id']}`"
         embed = get_discord_embed(dev_name)
+        view = ControlView() # แนบปุ่มกดไปพร้อมกับข้อความ
         
         try:
             if include_screenshot:
                 img_bytes = capture_screenshot_bytes()
                 if img_bytes:
                     file = discord.File(io.BytesIO(img_bytes), filename="screenshot.png")
-                    await channel.send(content=content, embed=embed, file=file)
+                    await channel.send(content=content, embed=embed, file=file, view=view)
                     return
-            await channel.send(content=content, embed=embed)
+            await channel.send(content=content, embed=embed, view=view)
         except Exception as e:
             log(f"ส่งรายงานพลาด: {e}", RED)
 
@@ -269,7 +292,7 @@ def menu_3_start_bot(cfg):
         log(f"✅ เชื่อมต่อบอท Discord: {bot.user.name} สำเร็จ!", GREEN)
         channel = bot.get_channel(int(cfg['channel_id']))
         if channel:
-            await send_bot_report(channel, "🟢 เริ่มเดินระบบเฝ้าจอ Auto Rejoin แล้ว! (รองรับคำสั่ง !status, !rejoin, !setmap, !stopgame)")
+            await send_bot_report(channel, "🟢 เริ่มเดินระบบเฝ้าจอ Auto Rejoin แล้ว! (กดปุ่มด้านล่างเพื่อควบคุมบอท)")
         
         if not run_root_text(f"pidof {PACKAGE_NAME}"):
             log("ยังไม่ได้เปิดเกม กำลังสั่งเข้าแมพครั้งแรก...", CYAN)
@@ -306,19 +329,7 @@ def menu_3_start_bot(cfg):
             if channel: await send_bot_report(channel, f"📸 รายงานสถานะหน้าจอประจำรอบ", True)
             state["last_screenshot"] = now
 
-    # ================= ชุดคำสั่งให้เราพิมพ์สั่งใน Discord =================
-    @bot.command()
-    async def status(ctx):
-        log(f"ได้รับคำสั่ง !status จาก Discord", YELLOW)
-        await send_bot_report(ctx.channel, "📊 สถานะปัจจุบันของระบบ (ตรวจสอบโดยคำสั่ง)", True)
-
-    @bot.command()
-    async def rejoin(ctx):
-        log(f"ได้รับคำสั่ง !rejoin จาก Discord", YELLOW)
-        await ctx.send("🔄 ได้รับคำสั่ง: กำลังบังคับ Rejoin เข้าเกมใหม่...")
-        await join_roblox_async(cfg)
-        await send_bot_report(ctx.channel, "✅ บังคับ Rejoin จากคำสั่งเสร็จสิ้น", True)
-
+    # คำสั่งพิมพ์ผ่านแชทยังเก็บไว้เป็นทางเลือกเสริม
     @bot.command()
     async def setmap(ctx, place_id: str):
         log(f"ได้รับคำสั่งเปลี่ยนแมพเป็น {place_id}", YELLOW)
@@ -328,14 +339,8 @@ def menu_3_start_bot(cfg):
         await join_roblox_async(cfg)
         await send_bot_report(ctx.channel, "✅ ดึงเข้าแมพใหม่เสร็จสิ้น", True)
 
-    @bot.command()
-    async def stopgame(ctx):
-        log(f"ได้รับคำสั่งหยุดเกมจาก Discord", YELLOW)
-        run_root_text(f"am force-stop {PACKAGE_NAME}")
-        await ctx.send("🛑 สั่งบังคับปิดแอป Roblox แล้ว (บอทยังออนไลน์เฝ้ารอคำสั่งต่อไป)")
-
     try:
-        bot.run(cfg['bot_token'], log_handler=None) # ปิด log รกๆ ของ discord.py
+        bot.run(cfg['bot_token'], log_handler=None)
     except discord.LoginFailure:
         print(f"\n{RED}❌ Bot Token ไม่ถูกต้อง! ตรวจสอบอีกครั้งในเมนู 2{RESET}")
         time.sleep(2)
