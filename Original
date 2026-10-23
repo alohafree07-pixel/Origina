@@ -123,7 +123,7 @@ def is_roblox_running():
 
 def get_latest_roblox_log():
     cmd = (f"LOG_DIR=/data/data/{PACKAGE_NAME}/files/appData/logs; "
-           f"LATEST=$(ls -t$LOG_DIR/*.log 2>/dev/null | head -n 1); "
+           f"LATEST=$(ls -t $LOG_DIR/*.log 2>/dev/null | head -n 1); "
            f"if [ -n \"$LATEST\" ]; then tail -n 150 \"$LATEST\"; fi")
     return run_root_text(cmd)
 
@@ -237,4 +237,86 @@ def menu_1_set_map(cfg):
     print(f"{GREEN}✔ บันทึก Place ID: {cfg['place_id']} เรียบร้อย!{RESET}")
     time.sleep(1.5)
 
-def menu_2_set_webhook(cfg)
+def menu_2_set_webhook(cfg):
+    print(f"\n{BRIGHT_CYAN}--- [2] ตั้งค่า Discord Webhook แคปหน้าจอ ---{RESET}")
+    url = safe_input("วางลิงก์ Discord Webhook (กด Enter เพื่อใช้ค่าเดิม): ")
+    if url: cfg['webhook_url'] = url
+
+    mins = safe_input(f"ต้องการให้แคปหน้าจอส่งรายงานทุกๆ กี่นาที [{cfg['screenshot_minutes']}]: ")
+    if mins.isdigit() and int(mins) > 0: cfg['screenshot_minutes'] = int(mins)
+
+    save_config(cfg)
+    print(f"{GREEN}✔ บันทึกการตั้งค่าเรียบร้อย (แคปจอทุกๆ {cfg['screenshot_minutes']} นาที){RESET}")
+
+    if cfg['webhook_url']:
+        test = safe_input("ต้องการทดสอบแคปหน้าจอส่งเข้า Discord ตอนนี้เลยไหม? (y/n): ").lower()
+        if test == "y":
+            log("กำลังแคปหน้าจอและส่งไปที่ Discord...", YELLOW)
+            send_webhook_report(cfg, "ทดสอบระบบแคปหน้าจอจากโปรแกรม ORIGINAL", include_screenshot=True)
+            safe_input("\nกด Enter เพื่อกลับสู่เมนูหลัก...")
+
+def menu_3_start_rejoin(cfg):
+    if not cfg['place_id']:
+        print(f"\n{RED}✘ กรุณาตั้งค่า Place ID ในเมนูที่ 1 ก่อนเริ่มทำงานครับ!{RESET}")
+        time.sleep(2)
+        return
+
+    print(f"\n{BRIGHT_CYAN}--- [3] เริ่มระบบ Smart Auto Rejoin ---{RESET}")
+    print(f"{YELLOW}(กดปุ่ม Ctrl + C เพื่อหยุดการทำงานและกลับสู่เมนู){RESET}\n")
+
+    subprocess.run(["termux-wake-lock"], stderr=subprocess.DEVNULL)
+    screenshot_interval_sec = cfg['screenshot_minutes'] * 60
+    last_screenshot_time = time.time()
+    freeze_state = {"last_hash": "", "count": 0}
+
+    if not is_roblox_running():
+        log("ยังไม่ได้เปิดเกม กำลังสั่งเข้าแมพครั้งแรก...", CYAN)
+        join_roblox(cfg)
+
+    send_webhook_report(cfg, "🟢 เริ่มเดินระบบเฝ้าจอ Smart Auto Rejoin แล้ว", include_screenshot=True)
+
+    try:
+        while True:
+            if not check_internet_connection():
+                log("⚠️ ตรวจพบอินเทอร์เน็ตหลุด! กำลังรอสัญญาณกลับมา...", RED)
+                time.sleep(10)
+                continue
+
+            is_healthy, reason = analyze_game_health(cfg, freeze_state)
+            if not is_healthy:
+                log(f"⚠️ ตรวจพบปัญหา: {reason}", RED)
+                send_webhook_report(cfg, f"⚠️ **ตรวจพบปัญหา:** {reason}\n🔄 กำลังทำการ Rejoin เข้าแมพใหม่...", include_screenshot=True)
+                join_roblox(cfg)
+                freeze_state = {"last_hash": "", "count": 0}
+                send_webhook_report(cfg, f"✅ **Rejoin สำเร็จแล้ว** (สาเหตุก่อนหน้า: {reason})", include_screenshot=True)
+                last_screenshot_time = time.time()
+                continue
+
+            if cfg['webhook_url'] and (time.time() - last_screenshot_time >= screenshot_interval_sec):
+                log(f"ครบกำหนด {cfg['screenshot_minutes']} นาที แคปหน้าจอส่งรายงาน...", CYAN)
+                send_webhook_report(cfg, f"📸 รายงานสถานะหน้าจอประจำรอบ ({cfg['screenshot_minutes']} นาที) - เกมทำงานปกติ", include_screenshot=True)
+                last_screenshot_time = time.time()
+
+            time.sleep(cfg['check_interval'])
+
+    except KeyboardInterrupt:
+        subprocess.run(["termux-wake-unlock"], stderr=subprocess.DEVNULL)
+        log("หยุดการทำงานกลับสู่เมนูหลัก...", YELLOW)
+        time.sleep(1)
+
+# ================= ลูปหลักของโปรแกรม =================
+def main():
+    cfg = load_config()
+    while True:
+        print_ui(cfg)
+        choice = safe_input(f"{BOLD_WHITE}เลือกเมนู: {RESET}")
+
+        if choice == "1": menu_1_set_map(cfg)
+        elif choice == "2": menu_2_set_webhook(cfg)
+        elif choice == "3": menu_3_start_rejoin(cfg)
+        elif choice == "0":
+            print(f"\n{CYAN}ออกจากโปรแกรม ORIGINAL เรียบร้อย{RESET}")
+            sys.exit(0)
+
+if __name__ == "__main__":
+    main()
