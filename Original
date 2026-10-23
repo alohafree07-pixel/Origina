@@ -253,7 +253,8 @@ def menu_2_set_webhook(cfg):
         if test == "y":
             log("กำลังแคปหน้าจอและส่งไปที่ Discord...", YELLOW)
             send_webhook_report(cfg, "ทดสอบระบบแคปหน้าจอจากโปรแกรม ORIGINAL", include_screenshot=True)
-            safe_input("\nกด Enter เพื่อกลับสู่เมนูหลัก...")
+            # 👇 แก้ไขบรรทัดนี้: เปลี่ยนจาก safe_input เป็น input ธรรมดา
+            input("\nกด Enter เพื่อกลับสู่เมนูหลัก...")
 
 def menu_3_start_rejoin(cfg):
     if not cfg['place_id']:
