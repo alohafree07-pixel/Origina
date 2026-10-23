@@ -148,7 +148,6 @@ def analyze_game_health(cfg):
     dumpsys_focus = run_root_text("dumpsys window windows | grep -E 'mCurrentFocus|mFocusedApp'")
     if "Application Not Responding" in dumpsys_focus: return False, "ตัวเกมค้างไม่ตอบสนอง (System ANR)"
 
-    # ตรวจสอบผ่านไฟล์ Log
     log_text = run_root_text(f"LOG_DIR=/data/data/{PACKAGE_NAME}/files/appData/logs; LATEST=$(ls -t $LOG_DIR/*.log 2>/dev/null | head -n 1); if [ -n \"$LATEST\" ]; then tail -n 150 \"$LATEST\"; fi")
     if log_text:
         log_lower = log_text.lower()
@@ -165,7 +164,6 @@ def analyze_game_health(cfg):
                     if target_place_id not in line: return False, f"ตรวจพบการอยู่ในแมพอื่นที่ไม่ใช่ Place ID: {target_place_id}"
                     break
 
-    # ตรวจสอบผ่านการสแกนหน้าจอ UI (กรณีไฟล์ Log ไม่ทันอัปเดต)
     ui_xml = run_root_text("uiautomator dump /sdcard/orig_ui.xml && cat /sdcard/orig_ui.xml")
     if ui_xml:
         ui_lower = ui_xml.lower()
@@ -341,10 +339,20 @@ def menu_3_start_bot(cfg):
         async def btn_update(self, interaction: discord.Interaction, button: discord.ui.Button):
             log("สั่งอัปเดตบอทจากปุ่มกด", YELLOW)
             await interaction.response.send_message("⬆️ กำลังดาวน์โหลดอัปเดตจาก GitHub...", ephemeral=True)
+            
+            # โหลดไฟล์มาทับไฟล์ปัจจุบันแบบเจาะจงที่อยู่
             url = "https://raw.githubusercontent.com/alohafree07-pixel/Origina/refs/heads/main/Original"
-            os.system(f"curl -Ls \"{url}\" -o ~/original.py")
-            await interaction.followup.send("✅ อัปเดตโค้ดเรียบร้อย! กำลังรีสตาร์ทบอท...", ephemeral=True)
-            os.execv(sys.executable, ['python', os.path.expanduser('~/original.py')])
+            script_path = os.path.abspath(sys.argv[0])
+            os.system(f"curl -Ls \"{url}\" -o \"{script_path}\"")
+            
+            await interaction.followup.send("✅ อัปเดตโค้ดเรียบร้อย! กำลังรีสตาร์ทบอทใน 2 วินาที...", ephemeral=True)
+            
+            # สร้างฟังก์ชันหน่วงเวลาก่อนรีสตาร์ทตัวเอง เพื่อให้ข้อความฝั่ง Discord ทำงานเสร็จ
+            async def restart_process():
+                await asyncio.sleep(2)
+                os.execv(sys.executable, [sys.executable] + sys.argv)
+                
+            asyncio.create_task(restart_process())
             
         # --- แถวที่ 3: ปุ่มหยุดพัก และ ลบไฟล์ขยะ ---
         @discord.ui.button(label="⏸️ Pause Auto", style=discord.ButtonStyle.secondary, row=2, custom_id="btn_pause")
