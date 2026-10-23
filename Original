@@ -86,7 +86,7 @@ def capture_screenshot_bytes():
     return None
 
 # ================= ดึงข้อมูลสถานะเครื่อง =================
-def get_discord_embed(dev_name):
+def get_discord_embed(dev_name, is_paused):
     try:
         with open('/proc/stat', 'r') as f: s1 = [int(i) for i in f.readline().split()[1:8]]
         time.sleep(0.2)
@@ -112,7 +112,9 @@ def get_discord_embed(dev_name):
         uptime_hrs = round(up_sec / 3600, 2)
     except: uptime_hrs = 0
 
-    embed = discord.Embed(color=0x3498db)
+    status_color = 0xf1c40f if is_paused else 0x3498db # เปลี่ยนเป็นสีเหลืองถ้าพักบอท
+    
+    embed = discord.Embed(color=status_color)
     embed.add_field(name="🔹 Device Name", value=f"`{dev_name}`", inline=True)
     embed.add_field(name="⚙️ CPU Usage", value=f"`{cpu_usage}%`", inline=True)
     embed.add_field(name="💾 Memory Usage", value=f"`{mem_usage_pct}%`", inline=True)
@@ -185,7 +187,7 @@ def print_ui(cfg):
 
 {BOLD_WHITE}1) ตั้งค่าแมพที่จะ Rejoin (ใส่ Place ID / VIP Server)
 2) ตั้งค่า Discord Bot Token & Channel ID
-3) เริ่มเดินระบบบอทเฝ้าจอ (มีปุ่มกดใน Discord)
+3) เริ่มเดินระบบบอทเฝ้าจอ (มีปุ่มสั่งการผ่าน Discord)
 4) ตั้งค่าเวลา Auto Clear RAM (กันเกมเด้ง)
 0) ออกจากโปรแกรม{RESET}
 """
@@ -243,38 +245,132 @@ def menu_3_start_bot(cfg):
 
     state = {
         "last_screenshot": time.time(),
-        "last_ram_clear": time.time()
+        "last_ram_clear": time.time(),
+        "paused": False
     }
 
-    # ================= คลาสสำหรับสร้างปุ่มกด (Discord UI) =================
+    # ================= หน้าต่าง Popup เวลาป้อนแมพใหม่ =================
+    class MapModal(discord.ui.Modal, title='ตั้งค่าเปลี่ยนแมพ (Change Map)'):
+        place_id_input = discord.ui.TextInput(label='Place ID', placeholder='ใส่เลข Place ID ที่นี่...', required=True)
+        vip_code_input = discord.ui.TextInput(label='VIP Link Code (ถ้ามี)', placeholder='ใส่แค่โค้ดต่อท้าย หรือเว้นว่างไว้', required=False)
+
+        async def on_submit(self, interaction: discord.Interaction):
+            cfg['place_id'] = self.place_id_input.value
+            cfg['vip_link_code'] = self.vip_code_input.value
+            save_config(cfg)
+            await interaction.response.send_message(f"✅ บันทึกแมพ `{self.place_id_input.value}` เรียบร้อย! กำลังดึงเข้าเกม...", ephemeral=True)
+            asyncio.create_task(self.rejoin_and_report(interaction.channel))
+
+        async def rejoin_and_report(self, channel):
+            await join_roblox_async(cfg)
+            await send_bot_report(channel, f"✅ เปลี่ยนเป็นแมพ `{cfg['place_id']}` เสร็จสิ้น", True)
+
+    # ================= หน้าต่าง Popup สำหรับแก้ไขการตั้งค่ารวม =================
+    class SettingsModal(discord.ui.Modal, title='⚙️ แก้ไขการตั้งค่าโปรแกรม (Settings)'):
+        def __init__(self):
+            super().__init__()
+            self.inp_pid = discord.ui.TextInput(label='Place ID ปัจจุบัน', default=str(cfg.get('place_id', '')), required=True)
+            self.inp_sm = discord.ui.TextInput(label='รอบแคปหน้าจอส่งเข้าดิส (นาที)', default=str(cfg.get('screenshot_minutes', 10)), required=True)
+            self.inp_rh = discord.ui.TextInput(label='รอบ Auto Clear RAM (ชั่วโมง)', default=str(cfg.get('clear_ram_hours', 1.0)), required=True)
+            
+            self.add_item(self.inp_pid)
+            self.add_item(self.inp_sm)
+            self.add_item(self.inp_rh)
+
+        async def on_submit(self, interaction: discord.Interaction):
+            cfg['place_id'] = self.inp_pid.value
+            try: cfg['screenshot_minutes'] = int(self.inp_sm.value)
+            except: pass
+            try: cfg['clear_ram_hours'] = float(self.inp_rh.value)
+            except: pass
+            save_config(cfg)
+            
+            summary = f"✅ **อัปเดตการตั้งค่าเรียบร้อย! (มีผลทันที)**\n🎮 Place ID: `{cfg['place_id']}`\n📸 แคปจอทุก: `{cfg['screenshot_minutes']}` นาที\n🧹 เคลียร์ RAM ทุก: `{cfg['clear_ram_hours']}` ชั่วโมง"
+            await interaction.response.send_message(summary, ephemeral=True)
+            log("อัปเดตการตั้งค่าระบบผ่าน Discord สำเร็จ", GREEN)
+
+    # ================= คลาสสำหรับสร้างปุ่มกด 10 ปุ่ม =================
     class ControlView(discord.ui.View):
         def __init__(self):
-            super().__init__(timeout=None) # ปุ่มจะไม่หมดอายุ
+            super().__init__(timeout=None) 
 
-        @discord.ui.button(label="📊 Get Stats", style=discord.ButtonStyle.primary, custom_id="btn_stats")
+        # --- แถวที่ 1: ปุ่มคำสั่งพื้นฐาน ---
+        @discord.ui.button(label="📊 Get Stats", style=discord.ButtonStyle.primary, row=0, custom_id="btn_stats")
         async def btn_stats(self, interaction: discord.Interaction, button: discord.ui.Button):
             log("ได้รับคำสั่งเช็คสถานะจากปุ่มกด", YELLOW)
-            await interaction.response.defer() # ป้องกันบอทขึ้น Interaction failed
-            await send_bot_report(interaction.channel, "📊 สถานะปัจจุบัน (เรียกดูจากปุ่มกด)", True)
+            await interaction.response.defer() 
+            status_text = "📊 สถานะปัจจุบัน (ระบบหยุดชั่วคราวอยู่)" if state["paused"] else "📊 สถานะปัจจุบัน (เรียกดูจากปุ่มกด)"
+            await send_bot_report(interaction.channel, status_text, True)
 
-        @discord.ui.button(label="🔄 Force Rejoin", style=discord.ButtonStyle.success, custom_id="btn_rejoin")
+        @discord.ui.button(label="🔄 Force Rejoin", style=discord.ButtonStyle.success, row=0, custom_id="btn_rejoin")
         async def btn_rejoin(self, interaction: discord.Interaction, button: discord.ui.Button):
             log("ได้รับคำสั่ง Rejoin จากปุ่มกด", YELLOW)
             await interaction.response.send_message("🔄 กำลังบังคับ Rejoin เข้าเกมใหม่...", ephemeral=True)
-            await join_roblox_async(cfg)
-            await send_bot_report(interaction.channel, "✅ บังคับ Rejoin จากปุ่มกดเสร็จสิ้น", True)
+            asyncio.create_task(self.rejoin_task(interaction.channel))
 
-        @discord.ui.button(label="🛑 Stop Game", style=discord.ButtonStyle.danger, custom_id="btn_stop")
+        async def rejoin_task(self, channel):
+            await join_roblox_async(cfg)
+            await send_bot_report(channel, "✅ บังคับ Rejoin จากปุ่มกดเสร็จสิ้น", True)
+
+        @discord.ui.button(label="🛑 Stop Game", style=discord.ButtonStyle.danger, row=0, custom_id="btn_stop")
         async def btn_stop(self, interaction: discord.Interaction, button: discord.ui.Button):
             log("ได้รับคำสั่งหยุดเกมจากปุ่มกด", YELLOW)
             run_root_text(f"am force-stop {PACKAGE_NAME}")
             await interaction.response.send_message("🛑 สั่งบังคับปิดแอป Roblox แล้ว (บอทยังออนไลน์รอคำสั่ง)", ephemeral=True)
 
+        # --- แถวที่ 2: ปุ่มจัดการระบบ ---
+        @discord.ui.button(label="🧹 Clear RAM", style=discord.ButtonStyle.secondary, row=1, custom_id="btn_ram")
+        async def btn_ram(self, interaction: discord.Interaction, button: discord.ui.Button):
+            log("ได้รับคำสั่งเคลียร์ RAM", YELLOW)
+            clear_system_ram()
+            state["last_ram_clear"] = time.time()
+            await interaction.response.send_message("🧹 สั่งเคลียร์แคช RAM ในมือถือสำเร็จ!", ephemeral=True)
+
+        @discord.ui.button(label="🗺️ Change Map", style=discord.ButtonStyle.secondary, row=1, custom_id="btn_map")
+        async def btn_map(self, interaction: discord.Interaction, button: discord.ui.Button):
+            await interaction.response.send_modal(MapModal())
+
+        @discord.ui.button(label="⬆️ Update Bot", style=discord.ButtonStyle.secondary, row=1, custom_id="btn_update")
+        async def btn_update(self, interaction: discord.Interaction, button: discord.ui.Button):
+            log("สั่งอัปเดตบอทจากปุ่มกด", YELLOW)
+            await interaction.response.send_message("⬆️ กำลังดาวน์โหลดอัปเดตจาก GitHub...", ephemeral=True)
+            url = "https://raw.githubusercontent.com/alohafree07-pixel/Origina/refs/heads/main/Original"
+            os.system(f"curl -Ls \"{url}\" -o ~/original.py")
+            await interaction.followup.send("✅ อัปเดตโค้ดเรียบร้อย! กำลังรีสตาร์ทบอท...", ephemeral=True)
+            os.execv(sys.executable, ['python', os.path.expanduser('~/original.py')])
+            
+        # --- แถวที่ 3: ปุ่มหยุดพัก และ ลบไฟล์ขยะ ---
+        @discord.ui.button(label="⏸️ Pause Auto", style=discord.ButtonStyle.secondary, row=2, custom_id="btn_pause")
+        async def btn_pause(self, interaction: discord.Interaction, button: discord.ui.Button):
+            state["paused"] = True
+            log("หยุดพักระบบเฝ้าจอชั่วคราว (Paused)", YELLOW)
+            await interaction.response.send_message("⏸️ ระงับระบบเฝ้าจอชั่วคราวแล้ว! คุณสามารถกดเดินเล่นทำเควสเองได้เลย บอทจะไม่กวน", ephemeral=True)
+
+        @discord.ui.button(label="▶️ Resume Auto", style=discord.ButtonStyle.success, row=2, custom_id="btn_resume")
+        async def btn_resume(self, interaction: discord.Interaction, button: discord.ui.Button):
+            state["paused"] = False
+            state["last_screenshot"] = time.time() 
+            state["last_ram_clear"] = time.time()
+            log("กลับมาเดินระบบเฝ้าจอต่อ (Resumed)", GREEN)
+            await interaction.response.send_message("▶️ ระบบเฝ้าจอกลับมาทำงานต่อแล้ว! จะเช็คหลุด/เด้งตามปกติ", ephemeral=True)
+
+        @discord.ui.button(label="🗑️ Clear Logs", style=discord.ButtonStyle.secondary, row=2, custom_id="btn_clear_logs")
+        async def btn_clear_logs(self, interaction: discord.Interaction, button: discord.ui.Button):
+            log("ได้รับคำสั่งเคลียร์โฟลเดอร์ Logs", YELLOW)
+            run_root_text(f"rm -rf /data/data/{PACKAGE_NAME}/files/appData/logs/*.log")
+            await interaction.response.send_message("🗑️ ลบไฟล์ขยะ Log ของเกม Roblox เรียบร้อย ได้พื้นที่คืน!", ephemeral=True)
+
+        # --- แถวที่ 4: ปุ่ม Settings (แก้ไขการตั้งค่า) ---
+        @discord.ui.button(label="⚙️ Edit Settings", style=discord.ButtonStyle.secondary, row=3, custom_id="btn_settings")
+        async def btn_settings(self, interaction: discord.Interaction, button: discord.ui.Button):
+            await interaction.response.send_modal(SettingsModal())
+
     async def send_bot_report(channel, message, include_screenshot=False):
         now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        content = f"🤖 **[ORIGINAL REPORT]** (`{now_str}`)\n📌 **สถานะ:** {message}\n🎮 **Place ID:** `{cfg['place_id']}`"
-        embed = get_discord_embed(dev_name)
-        view = ControlView() # แนบปุ่มกดไปพร้อมกับข้อความ
+        pause_tag = " ⏸️ `[PAUSED]`" if state["paused"] else ""
+        content = f"🤖 **[ORIGINAL REPORT]**{pause_tag} (`{now_str}`)\n📌 **สถานะ:** {message}\n🎮 **Place ID:** `{cfg['place_id']}`"
+        embed = get_discord_embed(dev_name, state["paused"])
+        view = ControlView()
         
         try:
             if include_screenshot:
@@ -302,6 +398,8 @@ def menu_3_start_bot(cfg):
 
     @tasks.loop(seconds=cfg['check_interval'])
     async def game_monitor_loop():
+        if state.get("paused", False): return
+
         channel = bot.get_channel(int(cfg['channel_id']))
         
         if not ("1 received" in run_root_text("ping -c 1 -W 3 8.8.8.8")):
@@ -328,16 +426,6 @@ def menu_3_start_bot(cfg):
             log("แคปหน้าจอส่งรายงานอัตโนมัติ...", CYAN)
             if channel: await send_bot_report(channel, f"📸 รายงานสถานะหน้าจอประจำรอบ", True)
             state["last_screenshot"] = now
-
-    # คำสั่งพิมพ์ผ่านแชทยังเก็บไว้เป็นทางเลือกเสริม
-    @bot.command()
-    async def setmap(ctx, place_id: str):
-        log(f"ได้รับคำสั่งเปลี่ยนแมพเป็น {place_id}", YELLOW)
-        cfg['place_id'] = place_id
-        save_config(cfg)
-        await ctx.send(f"✅ บันทึก Place ID เป็น `{place_id}` แล้ว! กำลังบังคับดึงเข้าแมพใหม่...")
-        await join_roblox_async(cfg)
-        await send_bot_report(ctx.channel, "✅ ดึงเข้าแมพใหม่เสร็จสิ้น", True)
 
     try:
         bot.run(cfg['bot_token'], log_handler=None)
