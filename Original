@@ -3,14 +3,18 @@ import sys
 import time
 import json
 import subprocess
+import asyncio
+import io
 from datetime import datetime
 
 try:
-    import requests
+    import discord
+    from discord.ext import commands, tasks
 except ImportError:
-    print("กำลังติดตั้งไลบรารี requests...")
-    subprocess.run([sys.executable, "-m", "pip", "install", "requests"])
-    import requests
+    print("กำลังติดตั้งไลบรารีสำหรับ Discord Bot...")
+    subprocess.run([sys.executable, "-m", "pip", "install", "discord.py"])
+    import discord
+    from discord.ext import commands, tasks
 
 # ================= ตั้งค่าสีหน้าจอ =================
 CYAN = "\033[96m"
@@ -27,7 +31,8 @@ PACKAGE_NAME = "com.roblox.client"
 DEFAULT_CONFIG = {
     "place_id": "",
     "vip_link_code": "",
-    "webhook_url": "",
+    "bot_token": "",
+    "channel_id": "",
     "screenshot_minutes": 10,
     "check_interval": 15,
     "clear_ram_hours": 1.0
@@ -38,13 +43,10 @@ def safe_input(prompt_text):
     try:
         import termios
         termios.tcflush(sys.stdin.fileno(), termios.TCIFLUSH)
-    except Exception:
-        pass
+    except Exception: pass
     time.sleep(0.1)
-    try:
-        return input(prompt_text).strip()
-    except EOFError:
-        return ""
+    try: return input(prompt_text).strip()
+    except EOFError: return ""
 
 # ================= จัดการการตั้งค่าและคำสั่ง Root =================
 def load_config():
@@ -53,11 +55,9 @@ def load_config():
             with open(CONFIG_FILE, "r", encoding="utf-8") as f:
                 data = json.load(f)
                 for k, v in DEFAULT_CONFIG.items():
-                    if k not in data:
-                        data[k] = v
+                    if k not in data: data[k] = v
                 return data
-        except Exception:
-            return DEFAULT_CONFIG.copy()
+        except: pass
     return DEFAULT_CONFIG.copy()
 
 def save_config(cfg):
@@ -72,17 +72,21 @@ def run_root_text(cmd):
     try:
         res = subprocess.run(["su", "-c", cmd], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=15)
         return res.stdout.strip()
-    except Exception:
-        return ""
+    except: return ""
 
 def clear_system_ram():
     run_root_text("sync && echo 3 > /proc/sys/vm/drop_caches")
 
-# ================= ดึงข้อมูลสถานะเครื่อง (System Stats) =================
-def get_system_stats_embed():
-    dev_name = run_root_text("getprop ro.product.model") or "Android Device"
-    
-    # คำนวณ CPU Usage
+def capture_screenshot_bytes():
+    try:
+        cmd = "screencap -p /sdcard/orig_screen.png && cat /sdcard/orig_screen.png"
+        res = subprocess.run(["su", "-c", cmd], stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=20)
+        if res.returncode == 0 and res.stdout: return res.stdout
+    except: pass
+    return None
+
+# ================= ระบบ Discord Bot =================
+def get_discord_embed(dev_name):
     try:
         with open('/proc/stat', 'r') as f: s1 = [int(i) for i in f.readline().split()[1:8]]
         time.sleep(0.2)
@@ -92,7 +96,6 @@ def get_system_stats_embed():
         cpu_usage = round(100 * ((t2-t1) - (i2-i1)) / (t2-t1), 2) if t2-t1 > 0 else 0
     except: cpu_usage = 0
 
-    # คำนวณ RAM Usage
     try:
         with open('/proc/meminfo', 'r') as f: lines = f.readlines()
         mem_total = mem_avail = 0
@@ -102,132 +105,31 @@ def get_system_stats_embed():
         mem_total_gb = round(mem_total / (1024*1024), 2)
         mem_avail_pct = round((mem_avail / mem_total) * 100, 2) if mem_total > 0 else 0
         mem_usage_pct = round(100 - mem_avail_pct, 2)
-    except:
-        mem_total_gb = mem_avail_pct = mem_usage_pct = 0
+    except: mem_total_gb = mem_avail_pct = mem_usage_pct = 0
 
-    # คำนวณ Uptime
     try:
         with open('/proc/uptime', 'r') as f: up_sec = float(f.readline().split()[0])
         uptime_hrs = round(up_sec / 3600, 2)
     except: uptime_hrs = 0
 
-    # สร้างโครงสร้าง Embed ส่งไป Discord
-    embed = {
-        "color": 3447003, # สีฟ้าตามธีมโปรแกรม
-        "fields": [
-            {"name": "🔹 Device Name", "value": f"`{dev_name}`", "inline": True},
-            {"name": "⚙️ CPU Usage", "value": f"`{cpu_usage}%`", "inline": True},
-            {"name": "💾 Memory Usage", "value": f"`{mem_usage_pct}%`", "inline": True},
-            {"name": "💾 Memory Available", "value": f"`{mem_avail_pct}%`", "inline": True},
-            {"name": "💡 Total Memory", "value": f"`{mem_total_gb} GB`", "inline": True},
-            {"name": "⏰ Uptime", "value": f"`{uptime_hrs} hours`", "inline": True}
-        ]
-    }
+    embed = discord.Embed(color=0x3498db) # สีฟ้า
+    embed.add_field(name="🔹 Device Name", value=f"`{dev_name}`", inline=True)
+    embed.add_field(name="⚙️ CPU Usage", value=f"`{cpu_usage}%`", inline=True)
+    embed.add_field(name="💾 Memory Usage", value=f"`{mem_usage_pct}%`", inline=True)
+    embed.add_field(name="💾 Memory Available", value=f"`{mem_avail_pct}%`", inline=True)
+    embed.add_field(name="💡 Total Memory", value=f"`{mem_total_gb} GB`", inline=True)
+    embed.add_field(name="⏰ Uptime", value=f"`{uptime_hrs} hours`", inline=True)
     return embed
 
-# ================= ระบบแคปหน้าจอและส่ง Webhook =================
-def capture_screenshot_bytes():
-    try:
-        cmd = "screencap -p /sdcard/orig_screen.png && cat /sdcard/orig_screen.png"
-        res = subprocess.run(["su", "-c", cmd], stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=20)
-        if res.returncode == 0 and res.stdout:
-            return res.stdout
-    except Exception:
-        pass
-    return None
-
-def send_webhook_report(cfg, message, include_screenshot=False):
-    url = cfg.get("webhook_url", "").strip()
-    if not url: return
-
-    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    content = f"🤖 **[ORIGINAL REPORT]** (`{now_str}`)\n📌 **สถานะ:** {message}\n🎮 **Place ID:** `{cfg.get('place_id') or '-'}`"
-
-    embed = get_system_stats_embed()
-    payload = {"content": content, "embeds": [embed]}
-
-    try:
-        if include_screenshot:
-            img_bytes = capture_screenshot_bytes()
-            if img_bytes:
-                files = {"file": ("screenshot.png", img_bytes, "image/png")}
-                # ส่งทั้งรูป ข้อความ และ Embed รวมกันในรอบเดียว
-                requests.post(url, data={"payload_json": json.dumps(payload)}, files=files, timeout=20)
-                log("ส่งรายงานพร้อมรูปและสถานะเครื่องเข้า Discord แล้ว", GREEN)
-                return
-                
-        requests.post(url, json=payload, timeout=15)
-        log("ส่งข้อความแจ้งเตือนพร้อมสถานะเครื่องเข้า Discord แล้ว", GREEN)
-    except Exception as e:
-        log(f"ส่ง Webhook ไม่สำเร็จ: {e}", RED)
-
-# ================= ระบบตรวจเช็คสถานะเชิงลึก =================
-def check_internet_connection():
-    res = run_root_text("ping -c 1 -W 3 8.8.8.8")
-    return "1 received" in res or "1 packets received" in res
-
-def is_roblox_running():
-    pid = run_root_text(f"pidof {PACKAGE_NAME}")
-    return bool(pid)
-
-def get_latest_roblox_log():
-    cmd = (f"LOG_DIR=/data/data/{PACKAGE_NAME}/files/appData/logs; "
-           f"LATEST=$(ls -t $LOG_DIR/*.log 2>/dev/null | head -n 1); "
-           f"if [ -n \"$LATEST\" ]; then tail -n 150 \"$LATEST\"; fi")
-    return run_root_text(cmd)
-
-def analyze_game_health(cfg):
-    target_place_id = str(cfg.get("place_id", "")).strip()
-
-    if not is_roblox_running(): return False, "แอป Roblox ปิดตัวลง (App Crashed / Closed)"
-
-    dumpsys_focus = run_root_text("dumpsys window windows | grep -E 'mCurrentFocus|mFocusedApp'")
-    if "Application Not Responding" in dumpsys_focus: return False, "ตัวเกมค้างไม่ตอบสนอง (System ANR)"
-
-    log_text = get_latest_roblox_log()
-    if log_text:
-        log_lower = log_text.lower()
-        if "273" in log_lower and ("same account" in log_lower or "different device" in log_lower or "disconnect" in log_lower):
-            return False, "ตรวจพบการเข้าไอดีซ้อนจากเครื่องอื่น! (Error Code: 273)"
-        if "error code: 267" in log_lower or "kicked from experience" in log_lower or "you were kicked" in log_lower:
-            return False, "ถูกเตะออกจากแมพ (Error Code: 267 / Kicked)"
-        if "error code: 268" in log_lower or "unexpected client behavior" in log_lower:
-            return False, "เซิร์ฟเวอร์เตะเนื่องจากพฤติกรรมไคลเอนต์ (Error Code: 268)"
-        
-        disconnect_signals = ["lost connection to the game server", "connection attempt failed", "disconnected from game", "idledisconnect", "error code: 277", "error code: 279"]
-        for sig in disconnect_signals:
-            if sig in log_lower: return False, f"หลุดออกจากเซิร์ฟเวอร์ ({sig})"
-
-        if "leaving game" in log_lower or "destructing datamodel" in log_lower:
-            last_lines = "\n".join(log_lower.splitlines()[-30:])
-            if "joining game" not in last_lines and "placeid" not in last_lines:
-                return False, "ตัวละครเด้งออกกลับมาหน้าล็อบบี้หลักของ Roblox"
-
-        if target_place_id:
-            for line in reversed(log_text.splitlines()):
-                if "placeId:" in line or "placeid=" in line.lower():
-                    if target_place_id not in line: return False, f"ตรวจพบการอยู่ในแมพอื่นที่ไม่ใช่ Place ID: {target_place_id}"
-                    break
-
-    ui_xml = run_root_text("uiautomator dump /sdcard/orig_ui.xml && cat /sdcard/orig_ui.xml")
-    if ui_xml:
-        ui_lower = ui_xml.lower()
-        if "same account" in ui_lower or "273" in ui_lower: return False, "ตรวจพบคนเข้าไอดีซ้อนบนหน้าจอ (Error 273)"
-        for kw in ["disconnected", "reconnect", "error code", "ตัดการเชื่อมต่อ", "เชื่อมต่อใหม่", "รหัสข้อผิดพลาด"]:
-            if kw in ui_lower: return False, f"ตรวจพบหน้าต่างแจ้งเตือนหลุดออกจากเกม ({kw})"
-
-    return True, "ปกติ"
-
-def join_roblox(cfg):
+async def join_roblox_async(cfg):
     place_id = cfg.get("place_id", "").strip()
     vip_code = cfg.get("vip_link_code", "").strip()
-
+    
     log("กำลังบังคับปิดเกมและเคลียร์ไฟล์ Log เก่า...", YELLOW)
     run_root_text(f"am force-stop {PACKAGE_NAME}")
     run_root_text(f"rm -rf /data/data/{PACKAGE_NAME}/files/appData/logs/*.log")
-    
     clear_system_ram()
-    time.sleep(3)
+    await asyncio.sleep(3)
 
     if vip_code: deep_link = f"roblox://placeId={place_id}&linkCode={vip_code}"
     else: deep_link = f"roblox://placeId={place_id}"
@@ -235,7 +137,34 @@ def join_roblox(cfg):
     cmd = f'am start -a android.intent.action.VIEW -d "{deep_link}" {PACKAGE_NAME}'
     run_root_text(cmd)
     log(f"ยิงคำสั่งเข้าแมพ {place_id} สำเร็จ! รอโหลดเข้าเกม 35 วินาที...", GREEN)
-    time.sleep(35)
+    await asyncio.sleep(35)
+
+def analyze_game_health(cfg):
+    target_place_id = str(cfg.get("place_id", "")).strip()
+    if not run_root_text(f"pidof {PACKAGE_NAME}"): return False, "แอป Roblox ปิดตัวลง (App Crashed)"
+    
+    dumpsys_focus = run_root_text("dumpsys window windows | grep -E 'mCurrentFocus|mFocusedApp'")
+    if "Application Not Responding" in dumpsys_focus: return False, "ตัวเกมค้างไม่ตอบสนอง (System ANR)"
+
+    log_text = run_root_text(f"LOG_DIR=/data/data/{PACKAGE_NAME}/files/appData/logs; LATEST=$(ls -t $LOG_DIR/*.log 2>/dev/null | head -n 1); if [ -n \"$LATEST\" ]; then tail -n 150 \"$LATEST\"; fi")
+    if log_text:
+        log_lower = log_text.lower()
+        if "273" in log_lower and ("same account" in log_lower or "disconnect" in log_lower): return False, "ตรวจพบการเข้าไอดีซ้อน! (Error Code: 273)"
+        if "error code: 267" in log_lower or "kicked" in log_lower: return False, "ถูกเตะออกจากแมพ (Error Code: 267)"
+        if "error code: 268" in log_lower or "unexpected client behavior" in log_lower: return False, "เซิร์ฟเวอร์เตะ (Error Code: 268)"
+        for sig in ["lost connection", "disconnected from game", "idledisconnect", "error code: 277"]:
+            if sig in log_lower: return False, f"หลุดออกจากเซิร์ฟเวอร์ ({sig})"
+            
+        if target_place_id:
+            for line in reversed(log_text.splitlines()):
+                if "placeId:" in line or "placeid=" in line.lower():
+                    if target_place_id not in line: return False, f"ตรวจพบการอยู่ในแมพอื่นที่ไม่ใช่ Place ID: {target_place_id}"
+                    break
+
+    ui_xml = run_root_text("uiautomator dump /sdcard/orig_ui.xml && cat /sdcard/orig_ui.xml")
+    if ui_xml and ("same account" in ui_xml.lower() or "273" in ui_xml.lower()): return False, "ตรวจพบคนเข้าไอดีซ้อนบนหน้าจอ (Error 273)"
+
+    return True, "ปกติ"
 
 # ================= หน้าตาเมนูหลัก (ORIGINAL) =================
 def print_ui(cfg):
@@ -246,22 +175,22 @@ def print_ui(cfg):
 ██║   ██║██╔══██╗██║██║   ██║██║██║╚██╗██║██╔══██║██║     
 ╚██████╔╝██║  ██║██║╚██████╔╝██║██║ ╚████║██║  ██║███████╗
  ╚═════╝ ╚═╝  ╚═╝╚═╝ ╚═════╝ ╚═╝╚═╝  ╚═══╝╚═╝  ╚═╝╚══════╝{RESET}
-{BOLD_WHITE}R O B L O X   S M A R T   R E J O I N{RESET}
+{BOLD_WHITE}R O B L O X   S M A R T   B O T   (DISCORD EDITION){RESET}
 {CYAN}Termux  •  Rooted  •  Android{RESET}
 {BRIGHT_CYAN}──────────────────────────────────────────────────────────{RESET}
-{CYAN}• Place ID ปัจจุบัน :{RESET} {BOLD_WHITE}{cfg['place_id'] or 'ยังไม่ได้ตั้งค่า'}{RESET}
-{CYAN}• Auto Clear RAM  :{RESET} {GREEN}เคลียร์อัตโนมัติทุกๆ {cfg.get('clear_ram_hours', 1)} ชั่วโมง{RESET}
+{CYAN}• Place ID    :{RESET} {BOLD_WHITE}{cfg['place_id'] or 'ยังไม่ได้ตั้งค่า'}{RESET}
+{CYAN}• Bot Token   :{RESET} {GREEN}{'✅ ติดตั้งแล้ว' if cfg['bot_token'] else '❌ ยังไม่มี'}{RESET}
+{CYAN}• Auto RAM    :{RESET} {GREEN}เคลียร์อัตโนมัติทุกๆ {cfg.get('clear_ram_hours', 1)} ชั่วโมง{RESET}
 {BRIGHT_CYAN}──────────────────────────────────────────────────────────{RESET}
 
 {BOLD_WHITE}1) ตั้งค่าแมพที่จะ Rejoin (ใส่ Place ID / VIP Server)
-2) ตั้งค่า Discord Webhook และเวลาแคปหน้าจอรายงานผล
-3) เริ่มการทำงานโปรแกรม Auto Rejoin
+2) ตั้งค่า Discord Bot Token & Channel ID
+3) เริ่มเดินระบบบอทเฝ้าจอ (รับคำสั่งผ่าน Discord)
 4) ตั้งค่าเวลา Auto Clear RAM (กันเกมเด้ง)
 0) ออกจากโปรแกรม{RESET}
 """
     print(banner)
 
-# ================= การทำงานของเมนู =================
 def menu_1_set_map(cfg):
     print(f"\n{BRIGHT_CYAN}--- [1] ตั้งค่าแมพสำหรับ Rejoin ---{RESET}")
     pid = safe_input(f"ใส่เลข Place ID [{cfg['place_id']}]: ")
@@ -272,98 +201,149 @@ def menu_1_set_map(cfg):
     print(f"{GREEN}✔ บันทึก Place ID เรียบร้อย!{RESET}")
     time.sleep(1.5)
 
-def menu_2_set_webhook(cfg):
-    print(f"\n{BRIGHT_CYAN}--- [2] ตั้งค่า Discord Webhook แคปหน้าจอ ---{RESET}")
-    url = safe_input("วางลิงก์ Discord Webhook (กด Enter เพื่อใช้ค่าเดิม): ")
-    if url: cfg['webhook_url'] = url
-    mins = safe_input(f"ต้องการให้แคปหน้าจอส่งรายงานทุกๆ กี่นาที [{cfg['screenshot_minutes']}]: ")
+def menu_2_set_bot(cfg):
+    print(f"\n{BRIGHT_CYAN}--- [2] ตั้งค่า Discord Bot ---{RESET}")
+    token = safe_input("วาง Bot Token (กด Enter เพื่อใช้ค่าเดิม): ")
+    if token: cfg['bot_token'] = token
+    cid = safe_input(f"วาง Channel ID สำหรับให้บอทส่งรายงาน [{cfg['channel_id']}]: ")
+    if cid: cfg['channel_id'] = cid
+    mins = safe_input(f"ต้องการแคปหน้าจอส่งรายงานอัตโนมัติทุกๆ กี่นาที [{cfg['screenshot_minutes']}]: ")
     if mins.isdigit() and int(mins) > 0: cfg['screenshot_minutes'] = int(mins)
     save_config(cfg)
-    print(f"{GREEN}✔ บันทึกการตั้งค่าเรียบร้อย{RESET}")
-
-    if cfg['webhook_url']:
-        test = safe_input("ต้องการทดสอบแคปหน้าจอส่งเข้า Discord ตอนนี้เลยไหม? (y/n): ").lower()
-        if test == "y":
-            log("กำลังแคปหน้าจอและส่งไปที่ Discord...", YELLOW)
-            send_webhook_report(cfg, "ทดสอบระบบแคปหน้าจอจากโปรแกรม ORIGINAL", include_screenshot=True)
-            input("\nกด Enter เพื่อกลับสู่เมนูหลัก...") 
+    print(f"{GREEN}✔ บันทึกการตั้งค่าบอทเรียบร้อย{RESET}")
+    input("\nกด Enter เพื่อกลับสู่เมนูหลัก...")
 
 def menu_4_ram(cfg):
     print(f"\n{BRIGHT_CYAN}--- [4] ตั้งค่า Auto Clear RAM ---{RESET}")
-    val = safe_input(f"ต้องการให้ระบบเคลียร์แคชมือถือทุกๆ กี่ชั่วโมง? (ใส่จุดทศนิยมได้ เช่น 1.5): ")
+    val = safe_input(f"ระบบจะเคลียร์แคชทุกๆ กี่ชั่วโมง? (ใส่จุดทศนิยมได้): ")
     try:
         if float(val) > 0:
             cfg['clear_ram_hours'] = float(val)
             save_config(cfg)
-            print(f"{GREEN}✔ บันทึกการเคลียร์ RAM เป็นทุกๆ {cfg['clear_ram_hours']} ชั่วโมง{RESET}")
-    except ValueError:
-        pass
+            print(f"{GREEN}✔ บันทึกเวลาเคลียร์ RAM สำเร็จ{RESET}")
+    except: pass
     input("\nกด Enter เพื่อกลับสู่เมนูหลัก...")
 
-def menu_3_start_rejoin(cfg):
-    if not cfg['place_id']:
-        print(f"\n{RED}✘ กรุณาตั้งค่า Place ID ในเมนูที่ 1 ก่อนเริ่มทำงานครับ!{RESET}")
+def menu_3_start_bot(cfg):
+    if not cfg['place_id'] or not cfg['bot_token'] or not cfg['channel_id']:
+        print(f"\n{RED}✘ กรุณาตั้งค่า Place ID และ Bot Token ในเมนูที่ 1 และ 2 ก่อนครับ!{RESET}")
         time.sleep(2)
         return
 
-    print(f"\n{BRIGHT_CYAN}--- [3] เริ่มระบบ Smart Auto Rejoin ---{RESET}")
-    print(f"{YELLOW}(กดปุ่ม CTRL + c เพื่อหยุดการทำงานและกลับสู่เมนูหลัก){RESET}\n")
+    print(f"\n{BRIGHT_CYAN}--- [3] เริ่มระบบ Discord Bot Auto Rejoin ---{RESET}")
+    print(f"{YELLOW}บอทกำลังรัน... คุณสามารถพิมพ์คำสั่งใน Discord ได้เลย{RESET}")
+    print(f"{YELLOW}(คำสั่ง: !status, !rejoin, !setmap, !stopgame){RESET}")
+    print(f"{YELLOW}(กดปุ่ม CTRL + c บน Termux เพื่อหยุดบอทและกลับสู่เมนูหลัก){RESET}\n")
 
     subprocess.run(["termux-wake-lock"], stderr=subprocess.DEVNULL)
-    
-    screenshot_interval_sec = cfg['screenshot_minutes'] * 60
-    ram_interval_sec = cfg.get('clear_ram_hours', 1) * 3600
-    
-    last_screenshot_time = time.time()
-    last_ram_clear = time.time()
+    dev_name = run_root_text("getprop ro.product.model") or "Android Device"
 
-    if not is_roblox_running():
-        log("ยังไม่ได้เปิดเกม กำลังสั่งเข้าแมพครั้งแรก...", CYAN)
-        join_roblox(cfg)
+    intents = discord.Intents.default()
+    intents.message_content = True
+    bot = commands.Bot(command_prefix="!", intents=intents)
 
-    send_webhook_report(cfg, "🟢 เริ่มเดินระบบเฝ้าจอ Smart Auto Rejoin แล้ว", include_screenshot=True)
+    # Variables for loops
+    state = {
+        "last_screenshot": time.time(),
+        "last_ram_clear": time.time()
+    }
+
+    async def send_bot_report(channel, message, include_screenshot=False):
+        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        content = f"🤖 **[ORIGINAL REPORT]** (`{now_str}`)\n📌 **สถานะ:** {message}\n🎮 **Place ID:** `{cfg['place_id']}`"
+        embed = get_discord_embed(dev_name)
+        
+        try:
+            if include_screenshot:
+                img_bytes = capture_screenshot_bytes()
+                if img_bytes:
+                    file = discord.File(io.BytesIO(img_bytes), filename="screenshot.png")
+                    await channel.send(content=content, embed=embed, file=file)
+                    return
+            await channel.send(content=content, embed=embed)
+        except Exception as e:
+            log(f"ส่งรายงานพลาด: {e}", RED)
+
+    @bot.event
+    async def on_ready():
+        log(f"✅ เชื่อมต่อบอท Discord: {bot.user.name} สำเร็จ!", GREEN)
+        channel = bot.get_channel(int(cfg['channel_id']))
+        if channel:
+            await send_bot_report(channel, "🟢 เริ่มเดินระบบเฝ้าจอ Auto Rejoin แล้ว! (รองรับคำสั่ง !status, !rejoin, !setmap, !stopgame)")
+        
+        if not run_root_text(f"pidof {PACKAGE_NAME}"):
+            log("ยังไม่ได้เปิดเกม กำลังสั่งเข้าแมพครั้งแรก...", CYAN)
+            await join_roblox_async(cfg)
+
+        game_monitor_loop.start()
+
+    @tasks.loop(seconds=cfg['check_interval'])
+    async def game_monitor_loop():
+        channel = bot.get_channel(int(cfg['channel_id']))
+        
+        if not ("1 received" in run_root_text("ping -c 1 -W 3 8.8.8.8")):
+            log("⚠️ อินเทอร์เน็ตหลุด! กำลังรอสัญญาณ...", RED)
+            return
+
+        is_healthy, reason = analyze_game_health(cfg)
+        if not is_healthy:
+            log(f"⚠️ ปัญหา: {reason}", RED)
+            if channel: await send_bot_report(channel, f"⚠️ **ปัญหา:** {reason}\n🔄 กำลังทำการ Rejoin...", True)
+            await join_roblox_async(cfg)
+            state["last_ram_clear"] = time.time()
+            if channel: await send_bot_report(channel, f"✅ **Rejoin สำเร็จแล้ว**", True)
+            state["last_screenshot"] = time.time()
+            return
+
+        now = time.time()
+        if now - state["last_ram_clear"] >= cfg.get('clear_ram_hours', 1) * 3600:
+            clear_system_ram()
+            log("เคลียร์ RAM สำเร็จ", GREEN)
+            state["last_ram_clear"] = now
+
+        if now - state["last_screenshot"] >= cfg['screenshot_minutes'] * 60:
+            log("แคปหน้าจอส่งรายงานอัตโนมัติ...", CYAN)
+            if channel: await send_bot_report(channel, f"📸 รายงานสถานะหน้าจอประจำรอบ", True)
+            state["last_screenshot"] = now
+
+    # ================= ชุดคำสั่งให้เราพิมพ์สั่งใน Discord =================
+    @bot.command()
+    async def status(ctx):
+        log(f"ได้รับคำสั่ง !status จาก Discord", YELLOW)
+        await send_bot_report(ctx.channel, "📊 สถานะปัจจุบันของระบบ (ตรวจสอบโดยคำสั่ง)", True)
+
+    @bot.command()
+    async def rejoin(ctx):
+        log(f"ได้รับคำสั่ง !rejoin จาก Discord", YELLOW)
+        await ctx.send("🔄 ได้รับคำสั่ง: กำลังบังคับ Rejoin เข้าเกมใหม่...")
+        await join_roblox_async(cfg)
+        await send_bot_report(ctx.channel, "✅ บังคับ Rejoin จากคำสั่งเสร็จสิ้น", True)
+
+    @bot.command()
+    async def setmap(ctx, place_id: str):
+        log(f"ได้รับคำสั่งเปลี่ยนแมพเป็น {place_id}", YELLOW)
+        cfg['place_id'] = place_id
+        save_config(cfg)
+        await ctx.send(f"✅ บันทึก Place ID เป็น `{place_id}` แล้ว! กำลังบังคับดึงเข้าแมพใหม่...")
+        await join_roblox_async(cfg)
+        await send_bot_report(ctx.channel, "✅ ดึงเข้าแมพใหม่เสร็จสิ้น", True)
+
+    @bot.command()
+    async def stopgame(ctx):
+        log(f"ได้รับคำสั่งหยุดเกมจาก Discord", YELLOW)
+        run_root_text(f"am force-stop {PACKAGE_NAME}")
+        await ctx.send("🛑 สั่งบังคับปิดแอป Roblox แล้ว (บอทยังออนไลน์เฝ้ารอคำสั่งต่อไป)")
 
     try:
-        while True:
-            if not check_internet_connection():
-                log("⚠️ ตรวจพบอินเทอร์เน็ตหลุด! กำลังรอสัญญาณกลับมา...", RED)
-                time.sleep(10)
-                continue
-
-            is_healthy, reason = analyze_game_health(cfg)
-            if not is_healthy:
-                log(f"⚠️ ตรวจพบปัญหา: {reason}", RED)
-                send_webhook_report(cfg, f"⚠️ **ตรวจพบปัญหา:** {reason}\n🔄 กำลังทำการ Rejoin เข้าแมพใหม่...", include_screenshot=True)
-                join_roblox(cfg)
-                last_ram_clear = time.time()
-                send_webhook_report(cfg, f"✅ **Rejoin สำเร็จแล้ว**", include_screenshot=True)
-                last_screenshot_time = time.time()
-                continue
-
-            if time.time() - last_ram_clear >= ram_interval_sec:
-                log(f"ครบกำหนด {cfg.get('clear_ram_hours')} ชั่วโมง กำลังเคลียร์แคช RAM ของระบบ...", YELLOW)
-                clear_system_ram()
-                log("เคลียร์ RAM สำเร็จ ช่วยลดอาการเกมหน่วง!", GREEN)
-                last_ram_clear = time.time()
-
-            if cfg['webhook_url'] and (time.time() - last_screenshot_time >= screenshot_interval_sec):
-                log(f"ครบกำหนด {cfg['screenshot_minutes']} นาที แคปหน้าจอส่งรายงาน...", CYAN)
-                send_webhook_report(cfg, f"📸 รายงานสถานะหน้าจอประจำรอบ ({cfg['screenshot_minutes']} นาที) - เกมทำงานปกติ", include_screenshot=True)
-                last_screenshot_time = time.time()
-
-            time.sleep(cfg['check_interval'])
-
+        bot.run(cfg['bot_token'], log_handler=None) # ปิด log รกๆ ของ discord.py
+    except discord.LoginFailure:
+        print(f"\n{RED}❌ Bot Token ไม่ถูกต้อง! ตรวจสอบอีกครั้งในเมนู 2{RESET}")
+        time.sleep(2)
     except KeyboardInterrupt:
         subprocess.run(["termux-wake-unlock"], stderr=subprocess.DEVNULL)
-        print(f"\n\n{YELLOW}🛑 หยุดการทำงานของบอทเฝ้าจอแล้ว{RESET}")
-        
-        ans = safe_input("คุณต้องการบังคับปิดแอป Roblox ด้วยหรือไม่? (y/n): ").lower()
-        if ans == 'y':
-            run_root_text(f"am force-stop {PACKAGE_NAME}")
-            log("ปิดแอป Roblox เรียบร้อยแล้ว", GREEN)
-        else:
-            log("ปล่อยให้เกมทำงานต่อไป", CYAN)
-            
+        print(f"\n\n{YELLOW}🛑 ปิดบอทเฝ้าจอแล้ว (Offline){RESET}")
+        ans = safe_input("ต้องการบังคับปิดแอป Roblox ด้วยไหม? (y/n): ").lower()
+        if ans == 'y': run_root_text(f"am force-stop {PACKAGE_NAME}")
         time.sleep(1)
 
 # ================= ลูปหลักของโปรแกรม =================
@@ -374,11 +354,10 @@ def main():
         choice = safe_input(f"{BOLD_WHITE}เลือกเมนู: {RESET}")
 
         if choice == "1": menu_1_set_map(cfg)
-        elif choice == "2": menu_2_set_webhook(cfg)
-        elif choice == "3": menu_3_start_rejoin(cfg)
+        elif choice == "2": menu_2_set_bot(cfg)
+        elif choice == "3": menu_3_start_bot(cfg)
         elif choice == "4": menu_4_ram(cfg)
         elif choice == "0":
-            print(f"\n{CYAN}ออกจากโปรแกรม ORIGINAL เรียบร้อย{RESET}")
             sys.exit(0)
 
 if __name__ == "__main__":
