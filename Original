@@ -148,11 +148,13 @@ def analyze_game_health(cfg):
     dumpsys_focus = run_root_text("dumpsys window windows | grep -E 'mCurrentFocus|mFocusedApp'")
     if "Application Not Responding" in dumpsys_focus: return False, "ตัวเกมค้างไม่ตอบสนอง (System ANR)"
 
+    # ตรวจสอบผ่านไฟล์ Log
     log_text = run_root_text(f"LOG_DIR=/data/data/{PACKAGE_NAME}/files/appData/logs; LATEST=$(ls -t $LOG_DIR/*.log 2>/dev/null | head -n 1); if [ -n \"$LATEST\" ]; then tail -n 150 \"$LATEST\"; fi")
     if log_text:
         log_lower = log_text.lower()
+        if "pss4" in log_lower or "datastores not loading" in log_lower: return False, "เซิร์ฟเวอร์แมพมีปัญหา (Error Code PSS4)"
         if "273" in log_lower and ("same account" in log_lower or "disconnect" in log_lower): return False, "ตรวจพบการเข้าไอดีซ้อน! (Error Code: 273)"
-        if "error code: 267" in log_lower or "kicked" in log_lower: return False, "ถูกเตะออกจากแมพ (Error Code: 267)"
+        if "error code: 267" in log_lower or "kicked" in log_lower: return False, "ถูกเตะออกจากแมพ (Error Code: 267 / Kicked)"
         if "error code: 268" in log_lower or "unexpected client behavior" in log_lower: return False, "เซิร์ฟเวอร์เตะ (Error Code: 268)"
         for sig in ["lost connection", "disconnected from game", "idledisconnect", "error code: 277"]:
             if sig in log_lower: return False, f"หลุดออกจากเซิร์ฟเวอร์ ({sig})"
@@ -163,8 +165,14 @@ def analyze_game_health(cfg):
                     if target_place_id not in line: return False, f"ตรวจพบการอยู่ในแมพอื่นที่ไม่ใช่ Place ID: {target_place_id}"
                     break
 
+    # ตรวจสอบผ่านการสแกนหน้าจอ UI (กรณีไฟล์ Log ไม่ทันอัปเดต)
     ui_xml = run_root_text("uiautomator dump /sdcard/orig_ui.xml && cat /sdcard/orig_ui.xml")
-    if ui_xml and ("same account" in ui_xml.lower() or "273" in ui_xml.lower()): return False, "ตรวจพบคนเข้าไอดีซ้อนบนหน้าจอ (Error 273)"
+    if ui_xml:
+        ui_lower = ui_xml.lower()
+        if "pss4" in ui_lower or "datastores not loading" in ui_lower: return False, "หน้าจอแจ้งเตือนเซิร์ฟเวอร์แมพมีปัญหา (Error Code PSS4)"
+        if "same account" in ui_lower or "273" in ui_lower: return False, "ตรวจพบคนเข้าไอดีซ้อนบนหน้าจอ (Error 273)"
+        if "kicked by this experience" in ui_lower: return False, "หน้าจอแจ้งเตือนถูกเตะออกจากแมพ (Kicked by Experience)"
+        if "disconnected" in ui_lower and "error code" in ui_lower: return False, "หน้าจอแจ้งเตือนหลุดออกจากเกม (Disconnected)"
 
     return True, "ปกติ"
 
@@ -239,7 +247,6 @@ def menu_3_start_bot(cfg):
     subprocess.run(["termux-wake-lock"], stderr=subprocess.DEVNULL)
     dev_name = run_root_text("getprop ro.product.model") or "Android Device"
 
-    # 📌 วิธีแก้: ใช้ Intents.default() เสมอเพื่อไม่ต้องใช้ Message Content ทันที 📌
     intents = discord.Intents.default()
     bot = commands.Bot(command_prefix="!", intents=intents)
 
