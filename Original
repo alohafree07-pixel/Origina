@@ -123,7 +123,7 @@ def is_roblox_running():
 
 def get_latest_roblox_log():
     cmd = (f"LOG_DIR=/data/data/{PACKAGE_NAME}/files/appData/logs; "
-           f"LATEST=$(ls -t $LOG_DIR/*.log 2>/dev/null | head -n 1); "
+           f"LATEST=$(ls -t$LOG_DIR/*.log 2>/dev/null | head -n 1); "
            f"if [ -n \"$LATEST\" ]; then tail -n 150 \"$LATEST\"; fi")
     return run_root_text(cmd)
 
@@ -135,7 +135,7 @@ def analyze_game_health(cfg, freeze_state):
     dumpsys_focus = run_root_text("dumpsys window windows | grep -E 'mCurrentFocus|mFocusedApp'")
     if "Application Not Responding" in dumpsys_focus: return False, "ตัวเกมค้างไม่ตอบสนอง (System ANR)"
     
-    # ❌ ลบการเช็คหน้าจอหลุดโฟกัสออกไปแล้ว เพื่อไม่ให้ตีกันกับหน้าต่างของ Executor / Script ❌
+    # หมายเหตุ: เอาการเช็ค "หน้าจอหลุดโฟกัส" ออกไปแล้ว เพื่อให้เปิดแอป/สคริปต์ซ้อนทับได้
 
     log_text = get_latest_roblox_log()
     if log_text:
@@ -183,6 +183,23 @@ def analyze_game_health(cfg, freeze_state):
             freeze_state["count"] = 0
 
     return True, "ปกติ"
+
+def join_roblox(cfg):
+    place_id = cfg.get("place_id", "").strip()
+    vip_code = cfg.get("vip_link_code", "").strip()
+
+    log("กำลังบังคับปิดเกมและเคลียร์ไฟล์ Log เก่า...", YELLOW)
+    run_root_text(f"am force-stop {PACKAGE_NAME}")
+    run_root_text(f"rm -rf /data/data/{PACKAGE_NAME}/files/appData/logs/*.log")
+    time.sleep(3)
+
+    if vip_code: deep_link = f"roblox://placeId={place_id}&linkCode={vip_code}"
+    else: deep_link = f"roblox://placeId={place_id}"
+
+    cmd = f'am start -a android.intent.action.VIEW -d "{deep_link}" {PACKAGE_NAME}'
+    run_root_text(cmd)
+    log(f"ยิงคำสั่งเข้าแมพ {place_id} สำเร็จ! รอโหลดเข้าเกม 35 วินาที...", GREEN)
+    time.sleep(35)
 
 # ================= หน้าตาเมนูหลัก (ORIGINAL) =================
 def print_ui(cfg):
@@ -237,8 +254,7 @@ def menu_2_set_webhook(cfg):
         if test == "y":
             log("กำลังแคปหน้าจอและส่งไปที่ Discord...", YELLOW)
             send_webhook_report(cfg, "ทดสอบระบบแคปหน้าจอจากโปรแกรม ORIGINAL", include_screenshot=True)
-            # 👇 แก้ไขบรรทัดนี้: เปลี่ยนจาก safe_input เป็น input ธรรมดา
-            input("\nกด Enter เพื่อกลับสู่เมนูหลัก...")
+            input("\nกด Enter เพื่อกลับสู่เมนูหลัก...") # แก้ไขให้ใช้ input ปกติ
 
 def menu_3_start_rejoin(cfg):
     if not cfg['place_id']:
@@ -287,21 +303,4 @@ def menu_3_start_rejoin(cfg):
     except KeyboardInterrupt:
         subprocess.run(["termux-wake-unlock"], stderr=subprocess.DEVNULL)
         log("หยุดการทำงานกลับสู่เมนูหลัก...", YELLOW)
-        time.sleep(1)
-
-# ================= ลูปหลักของโปรแกรม =================
-def main():
-    cfg = load_config()
-    while True:
-        print_ui(cfg)
-        choice = safe_input(f"{BOLD_WHITE}เลือกเมนู: {RESET}")
-
-        if choice == "1": menu_1_set_map(cfg)
-        elif choice == "2": menu_2_set_webhook(cfg)
-        elif choice == "3": menu_3_start_rejoin(cfg)
-        elif choice == "0":
-            print(f"\n{CYAN}ออกจากโปรแกรม ORIGINAL เรียบร้อย{RESET}")
-            sys.exit(0)
-
-if __name__ == "__main__":
-    main()
+        time.sleep(
