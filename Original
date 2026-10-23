@@ -30,8 +30,7 @@ DEFAULT_CONFIG = {
     "webhook_url": "",
     "screenshot_minutes": 10,
     "check_interval": 15,
-    "enable_heartbeat": False,
-    "clear_ram_hours": 1.0  # ค่าเริ่มต้น เคลียร์ RAM ทุกๆ 1 ชั่วโมง
+    "clear_ram_hours": 1.0
 }
 
 # ================= ฟังก์ชันแก้บัคพิมพ์ข้าม =================
@@ -127,21 +126,6 @@ def get_latest_roblox_log():
            f"if [ -n \"$LATEST\" ]; then tail -n 150 \"$LATEST\"; fi")
     return run_root_text(cmd)
 
-def check_script_heartbeat(heartbeat_state):
-    cmd = (f"LOG_DIR=/data/data/{PACKAGE_NAME}/files/appData/logs; "
-           f"LATEST=$(ls -t $LOG_DIR/*.log 2>/dev/null | head -n 1); "
-           f"if [ -n \"$LATEST\" ]; then grep -c '\\[ORIGINAL_BOT_ACTIVE\\]' \"$LATEST\"; else echo '0'; fi")
-    res = run_root_text(cmd)
-    try:
-        current_count = int(res)
-    except Exception:
-        current_count = 0
-        
-    if current_count > heartbeat_state["count"]:
-        heartbeat_state["count"] = current_count
-        heartbeat_state["last_time"] = time.time()
-    return heartbeat_state
-
 def analyze_game_health(cfg):
     target_place_id = str(cfg.get("place_id", "")).strip()
 
@@ -192,7 +176,6 @@ def join_roblox(cfg):
     run_root_text(f"am force-stop {PACKAGE_NAME}")
     run_root_text(f"rm -rf /data/data/{PACKAGE_NAME}/files/appData/logs/*.log")
     
-    # เคลียร์ RAM แบบ 100% ทุกครั้งที่มีการเด้งเข้าเกมใหม่
     clear_system_ram()
     time.sleep(3)
 
@@ -207,8 +190,6 @@ def join_roblox(cfg):
 # ================= หน้าตาเมนูหลัก (ORIGINAL) =================
 def print_ui(cfg):
     os.system("clear")
-    hb_status = f"{GREEN}ON{RESET}" if cfg.get('enable_heartbeat') else f"{RED}OFF{RESET}"
-    
     banner = f"""{BRIGHT_CYAN} ██████╗ ██████╗ ██╗ ██████╗ ██╗███╗   ██╗ █████╗ ██╗     
 ██╔═══██╗██╔══██╗██║██╔════╝ ██║████╗  ██║██╔══██╗██║     
 ██║   ██║██████╔╝██║██║  ███╗██║██╔██╗ ██║███████║██║     
@@ -219,15 +200,13 @@ def print_ui(cfg):
 {CYAN}Termux  •  Rooted  •  Android{RESET}
 {BRIGHT_CYAN}──────────────────────────────────────────────────────────{RESET}
 {CYAN}• Place ID ปัจจุบัน :{RESET} {BOLD_WHITE}{cfg['place_id'] or 'ยังไม่ได้ตั้งค่า'}{RESET}
-{CYAN}• ระบบจับสคริปต์ตาย  :{RESET} {hb_status} (ต้องการไฟล์ heartbeat.lua ใน autoexec)
 {CYAN}• Auto Clear RAM  :{RESET} {GREEN}เคลียร์อัตโนมัติทุกๆ {cfg.get('clear_ram_hours', 1)} ชั่วโมง{RESET}
 {BRIGHT_CYAN}──────────────────────────────────────────────────────────{RESET}
 
 {BOLD_WHITE}1) ตั้งค่าแมพที่จะ Rejoin (ใส่ Place ID / VIP Server)
 2) ตั้งค่า Discord Webhook และเวลาแคปหน้าจอรายงานผล
 3) เริ่มการทำงานโปรแกรม Auto Rejoin
-4) เปิด/ปิด ระบบชีพจรตรวจสอบสคริปต์ค้าง
-5) ตั้งค่าเวลา Auto Clear RAM (กันเกมเด้ง)
+4) ตั้งค่าเวลา Auto Clear RAM (กันเกมเด้ง)
 0) ออกจากโปรแกรม{RESET}
 """
     print(banner)
@@ -259,21 +238,8 @@ def menu_2_set_webhook(cfg):
             send_webhook_report(cfg, "ทดสอบระบบแคปหน้าจอจากโปรแกรม ORIGINAL", include_screenshot=True)
             input("\nกด Enter เพื่อกลับสู่เมนูหลัก...") 
 
-def menu_4_heartbeat(cfg):
-    print(f"\n{BRIGHT_CYAN}--- [4] ระบบชีพจรตรวจสอบสคริปต์ตาย ---{RESET}")
-    print(f"{YELLOW}ระบบนี้จะบังคับปิดเกมอัตโนมัติหากสคริปต์ในเกมหยุดทำงานหรือบัคเกิน 5 นาที{RESET}")
-    ans = safe_input("ต้องการเปิดใช้งานระบบนี้หรือไม่? (y/n): ").lower()
-    if ans == 'y':
-        cfg['enable_heartbeat'] = True
-        print(f"{GREEN}เปิดใช้งานสำเร็จ! อย่าลืมใส่ไฟล์ heartbeat.lua ในโฟลเดอร์ autoexec{RESET}")
-    elif ans == 'n':
-        cfg['enable_heartbeat'] = False
-        print(f"{YELLOW}ปิดการใช้งานเรียบร้อย{RESET}")
-    save_config(cfg)
-    input("\nกด Enter เพื่อกลับสู่เมนูหลัก...")
-
-def menu_5_ram(cfg):
-    print(f"\n{BRIGHT_CYAN}--- [5] ตั้งค่า Auto Clear RAM ---{RESET}")
+def menu_4_ram(cfg):
+    print(f"\n{BRIGHT_CYAN}--- [4] ตั้งค่า Auto Clear RAM ---{RESET}")
     val = safe_input(f"ต้องการให้ระบบเคลียร์แคชมือถือทุกๆ กี่ชั่วโมง? (ใส่จุดทศนิยมได้ เช่น 1.5): ")
     try:
         if float(val) > 0:
@@ -291,7 +257,7 @@ def menu_3_start_rejoin(cfg):
         return
 
     print(f"\n{BRIGHT_CYAN}--- [3] เริ่มระบบ Smart Auto Rejoin ---{RESET}")
-    print(f"{YELLOW}(กดปุ่ม Ctrl + C เพื่อหยุดการทำงานและกลับสู่เมนู){RESET}\n")
+    print(f"{YELLOW}(กดปุ่ม CTRL + c เพื่อหยุดการทำงานและกลับสู่เมนูหลัก){RESET}\n")
 
     subprocess.run(["termux-wake-lock"], stderr=subprocess.DEVNULL)
     
@@ -300,7 +266,6 @@ def menu_3_start_rejoin(cfg):
     
     last_screenshot_time = time.time()
     last_ram_clear = time.time()
-    heartbeat_state = {"count": 0, "last_time": time.time() + 180}
 
     if not is_roblox_running():
         log("ยังไม่ได้เปิดเกม กำลังสั่งเข้าแมพครั้งแรก...", CYAN)
@@ -315,38 +280,22 @@ def menu_3_start_rejoin(cfg):
                 time.sleep(10)
                 continue
 
-            # 1. เช็คเกมเด้ง/ค้าง/เน็ตหลุด
             is_healthy, reason = analyze_game_health(cfg)
             if not is_healthy:
                 log(f"⚠️ ตรวจพบปัญหา: {reason}", RED)
                 send_webhook_report(cfg, f"⚠️ **ตรวจพบปัญหา:** {reason}\n🔄 กำลังทำการ Rejoin เข้าแมพใหม่...", include_screenshot=True)
                 join_roblox(cfg)
-                heartbeat_state = {"count": 0, "last_time": time.time() + 180}
                 last_ram_clear = time.time()
                 send_webhook_report(cfg, f"✅ **Rejoin สำเร็จแล้ว**", include_screenshot=True)
                 last_screenshot_time = time.time()
                 continue
 
-            # 2. เช็คสัญญาณชีพจรสคริปต์ (ถ้าเปิด)
-            if cfg.get("enable_heartbeat"):
-                heartbeat_state = check_script_heartbeat(heartbeat_state)
-                if time.time() - heartbeat_state["last_time"] > 300:
-                    log("⚠️ สคริปต์ฟาร์มหยุดทำงาน! (Heartbeat Dead) กำลัง Rejoin...", RED)
-                    send_webhook_report(cfg, "⚠️ **สคริปต์ฟาร์มไม่ตอบสนอง**\n🔄 กำลังทำการ Rejoin เพื่อรีเฟรชสคริปต์ใหม่...", include_screenshot=True)
-                    join_roblox(cfg)
-                    heartbeat_state = {"count": 0, "last_time": time.time() + 180}
-                    last_ram_clear = time.time()
-                    send_webhook_report(cfg, "✅ **Rejoin รีเฟรชสคริปต์สำเร็จแล้ว**", include_screenshot=False)
-                    continue
-
-            # 3. ระบบเคลียร์ RAM อัตโนมัติตามชั่วโมงที่ตั้งไว้
             if time.time() - last_ram_clear >= ram_interval_sec:
                 log(f"ครบกำหนด {cfg.get('clear_ram_hours')} ชั่วโมง กำลังเคลียร์แคช RAM ของระบบ...", YELLOW)
                 clear_system_ram()
                 log("เคลียร์ RAM สำเร็จ ช่วยลดอาการเกมหน่วง!", GREEN)
                 last_ram_clear = time.time()
 
-            # 4. แคปหน้าจอส่งรายงาน
             if cfg['webhook_url'] and (time.time() - last_screenshot_time >= screenshot_interval_sec):
                 log(f"ครบกำหนด {cfg['screenshot_minutes']} นาที แคปหน้าจอส่งรายงาน...", CYAN)
                 send_webhook_report(cfg, f"📸 รายงานสถานะหน้าจอประจำรอบ ({cfg['screenshot_minutes']} นาที) - เกมทำงานปกติ", include_screenshot=True)
@@ -354,9 +303,19 @@ def menu_3_start_rejoin(cfg):
 
             time.sleep(cfg['check_interval'])
 
+    # ส่วนนี้คือระบบหยุดการทำงานเมื่อกด CTRL + C
     except KeyboardInterrupt:
         subprocess.run(["termux-wake-unlock"], stderr=subprocess.DEVNULL)
-        log("หยุดการทำงานกลับสู่เมนูหลัก...", YELLOW)
+        print(f"\n\n{YELLOW}🛑 หยุดการทำงานของบอทเฝ้าจอแล้ว{RESET}")
+        
+        # ถามผู้ใช้ว่าต้องการปิดเกมด้วยไหม
+        ans = safe_input("คุณต้องการบังคับปิดแอป Roblox ด้วยหรือไม่? (y/n): ").lower()
+        if ans == 'y':
+            run_root_text(f"am force-stop {PACKAGE_NAME}")
+            log("ปิดแอป Roblox เรียบร้อยแล้ว", GREEN)
+        else:
+            log("ปล่อยให้เกมทำงานต่อไป", CYAN)
+            
         time.sleep(1)
 
 # ================= ลูปหลักของโปรแกรม =================
@@ -369,8 +328,7 @@ def main():
         if choice == "1": menu_1_set_map(cfg)
         elif choice == "2": menu_2_set_webhook(cfg)
         elif choice == "3": menu_3_start_rejoin(cfg)
-        elif choice == "4": menu_4_heartbeat(cfg)
-        elif choice == "5": menu_5_ram(cfg)
+        elif choice == "4": menu_4_ram(cfg)
         elif choice == "0":
             print(f"\n{CYAN}ออกจากโปรแกรม ORIGINAL เรียบร้อย{RESET}")
             sys.exit(0)
