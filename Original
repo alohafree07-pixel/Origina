@@ -123,7 +123,7 @@ def is_roblox_running():
 
 def get_latest_roblox_log():
     cmd = (f"LOG_DIR=/data/data/{PACKAGE_NAME}/files/appData/logs; "
-           f"LATEST=$(ls -t$LOG_DIR/*.log 2>/dev/null | head -n 1); "
+           f"LATEST=$(ls -t $LOG_DIR/*.log 2>/dev/null | head -n 1); "
            f"if [ -n \"$LATEST\" ]; then tail -n 150 \"$LATEST\"; fi")
     return run_root_text(cmd)
 
@@ -303,4 +303,21 @@ def menu_3_start_rejoin(cfg):
     except KeyboardInterrupt:
         subprocess.run(["termux-wake-unlock"], stderr=subprocess.DEVNULL)
         log("หยุดการทำงานกลับสู่เมนูหลัก...", YELLOW)
-        time.sleep(
+        time.sleep(1)
+
+# ================= ลูปหลักของโปรแกรม =================
+def main():
+    cfg = load_config()
+    while True:
+        print_ui(cfg)
+        choice = safe_input(f"{BOLD_WHITE}เลือกเมนู: {RESET}")
+
+        if choice == "1": menu_1_set_map(cfg)
+        elif choice == "2": menu_2_set_webhook(cfg)
+        elif choice == "3": menu_3_start_rejoin(cfg)
+        elif choice == "0":
+            print(f"\n{CYAN}ออกจากโปรแกรม ORIGINAL เรียบร้อย{RESET}")
+            sys.exit(0)
+
+if __name__ == "__main__":
+    main()
