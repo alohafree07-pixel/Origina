@@ -5,6 +5,7 @@ import json
 import subprocess
 import asyncio
 import io
+import base64
 from datetime import datetime
 
 try:
@@ -35,7 +36,9 @@ DEFAULT_CONFIG = {
     "channel_id": "",
     "screenshot_minutes": 10,
     "check_interval": 15,
-    "clear_ram_hours": 1.0
+    "clear_ram_hours": 1.0,
+    "autoexec_path": "/sdcard/Delta/autoexec",
+    "executor_name": "delta"
 }
 
 # ================= ฟังก์ชันแก้บัคพิมพ์ข้าม =================
@@ -76,6 +79,14 @@ def run_root_text(cmd):
 
 def clear_system_ram():
     run_root_text("sync && echo 3 > /proc/sys/vm/drop_caches")
+
+def clear_termux_junk():
+    # ลบไฟล์ Cache ของระบบและ Python ใน Termux
+    os.system("rm -rf ~/.cache/*")
+    # เคลียร์แพ็กเกจที่ดาวน์โหลดมาค้างไว้
+    subprocess.run(["apt", "clean"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    # ลบไฟล์ชั่วคราว
+    os.system("rm -rf $PREFIX/tmp/*")
 
 def capture_screenshot_bytes():
     try:
@@ -141,14 +152,32 @@ async def join_roblox_async(cfg):
     log(f"ยิงคำสั่งเข้าแมพ {place_id} สำเร็จ! รอโหลดเข้าเกม 35 วินาที...", GREEN)
     await asyncio.sleep(35)
 
-def analyze_game_health(cfg):
+def analyze_game_health(cfg, state=None):
     target_place_id = str(cfg.get("place_id", "")).strip()
-    if not run_root_text(f"pidof {PACKAGE_NAME}"): return False, "แอป Roblox ปิดตัวลง (App Crashed)"
     
     dumpsys_focus = run_root_text("dumpsys window windows | grep -E 'mCurrentFocus|mFocusedApp'")
-    if "Application Not Responding" in dumpsys_focus: return False, "ตัวเกมค้างไม่ตอบสนอง (System ANR)"
+    if "com.android.vending" in dumpsys_focus or "Google Play" in dumpsys_focus:
+        return False, "เด้งไป Play Store (เกมบังคับอัปเดตแพทช์)"
+        
+    if not run_root_text(f"pidof {PACKAGE_NAME}"): 
+        return False, "แอป Roblox ปิดตัวลง (App Crashed)"
+        
+    if "Application Not Responding" in dumpsys_focus: 
+        return False, "ตัวเกมค้างไม่ตอบสนอง (System ANR)"
 
-    log_text = run_root_text(f"LOG_DIR=/data/data/{PACKAGE_NAME}/files/appData/logs; LATEST=$(ls -t $LOG_DIR/*.log 2>/dev/null | head -n 1); if [ -n \"$LATEST\" ]; then tail -n 150 \"$LATEST\"; fi")
+    log_text = run_root_text(f"LOG_DIR=/data/data/{PACKAGE_NAME}/files/appData/logs; LATEST=$(ls -t $LOG_DIR/*.log 2>/dev/null | head -n 1); if [ -n \"$LATEST\" ]; then tail -n 250 \"$LATEST\"; fi")
+    ui_xml = run_root_text("uiautomator dump /sdcard/orig_ui.xml && cat /sdcard/orig_ui.xml")
+    
+    executor = str(cfg.get("executor_name", "")).lower().strip()
+    if executor and executor != "none" and state:
+        if time.time() - state.get("game_start_time", time.time()) > 120:
+            found_exec = False
+            if log_text and executor in log_text.lower(): found_exec = True
+            if ui_xml and executor in ui_xml.lower(): found_exec = True
+            
+            if not found_exec:
+                return False, f"ไม่พบร่องรอยการทำงานของ '{executor}' บนหน้าจอ (Executor Crash / โหลดไม่ขึ้น)"
+
     if log_text:
         log_lower = log_text.lower()
         if "pss4" in log_lower or "datastores not loading" in log_lower: return False, "เซิร์ฟเวอร์แมพมีปัญหา (Error Code PSS4)"
@@ -164,9 +193,9 @@ def analyze_game_health(cfg):
                     if target_place_id not in line: return False, f"ตรวจพบการอยู่ในแมพอื่นที่ไม่ใช่ Place ID: {target_place_id}"
                     break
 
-    ui_xml = run_root_text("uiautomator dump /sdcard/orig_ui.xml && cat /sdcard/orig_ui.xml")
     if ui_xml:
         ui_lower = ui_xml.lower()
+        if "upgrade" in ui_lower and "roblox" in ui_lower: return False, "หน้าจอแจ้งเตือนให้อัปเดตเวอร์ชัน (Upgrade Required)"
         if "pss4" in ui_lower or "datastores not loading" in ui_lower: return False, "หน้าจอแจ้งเตือนเซิร์ฟเวอร์แมพมีปัญหา (Error Code PSS4)"
         if "same account" in ui_lower or "273" in ui_lower: return False, "ตรวจพบคนเข้าไอดีซ้อนบนหน้าจอ (Error 273)"
         if "kicked by this experience" in ui_lower: return False, "หน้าจอแจ้งเตือนถูกเตะออกจากแมพ (Kicked by Experience)"
@@ -251,7 +280,8 @@ def menu_3_start_bot(cfg):
     state = {
         "last_screenshot": time.time(),
         "last_ram_clear": time.time(),
-        "paused": False
+        "paused": False,
+        "game_start_time": time.time()
     }
 
     # ================= หน้าต่าง Popup เวลาป้อนแมพใหม่ =================
@@ -268,19 +298,62 @@ def menu_3_start_bot(cfg):
 
         async def rejoin_and_report(self, channel):
             await join_roblox_async(cfg)
+            state["game_start_time"] = time.time()
             await send_bot_report(channel, f"✅ เปลี่ยนเป็นแมพ `{cfg['place_id']}` เสร็จสิ้น", True)
+
+    # ================= หน้าต่าง Popup สำหรับสร้างไฟล์ AutoExecute =================
+    class AddScriptModal(discord.ui.Modal, title='📝 เพิ่มสคริปต์ฟาร์ม (Add Script)'):
+        filename_input = discord.ui.TextInput(label='ชื่อไฟล์ (ต้องลงท้ายด้วย .lua)', placeholder='เช่น farm.lua', required=True)
+        script_input = discord.ui.TextInput(label='โค้ดสคริปต์ (Script Code)', style=discord.TextStyle.paragraph, placeholder='loadstring(...)', required=True)
+
+        async def on_submit(self, interaction: discord.Interaction):
+            path = cfg.get("autoexec_path", "/sdcard/Delta/autoexec").strip()
+            filename = self.filename_input.value.strip()
+            if not filename.endswith('.lua'): filename += '.lua'
+            file_path = f"{path}/{filename}"
+            
+            encoded_script = base64.b64encode(self.script_input.value.encode('utf-8')).decode('utf-8')
+            cmd = f"mkdir -p \"{path}\" && echo \"{encoded_script}\" | base64 -d > \"{file_path}\""
+            run_root_text(cmd)
+            
+            await interaction.response.send_message(f"✅ สร้างไฟล์ `{filename}` ลงในโฟลเดอร์ AutoExecute สำเร็จ!", ephemeral=True)
+            log(f"บันทึกไฟล์สคริปต์ใหม่: {filename}", GREEN)
+
+    # ================= หน้าต่าง Popup สำหรับลบไฟล์ AutoExecute =================
+    class DeleteScriptModal(discord.ui.Modal, title='🗑️ ลบสคริปต์ฟาร์ม (Delete Script)'):
+        filename_input = discord.ui.TextInput(label='ชื่อไฟล์ที่ต้องการลบ (รวม .lua)', placeholder='เช่น farm.lua', required=True)
+
+        async def on_submit(self, interaction: discord.Interaction):
+            path = cfg.get("autoexec_path", "/sdcard/Delta/autoexec").strip()
+            filename = self.filename_input.value.strip()
+            if not filename.endswith('.lua'): filename += '.lua'
+            file_path = f"{path}/{filename}"
+            
+            cmd = f"if [ -f \"{file_path}\" ]; then rm -f \"{file_path}\"; echo 'OK'; else echo 'FAIL'; fi"
+            res = run_root_text(cmd)
+            
+            if res == 'OK':
+                await interaction.response.send_message(f"🗑️ ลบไฟล์ `{filename}` ออกจาก AutoExecute เรียบร้อยแล้ว!", ephemeral=True)
+                log(f"ลบไฟล์สคริปต์: {filename}", YELLOW)
+            else:
+                await interaction.response.send_message(f"❌ หาไฟล์ `{filename}` ไม่พบในโฟลเดอร์ {path}", ephemeral=True)
+                log(f"พยายามลบสคริปต์ {filename} แต่หาไฟล์ไม่เจอ", RED)
 
     # ================= หน้าต่าง Popup สำหรับแก้ไขการตั้งค่ารวม =================
     class SettingsModal(discord.ui.Modal, title='⚙️ แก้ไขการตั้งค่าโปรแกรม (Settings)'):
         def __init__(self):
             super().__init__()
             self.inp_pid = discord.ui.TextInput(label='Place ID ปัจจุบัน', default=str(cfg.get('place_id', '')), required=True)
-            self.inp_sm = discord.ui.TextInput(label='รอบแคปหน้าจอส่งเข้าดิส (นาที)', default=str(cfg.get('screenshot_minutes', 10)), required=True)
-            self.inp_rh = discord.ui.TextInput(label='รอบ Auto Clear RAM (ชั่วโมง)', default=str(cfg.get('clear_ram_hours', 1.0)), required=True)
+            self.inp_sm = discord.ui.TextInput(label='รอบแคปหน้าจอ (นาที)', default=str(cfg.get('screenshot_minutes', 10)), required=True)
+            self.inp_rh = discord.ui.TextInput(label='รอบ Clear RAM (ชั่วโมง)', default=str(cfg.get('clear_ram_hours', 1.0)), required=True)
+            self.inp_exec = discord.ui.TextInput(label='โฟลเดอร์ AutoExec', default=str(cfg.get('autoexec_path', '/sdcard/Delta/autoexec')), required=True)
+            self.inp_exec_name = discord.ui.TextInput(label='ชื่อโปรแกรมฟาร์ม (ดักจับแครช / none=ปิด)', default=str(cfg.get('executor_name', 'delta')), required=True)
             
             self.add_item(self.inp_pid)
             self.add_item(self.inp_sm)
             self.add_item(self.inp_rh)
+            self.add_item(self.inp_exec)
+            self.add_item(self.inp_exec_name)
 
         async def on_submit(self, interaction: discord.Interaction):
             cfg['place_id'] = self.inp_pid.value
@@ -288,13 +361,15 @@ def menu_3_start_bot(cfg):
             except: pass
             try: cfg['clear_ram_hours'] = float(self.inp_rh.value)
             except: pass
+            cfg['autoexec_path'] = self.inp_exec.value
+            cfg['executor_name'] = self.inp_exec_name.value
             save_config(cfg)
             
-            summary = f"✅ **อัปเดตการตั้งค่าเรียบร้อย! (มีผลทันที)**\n🎮 Place ID: `{cfg['place_id']}`\n📸 แคปจอทุก: `{cfg['screenshot_minutes']}` นาที\n🧹 เคลียร์ RAM ทุก: `{cfg['clear_ram_hours']}` ชั่วโมง"
+            summary = f"✅ **อัปเดตการตั้งค่าเรียบร้อย!**\n🎮 Place ID: `{cfg['place_id']}`\n🕵️ ดักจับแครช: `{cfg['executor_name']}`"
             await interaction.response.send_message(summary, ephemeral=True)
             log("อัปเดตการตั้งค่าระบบผ่าน Discord สำเร็จ", GREEN)
 
-    # ================= คลาสสำหรับสร้างปุ่มกด 10 ปุ่ม =================
+    # ================= คลาสสำหรับสร้างปุ่มกด =================
     class ControlView(discord.ui.View):
         def __init__(self):
             super().__init__(timeout=None) 
@@ -315,6 +390,7 @@ def menu_3_start_bot(cfg):
 
         async def rejoin_task(self, channel):
             await join_roblox_async(cfg)
+            state["game_start_time"] = time.time()
             await send_bot_report(channel, "✅ บังคับ Rejoin จากปุ่มกดเสร็จสิ้น", True)
 
         @discord.ui.button(label="🛑 Stop Game", style=discord.ButtonStyle.danger, row=0, custom_id="btn_stop")
@@ -323,13 +399,19 @@ def menu_3_start_bot(cfg):
             run_root_text(f"am force-stop {PACKAGE_NAME}")
             await interaction.response.send_message("🛑 สั่งบังคับปิดแอป Roblox แล้ว (บอทยังออนไลน์รอคำสั่ง)", ephemeral=True)
 
-        # --- แถวที่ 2: ปุ่มจัดการระบบ ---
+        # --- แถวที่ 2: ปุ่มจัดการระบบและทรัพยากร ---
         @discord.ui.button(label="🧹 Clear RAM", style=discord.ButtonStyle.secondary, row=1, custom_id="btn_ram")
         async def btn_ram(self, interaction: discord.Interaction, button: discord.ui.Button):
             log("ได้รับคำสั่งเคลียร์ RAM", YELLOW)
             clear_system_ram()
             state["last_ram_clear"] = time.time()
             await interaction.response.send_message("🧹 สั่งเคลียร์แคช RAM ในมือถือสำเร็จ!", ephemeral=True)
+            
+        @discord.ui.button(label="🧹 Clean Termux", style=discord.ButtonStyle.secondary, row=1, custom_id="btn_termux_junk")
+        async def btn_termux_junk(self, interaction: discord.Interaction, button: discord.ui.Button):
+            log("ได้รับคำสั่งเคลียร์ขยะ Termux", YELLOW)
+            clear_termux_junk()
+            await interaction.response.send_message("🧹 สั่งลบไฟล์ขยะและแคชที่ซ่อนอยู่ใน Termux สำเร็จ ได้พื้นที่คืน!", ephemeral=True)
 
         @discord.ui.button(label="🗺️ Change Map", style=discord.ButtonStyle.secondary, row=1, custom_id="btn_map")
         async def btn_map(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -339,19 +421,14 @@ def menu_3_start_bot(cfg):
         async def btn_update(self, interaction: discord.Interaction, button: discord.ui.Button):
             log("สั่งอัปเดตบอทจากปุ่มกด", YELLOW)
             await interaction.response.send_message("⬆️ กำลังดาวน์โหลดอัปเดตจาก GitHub...", ephemeral=True)
-            
-            # โหลดไฟล์มาทับไฟล์ปัจจุบันแบบเจาะจงที่อยู่
             url = "https://raw.githubusercontent.com/alohafree07-pixel/Origina/refs/heads/main/Original"
             script_path = os.path.abspath(sys.argv[0])
             os.system(f"curl -Ls \"{url}\" -o \"{script_path}\"")
             
             await interaction.followup.send("✅ อัปเดตโค้ดเรียบร้อย! กำลังรีสตาร์ทบอทใน 2 วินาที...", ephemeral=True)
-            
-            # สร้างฟังก์ชันหน่วงเวลาก่อนรีสตาร์ทตัวเอง เพื่อให้ข้อความฝั่ง Discord ทำงานเสร็จ
             async def restart_process():
                 await asyncio.sleep(2)
                 os.execv(sys.executable, [sys.executable] + sys.argv)
-                
             asyncio.create_task(restart_process())
             
         # --- แถวที่ 3: ปุ่มหยุดพัก และ ลบไฟล์ขยะ ---
@@ -359,7 +436,7 @@ def menu_3_start_bot(cfg):
         async def btn_pause(self, interaction: discord.Interaction, button: discord.ui.Button):
             state["paused"] = True
             log("หยุดพักระบบเฝ้าจอชั่วคราว (Paused)", YELLOW)
-            await interaction.response.send_message("⏸️ ระงับระบบเฝ้าจอชั่วคราวแล้ว! คุณสามารถกดเดินเล่นทำเควสเองได้เลย บอทจะไม่กวน", ephemeral=True)
+            await interaction.response.send_message("⏸️ ระงับระบบเฝ้าจอชั่วคราวแล้ว! บอทจะไม่ดึงเข้าเกมใหม่", ephemeral=True)
 
         @discord.ui.button(label="▶️ Resume Auto", style=discord.ButtonStyle.success, row=2, custom_id="btn_resume")
         async def btn_resume(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -367,7 +444,7 @@ def menu_3_start_bot(cfg):
             state["last_screenshot"] = time.time() 
             state["last_ram_clear"] = time.time()
             log("กลับมาเดินระบบเฝ้าจอต่อ (Resumed)", GREEN)
-            await interaction.response.send_message("▶️ ระบบเฝ้าจอกลับมาทำงานต่อแล้ว! จะเช็คหลุด/เด้งตามปกติ", ephemeral=True)
+            await interaction.response.send_message("▶️ ระบบเฝ้าจอกลับมาทำงานต่อแล้ว!", ephemeral=True)
 
         @discord.ui.button(label="🗑️ Clear Logs", style=discord.ButtonStyle.secondary, row=2, custom_id="btn_clear_logs")
         async def btn_clear_logs(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -375,10 +452,25 @@ def menu_3_start_bot(cfg):
             run_root_text(f"rm -rf /data/data/{PACKAGE_NAME}/files/appData/logs/*.log")
             await interaction.response.send_message("🗑️ ลบไฟล์ขยะ Log ของเกม Roblox เรียบร้อย ได้พื้นที่คืน!", ephemeral=True)
 
-        # --- แถวที่ 4: ปุ่ม Settings (แก้ไขการตั้งค่า) ---
+        # --- แถวที่ 4: ปุ่ม Settings และ AutoExecute ---
         @discord.ui.button(label="⚙️ Edit Settings", style=discord.ButtonStyle.secondary, row=3, custom_id="btn_settings")
         async def btn_settings(self, interaction: discord.Interaction, button: discord.ui.Button):
             await interaction.response.send_modal(SettingsModal())
+            
+        @discord.ui.button(label="📂 Check AutoExec", style=discord.ButtonStyle.secondary, row=3, custom_id="btn_check_exec")
+        async def btn_check_exec(self, interaction: discord.Interaction, button: discord.ui.Button):
+            path = cfg.get("autoexec_path", "/sdcard/Delta/autoexec").strip()
+            res = run_root_text(f"ls -1 \"{path}\"")
+            if not res: res = "ไม่มีไฟล์ในโฟลเดอร์ หรือหาโฟลเดอร์ไม่เจอ (ลองเช็ค Path ใน Settings)"
+            await interaction.response.send_message(f"📂 **รายการไฟล์ใน `{path}`:**\n```\n{res}\n```", ephemeral=True)
+            
+        @discord.ui.button(label="📝 Add Script", style=discord.ButtonStyle.success, row=3, custom_id="btn_add_script")
+        async def btn_add_script(self, interaction: discord.Interaction, button: discord.ui.Button):
+            await interaction.response.send_modal(AddScriptModal())
+
+        @discord.ui.button(label="❌ Del Script", style=discord.ButtonStyle.danger, row=3, custom_id="btn_del_script")
+        async def btn_del_script(self, interaction: discord.Interaction, button: discord.ui.Button):
+            await interaction.response.send_modal(DeleteScriptModal())
 
     async def send_bot_report(channel, message, include_screenshot=False):
         now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -403,11 +495,12 @@ def menu_3_start_bot(cfg):
         log(f"✅ เชื่อมต่อบอท Discord: {bot.user.name} สำเร็จ!", GREEN)
         channel = bot.get_channel(int(cfg['channel_id']))
         if channel:
-            await send_bot_report(channel, "🟢 เริ่มเดินระบบเฝ้าจอ Auto Rejoin แล้ว! (กดปุ่มด้านล่างเพื่อควบคุมบอท)")
+            await send_bot_report(channel, "🟢 เริ่มเดินระบบเฝ้าจอ Auto Rejoin แล้ว! (เพิ่มปุ่มลบขยะ Termux)")
         
         if not run_root_text(f"pidof {PACKAGE_NAME}"):
             log("ยังไม่ได้เปิดเกม กำลังสั่งเข้าแมพครั้งแรก...", CYAN)
             await join_roblox_async(cfg)
+            state["game_start_time"] = time.time()
 
         game_monitor_loop.start()
 
@@ -421,11 +514,19 @@ def menu_3_start_bot(cfg):
             log("⚠️ อินเทอร์เน็ตหลุด! กำลังรอสัญญาณ...", RED)
             return
 
-        is_healthy, reason = analyze_game_health(cfg)
+        is_healthy, reason = analyze_game_health(cfg, state)
         if not is_healthy:
             log(f"⚠️ ปัญหา: {reason}", RED)
+            
+            if "อัปเดต" in reason or "Upgrade" in reason or "Play Store" in reason:
+                state["paused"] = True
+                run_root_text(f"am force-stop {PACKAGE_NAME}")
+                if channel: await send_bot_report(channel, f"🚨 **หยุดทำงานอัตโนมัติ:** {reason}\n👉 *โปรดไปอัปเดตแอปผ่าน Play Store ด้วยตัวเอง แล้วค่อยมากดปุ่ม ▶️ Resume Auto นะครับ!*", True)
+                return
+                
             if channel: await send_bot_report(channel, f"⚠️ **ปัญหา:** {reason}\n🔄 กำลังทำการ Rejoin...", True)
             await join_roblox_async(cfg)
+            state["game_start_time"] = time.time()
             state["last_ram_clear"] = time.time()
             if channel: await send_bot_report(channel, f"✅ **Rejoin สำเร็จแล้ว**", True)
             state["last_screenshot"] = time.time()
@@ -434,7 +535,8 @@ def menu_3_start_bot(cfg):
         now = time.time()
         if now - state["last_ram_clear"] >= cfg.get('clear_ram_hours', 1) * 3600:
             clear_system_ram()
-            log("เคลียร์ RAM สำเร็จ", GREEN)
+            clear_termux_junk()
+            log("เคลียร์ RAM และขยะ Termux สำเร็จ", GREEN)
             state["last_ram_clear"] = now
 
         if now - state["last_screenshot"] >= cfg['screenshot_minutes'] * 60:
