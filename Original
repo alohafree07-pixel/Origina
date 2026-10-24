@@ -37,8 +37,7 @@ DEFAULT_CONFIG = {
     "screenshot_minutes": 10,
     "check_interval": 15,
     "clear_ram_hours": 1.0,
-    "autoexec_path": "/sdcard/Delta/autoexec",
-    "executor_name": "delta"
+    "autoexec_path": "/sdcard/Delta/autoexec"
 }
 
 # ================= ฟังก์ชันแก้บัคพิมพ์ข้าม =================
@@ -81,11 +80,8 @@ def clear_system_ram():
     run_root_text("sync && echo 3 > /proc/sys/vm/drop_caches")
 
 def clear_termux_junk():
-    # ลบไฟล์ Cache ของระบบและ Python ใน Termux
     os.system("rm -rf ~/.cache/*")
-    # เคลียร์แพ็กเกจที่ดาวน์โหลดมาค้างไว้
     subprocess.run(["apt", "clean"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    # ลบไฟล์ชั่วคราว
     os.system("rm -rf $PREFIX/tmp/*")
 
 def capture_screenshot_bytes():
@@ -167,16 +163,6 @@ def analyze_game_health(cfg, state=None):
 
     log_text = run_root_text(f"LOG_DIR=/data/data/{PACKAGE_NAME}/files/appData/logs; LATEST=$(ls -t $LOG_DIR/*.log 2>/dev/null | head -n 1); if [ -n \"$LATEST\" ]; then tail -n 250 \"$LATEST\"; fi")
     ui_xml = run_root_text("uiautomator dump /sdcard/orig_ui.xml && cat /sdcard/orig_ui.xml")
-    
-    executor = str(cfg.get("executor_name", "")).lower().strip()
-    if executor and executor != "none" and state:
-        if time.time() - state.get("game_start_time", time.time()) > 120:
-            found_exec = False
-            if log_text and executor in log_text.lower(): found_exec = True
-            if ui_xml and executor in ui_xml.lower(): found_exec = True
-            
-            if not found_exec:
-                return False, f"ไม่พบร่องรอยการทำงานของ '{executor}' บนหน้าจอ (Executor Crash / โหลดไม่ขึ้น)"
 
     if log_text:
         log_lower = log_text.lower()
@@ -347,13 +333,11 @@ def menu_3_start_bot(cfg):
             self.inp_sm = discord.ui.TextInput(label='รอบแคปหน้าจอ (นาที)', default=str(cfg.get('screenshot_minutes', 10)), required=True)
             self.inp_rh = discord.ui.TextInput(label='รอบ Clear RAM (ชั่วโมง)', default=str(cfg.get('clear_ram_hours', 1.0)), required=True)
             self.inp_exec = discord.ui.TextInput(label='โฟลเดอร์ AutoExec', default=str(cfg.get('autoexec_path', '/sdcard/Delta/autoexec')), required=True)
-            self.inp_exec_name = discord.ui.TextInput(label='ชื่อโปรแกรมฟาร์ม (ดักจับแครช / none=ปิด)', default=str(cfg.get('executor_name', 'delta')), required=True)
             
             self.add_item(self.inp_pid)
             self.add_item(self.inp_sm)
             self.add_item(self.inp_rh)
             self.add_item(self.inp_exec)
-            self.add_item(self.inp_exec_name)
 
         async def on_submit(self, interaction: discord.Interaction):
             cfg['place_id'] = self.inp_pid.value
@@ -362,14 +346,13 @@ def menu_3_start_bot(cfg):
             try: cfg['clear_ram_hours'] = float(self.inp_rh.value)
             except: pass
             cfg['autoexec_path'] = self.inp_exec.value
-            cfg['executor_name'] = self.inp_exec_name.value
             save_config(cfg)
             
-            summary = f"✅ **อัปเดตการตั้งค่าเรียบร้อย!**\n🎮 Place ID: `{cfg['place_id']}`\n🕵️ ดักจับแครช: `{cfg['executor_name']}`"
+            summary = f"✅ **อัปเดตการตั้งค่าเรียบร้อย!**\n🎮 Place ID: `{cfg['place_id']}`\n📂 โฟลเดอร์: `{cfg['autoexec_path']}`"
             await interaction.response.send_message(summary, ephemeral=True)
             log("อัปเดตการตั้งค่าระบบผ่าน Discord สำเร็จ", GREEN)
 
-    # ================= คลาสสำหรับสร้างปุ่มกด =================
+    # ================= คลาสสำหรับสร้างปุ่มกด 13 ปุ่ม =================
     class ControlView(discord.ui.View):
         def __init__(self):
             super().__init__(timeout=None) 
@@ -495,7 +478,7 @@ def menu_3_start_bot(cfg):
         log(f"✅ เชื่อมต่อบอท Discord: {bot.user.name} สำเร็จ!", GREEN)
         channel = bot.get_channel(int(cfg['channel_id']))
         if channel:
-            await send_bot_report(channel, "🟢 เริ่มเดินระบบเฝ้าจอ Auto Rejoin แล้ว! (เพิ่มปุ่มลบขยะ Termux)")
+            await send_bot_report(channel, "🟢 เริ่มเดินระบบเฝ้าจอ Auto Rejoin แล้ว!")
         
         if not run_root_text(f"pidof {PACKAGE_NAME}"):
             log("ยังไม่ได้เปิดเกม กำลังสั่งเข้าแมพครั้งแรก...", CYAN)
