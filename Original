@@ -72,9 +72,11 @@ def log(msg, color=CYAN):
 
 def run_root_text(cmd):
     try:
-        res = subprocess.run(["su", "-c", cmd], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=15)
+        # เพิ่ม errors='replace' เพื่อป้องกันบอทแครชเวลาอ่านเจอ Log ภาษาต่างดาวหรือตัวอักษรแปลกๆ
+        res = subprocess.run(["su", "-c", cmd], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=15, errors='replace')
         return res.stdout.strip()
-    except: return ""
+    except Exception as e: 
+        return ""
 
 def clear_system_ram():
     run_root_text("sync && echo 3 > /proc/sys/vm/drop_caches")
@@ -352,7 +354,7 @@ def menu_3_start_bot(cfg):
             await interaction.response.send_message(summary, ephemeral=True)
             log("อัปเดตการตั้งค่าระบบผ่าน Discord สำเร็จ", GREEN)
 
-    # ================= คลาสสำหรับสร้างปุ่มกด 13 ปุ่ม =================
+    # ================= คลาสสำหรับสร้างปุ่มกด =================
     class ControlView(discord.ui.View):
         def __init__(self):
             super().__init__(timeout=None) 
@@ -478,7 +480,7 @@ def menu_3_start_bot(cfg):
         log(f"✅ เชื่อมต่อบอท Discord: {bot.user.name} สำเร็จ!", GREEN)
         channel = bot.get_channel(int(cfg['channel_id']))
         if channel:
-            await send_bot_report(channel, "🟢 เริ่มเดินระบบเฝ้าจอ Auto Rejoin แล้ว!")
+            await send_bot_report(channel, "🟢 เริ่มเดินระบบเฝ้าจอ Auto Rejoin แล้ว! (เพิ่มระบบป้องกันลูปค้าง)")
         
         if not run_root_text(f"pidof {PACKAGE_NAME}"):
             log("ยังไม่ได้เปิดเกม กำลังสั่งเข้าแมพครั้งแรก...", CYAN)
@@ -487,45 +489,63 @@ def menu_3_start_bot(cfg):
 
         game_monitor_loop.start()
 
+    # 🛡️ 1. ป้องกันลูปเริ่มทำงานก่อนที่บอทจะเชื่อมต่อเสร็จสมบูรณ์
+    @game_monitor_loop.before_loop
+    async def before_game_monitor():
+        await bot.wait_until_ready()
+
+    # 🛡️ 2. ระบบ Auto-Restart หากลูปพังรุนแรง
+    @game_monitor_loop.error
+    async def game_monitor_error(error):
+        log(f"🚨 ลูปเฝ้าจอหลักพัง!: {error}", RED)
+        log("🔄 ระบบกำลังทำการรีสตาร์ทลูปเฝ้าจอใหม่ใน 5 วินาที...", YELLOW)
+        await asyncio.sleep(5)
+        game_monitor_loop.restart()
+
     @tasks.loop(seconds=cfg['check_interval'])
     async def game_monitor_loop():
-        if state.get("paused", False): return
+        # 🛡️ 3. ครอบโค้ดทั้งหมดด้วย try...except ป้องกันโค้ดบัคเงียบ
+        try:
+            if state.get("paused", False): return
 
-        channel = bot.get_channel(int(cfg['channel_id']))
-        
-        if not ("1 received" in run_root_text("ping -c 1 -W 3 8.8.8.8")):
-            log("⚠️ อินเทอร์เน็ตหลุด! กำลังรอสัญญาณ...", RED)
-            return
-
-        is_healthy, reason = analyze_game_health(cfg, state)
-        if not is_healthy:
-            log(f"⚠️ ปัญหา: {reason}", RED)
+            channel = bot.get_channel(int(cfg['channel_id']))
             
-            if "อัปเดต" in reason or "Upgrade" in reason or "Play Store" in reason:
-                state["paused"] = True
-                run_root_text(f"am force-stop {PACKAGE_NAME}")
-                if channel: await send_bot_report(channel, f"🚨 **หยุดทำงานอัตโนมัติ:** {reason}\n👉 *โปรดไปอัปเดตแอปผ่าน Play Store ด้วยตัวเอง แล้วค่อยมากดปุ่ม ▶️ Resume Auto นะครับ!*", True)
+            if not ("1 received" in run_root_text("ping -c 1 -W 3 8.8.8.8")):
+                log("⚠️ อินเทอร์เน็ตหลุด! กำลังรอสัญญาณ...", RED)
                 return
+
+            is_healthy, reason = analyze_game_health(cfg, state)
+            if not is_healthy:
+                log(f"⚠️ ปัญหา: {reason}", RED)
                 
-            if channel: await send_bot_report(channel, f"⚠️ **ปัญหา:** {reason}\n🔄 กำลังทำการ Rejoin...", True)
-            await join_roblox_async(cfg)
-            state["game_start_time"] = time.time()
-            state["last_ram_clear"] = time.time()
-            if channel: await send_bot_report(channel, f"✅ **Rejoin สำเร็จแล้ว**", True)
-            state["last_screenshot"] = time.time()
-            return
+                if "อัปเดต" in reason or "Upgrade" in reason or "Play Store" in reason:
+                    state["paused"] = True
+                    run_root_text(f"am force-stop {PACKAGE_NAME}")
+                    if channel: await send_bot_report(channel, f"🚨 **หยุดทำงานอัตโนมัติ:** {reason}\n👉 *โปรดไปอัปเดตแอปผ่าน Play Store ด้วยตัวเอง แล้วค่อยมากดปุ่ม ▶️ Resume Auto นะครับ!*", True)
+                    return
+                    
+                if channel: await send_bot_report(channel, f"⚠️ **ปัญหา:** {reason}\n🔄 กำลังทำการ Rejoin...", True)
+                await join_roblox_async(cfg)
+                state["game_start_time"] = time.time()
+                state["last_ram_clear"] = time.time()
+                if channel: await send_bot_report(channel, f"✅ **Rejoin สำเร็จแล้ว**", True)
+                state["last_screenshot"] = time.time()
+                return
 
-        now = time.time()
-        if now - state["last_ram_clear"] >= cfg.get('clear_ram_hours', 1) * 3600:
-            clear_system_ram()
-            clear_termux_junk()
-            log("เคลียร์ RAM และขยะ Termux สำเร็จ", GREEN)
-            state["last_ram_clear"] = now
+            now = time.time()
+            if now - state["last_ram_clear"] >= cfg.get('clear_ram_hours', 1) * 3600:
+                clear_system_ram()
+                clear_termux_junk()
+                log("เคลียร์ RAM และขยะ Termux สำเร็จ", GREEN)
+                state["last_ram_clear"] = now
 
-        if now - state["last_screenshot"] >= cfg['screenshot_minutes'] * 60:
-            log("แคปหน้าจอส่งรายงานอัตโนมัติ...", CYAN)
-            if channel: await send_bot_report(channel, f"📸 รายงานสถานะหน้าจอประจำรอบ", True)
-            state["last_screenshot"] = now
+            if now - state["last_screenshot"] >= cfg['screenshot_minutes'] * 60:
+                log("แคปหน้าจอส่งรายงานอัตโนมัติ...", CYAN)
+                if channel: await send_bot_report(channel, f"📸 รายงานสถานะหน้าจอประจำรอบ", True)
+                state["last_screenshot"] = now
+
+        except Exception as e:
+            log(f"🔥 ข้ามข้อผิดพลาดภายในระบบเฝ้าจอ: {e}", RED)
 
     try:
         bot.run(cfg['bot_token'], log_handler=None)
