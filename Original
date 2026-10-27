@@ -11,6 +11,7 @@ import shlex
 import shutil
 import glob
 import logging
+import hashlib
 import urllib.request
 from logging.handlers import RotatingFileHandler
 from datetime import datetime
@@ -59,7 +60,8 @@ DEFAULT_CONFIG = {
     "clear_ram_hours": 1.0,
     "join_wait_seconds": 35,
     "log_tail_lines": 250,
-    "autoexec_path": "/sdcard/Delta/autoexec"
+    "autoexec_path": "/sdcard/Delta/autoexec",
+    "update_sha256": ""  # ถ้าตั้งค่า SHA-256 จะตรวจไฟล์อัปเดตก่อนติดตั้ง
 }
 
 CFG = {}
@@ -384,6 +386,16 @@ def safe_update_script():
         return False, f"❌ ดาวน์โหลดไม่สำเร็จ: {e}"
     if len(data) < 5000:
         return False, "❌ ไฟล์ที่ดาวน์โหลดเล็กผิดปกติ ยกเลิกการอัปเดต (ไฟล์เดิมยังอยู่)"
+
+    # ถ้ากำหนด SHA-256 ไว้ใน config ให้ตรวจสอบก่อนติดตั้ง
+    expected_hash = str(CFG.get("update_sha256", "")).strip().lower()
+    if expected_hash:
+        if not re.fullmatch(r"[0-9a-f]{64}", expected_hash):
+            return False, "❌ update_sha256 ใน config ไม่ถูกต้อง (ต้องเป็น hex 64 ตัว)"
+        actual_hash = hashlib.sha256(data).hexdigest()
+        if actual_hash != expected_hash:
+            return False, "❌ SHA-256 ของไฟล์อัปเดตไม่ตรง ยกเลิกการอัปเดต"
+
     try:
         compile(data, "update_check", "exec")
     except SyntaxError as e:
@@ -543,11 +555,11 @@ async def do_rejoin(channel, done_message):
     """Rejoin โดยกันไม่ให้ทำซ้อนกัน"""
     async with STATE["lock"]:
         ok = await join_roblox_async(CFG)
-        now = time.time()
-        STATE["game_start_time"] = now
-        STATE["last_ram_clear"] = now
-        STATE["last_screenshot"] = now
         if ok:
+            now = time.time()
+            STATE["game_start_time"] = now
+            STATE["last_ram_clear"] = now
+            STATE["last_screenshot"] = now
             STATE["rejoin_total"] += 1
     if channel:
         await send_bot_report(channel, done_message if ok else "❌ Rejoin ไม่สำเร็จ (ตรวจสอบ Place ID / VIP Code)", True)
@@ -632,36 +644,48 @@ class SettingsModal(discord.ui.Modal, title='⚙️ แก้ไขการต�
             return await interaction.response.send_message("⛔ ไม่มีสิทธิ์", ephemeral=True)
 
         errors = []
+        updates = {}
+
         pid = self.inp_pid.value.strip()
         if valid_place_id(pid):
-            CFG['place_id'] = pid
+            updates["place_id"] = pid
         else:
             errors.append("Place ID ต้องเป็นตัวเลข")
+
         try:
-            v = int(self.inp_sm.value)
-            if v < 1:
+            screenshot_minutes = int(self.inp_sm.value)
+            if screenshot_minutes < 1:
                 raise ValueError
-            CFG['screenshot_minutes'] = v
+            updates["screenshot_minutes"] = screenshot_minutes
         except ValueError:
             errors.append("รอบแคปหน้าจอต้องเป็นจำนวนเต็ม ≥ 1")
+
         try:
-            v = float(self.inp_rh.value)
-            if v < 0.1:
+            clear_ram_hours = float(self.inp_rh.value)
+            if clear_ram_hours < 0.1:
                 raise ValueError
-            CFG['clear_ram_hours'] = v
+            updates["clear_ram_hours"] = clear_ram_hours
         except ValueError:
             errors.append("รอบ Clear RAM ต้องเป็นตัวเลข ≥ 0.1")
-        p = self.inp_exec.value.strip()
-        if valid_path(p):
-            CFG['autoexec_path'] = p
+
+        exec_path = self.inp_exec.value.strip()
+        if valid_path(exec_path):
+            updates["autoexec_path"] = exec_path
         else:
-            errors.append("โฟลเดอร์ AutoExec ต้องขึ้นต้นด้วย /sdcard หรือ /storage")
+            errors.append("โฟลเดอร์ AutoExec ต้องขึ้นต้นด้วย /sdcard, /storage หรือ /data/local/tmp")
+
+        # Atomic validation: ถ้ามีช่องใดผิด จะไม่บันทึกค่าใดเลย
+        if errors:
+            return await interaction.response.send_message(
+                "❌ **ยังไม่บันทึกการตั้งค่า**\n⚠️ กรุณาแก้ไข: " + ", ".join(errors),
+                ephemeral=True
+            )
+
+        CFG.update(updates)
         save_config(CFG)
 
         summary = (f"✅ **อัปเดตการตั้งค่า**\n🎮 Place ID: `{CFG['place_id']}`\n"
                    f"📂 โฟลเดอร์: `{CFG['autoexec_path']}`")
-        if errors:
-            summary += "\n⚠️ ค่าที่ไม่ถูกบันทึก: " + ", ".join(errors)
         await interaction.response.send_message(summary, ephemeral=True)
         log("อัปเดตการตั้งค่าระบบผ่าน Discord", GREEN)
 
@@ -872,7 +896,8 @@ def menu_3_start_bot(cfg):
             STATE["loop_restarts"] = 0
 
         except Exception as e:
-            log(f"🔥 ข้ามข้อผิดพลาดภายในระบบเฝ้าจอ: {e}", RED)
+            log(f"🔥 ระบบเฝ้าจอพบข้อผิดพลาด: {e}", RED)
+            raise
 
     @game_monitor_loop.before_loop
     async def before_game_monitor():
