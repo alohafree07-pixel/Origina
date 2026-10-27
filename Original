@@ -72,7 +72,6 @@ def log(msg, color=CYAN):
 
 def run_root_text(cmd):
     try:
-        # เพิ่ม errors='replace' เพื่อป้องกันบอทแครชเวลาอ่านเจอ Log ภาษาต่างดาวหรือตัวอักษรแปลกๆ
         res = subprocess.run(["su", "-c", cmd], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=15, errors='replace')
         return res.stdout.strip()
     except Exception as e: 
@@ -354,7 +353,7 @@ def menu_3_start_bot(cfg):
             await interaction.response.send_message(summary, ephemeral=True)
             log("อัปเดตการตั้งค่าระบบผ่าน Discord สำเร็จ", GREEN)
 
-    # ================= คลาสสำหรับสร้างปุ่มกด =================
+    # ================= คลาสสำหรับสร้างปุ่มกด 13 ปุ่ม =================
     class ControlView(discord.ui.View):
         def __init__(self):
             super().__init__(timeout=None) 
@@ -475,36 +474,9 @@ def menu_3_start_bot(cfg):
         except Exception as e:
             log(f"ส่งรายงานพลาด: {e}", RED)
 
-    @bot.event
-    async def on_ready():
-        log(f"✅ เชื่อมต่อบอท Discord: {bot.user.name} สำเร็จ!", GREEN)
-        channel = bot.get_channel(int(cfg['channel_id']))
-        if channel:
-            await send_bot_report(channel, "🟢 เริ่มเดินระบบเฝ้าจอ Auto Rejoin แล้ว! (เพิ่มระบบป้องกันลูปค้าง)")
-        
-        if not run_root_text(f"pidof {PACKAGE_NAME}"):
-            log("ยังไม่ได้เปิดเกม กำลังสั่งเข้าแมพครั้งแรก...", CYAN)
-            await join_roblox_async(cfg)
-            state["game_start_time"] = time.time()
-
-        game_monitor_loop.start()
-
-    # 🛡️ 1. ป้องกันลูปเริ่มทำงานก่อนที่บอทจะเชื่อมต่อเสร็จสมบูรณ์
-    @game_monitor_loop.before_loop
-    async def before_game_monitor():
-        await bot.wait_until_ready()
-
-    # 🛡️ 2. ระบบ Auto-Restart หากลูปพังรุนแรง
-    @game_monitor_loop.error
-    async def game_monitor_error(error):
-        log(f"🚨 ลูปเฝ้าจอหลักพัง!: {error}", RED)
-        log("🔄 ระบบกำลังทำการรีสตาร์ทลูปเฝ้าจอใหม่ใน 5 วินาที...", YELLOW)
-        await asyncio.sleep(5)
-        game_monitor_loop.restart()
-
+    # ================= 🛡️ ย้ายการสร้าง Task Loop ขึ้นมาก่อน =================
     @tasks.loop(seconds=cfg['check_interval'])
     async def game_monitor_loop():
-        # 🛡️ 3. ครอบโค้ดทั้งหมดด้วย try...except ป้องกันโค้ดบัคเงียบ
         try:
             if state.get("paused", False): return
 
@@ -546,6 +518,33 @@ def menu_3_start_bot(cfg):
 
         except Exception as e:
             log(f"🔥 ข้ามข้อผิดพลาดภายในระบบเฝ้าจอ: {e}", RED)
+
+    # ================= 🛡️ ใส่ระบบป้องกันหลังจากสร้าง Loop เสร็จ =================
+    @game_monitor_loop.before_loop
+    async def before_game_monitor():
+        await bot.wait_until_ready()
+
+    @game_monitor_loop.error
+    async def game_monitor_error(error):
+        log(f"🚨 ลูปเฝ้าจอหลักพัง!: {error}", RED)
+        log("🔄 ระบบกำลังทำการรีสตาร์ทลูปเฝ้าจอใหม่ใน 5 วินาที...", YELLOW)
+        await asyncio.sleep(5)
+        game_monitor_loop.restart()
+
+    # ================= Event พร้อมทำงาน และเปิด Loop =================
+    @bot.event
+    async def on_ready():
+        log(f"✅ เชื่อมต่อบอท Discord: {bot.user.name} สำเร็จ!", GREEN)
+        channel = bot.get_channel(int(cfg['channel_id']))
+        if channel:
+            await send_bot_report(channel, "🟢 เริ่มเดินระบบเฝ้าจอ Auto Rejoin แล้ว! (แก้บัคการเรียก Loop เรียบร้อย)")
+        
+        if not run_root_text(f"pidof {PACKAGE_NAME}"):
+            log("ยังไม่ได้เปิดเกม กำลังสั่งเข้าแมพครั้งแรก...", CYAN)
+            await join_roblox_async(cfg)
+            state["game_start_time"] = time.time()
+
+        game_monitor_loop.start() # สั่งให้ Loop เริ่มทำงาน
 
     try:
         bot.run(cfg['bot_token'], log_handler=None)
