@@ -78,26 +78,27 @@ STATE = {
 }
 BG_TASKS = set()
 
+# ตัวแปรสำหรับคุม Dashboard (ใหม่)
+DASHBOARD_ACTIVE = False
+LOG_HISTORY = []
+MAX_LOGS = 7  # จำนวนบรรทัด Log ที่จะแสดงในกรอบ Result
+
 # ================= ตัวตรวจสอบข้อมูล (กัน command injection) =================
 RE_PLACE = re.compile(r"\d{1,20}")
 RE_VIP = re.compile(r"[A-Za-z0-9_\-]{1,100}")
 RE_FILE = re.compile(r"[\w\-. ]{1,60}\.lua")
 RE_PATH = re.compile(r"/(sdcard|storage|data/local/tmp)(/[\w\-. ]+)*")
 
-
 def valid_place_id(v):
     return bool(RE_PLACE.fullmatch(str(v).strip()))
-
 
 def valid_vip(v):
     v = str(v).strip()
     return v == "" or bool(RE_VIP.fullmatch(v))
 
-
 def valid_path(v):
     v = str(v).strip()
     return bool(RE_PATH.fullmatch(v)) and ".." not in v
-
 
 def clean_filename(name):
     name = os.path.basename(str(name).strip())
@@ -107,12 +108,10 @@ def clean_filename(name):
         return None
     return name
 
-
 def is_authorized(user_id):
     return int(user_id) in CFG.get("allowed_users", [])
 
-
-# ================= Logging =================
+# ================= Logging & Dashboard Renderer =================
 logger = logging.getLogger("rbbot")
 logger.setLevel(logging.INFO)
 try:
@@ -122,12 +121,62 @@ try:
 except OSError:
     pass
 
+def print_bot_dashboard():
+    """ฟังก์ชันเรนเดอร์หน้าจอ Dashboard ล่าสุดพร้อม Log แบบเรียลไทม์"""
+    os.system("clear")
+    
+    if STATE.get("paused", False):
+        status_box = f"║ {YELLOW}⏸️ ระบบหยุดพักชั่วคราว (Paused) {CYAN}║"
+    else:
+        status_box = f"║ {GREEN}🟢 บอทกำลังทำงาน (Running)      {CYAN}║"
+
+    ui = f"""
+{BRIGHT_CYAN}       ██████╗ ███████╗    ██╗ ██████╗ ██╗███╗   ██╗
+       ██╔══██╗██╔════╝    ██║██╔═══██╗██║████╗  ██║
+       ██████╔╝█████╗      ██║██║   ██║██║██╔██╗ ██║
+       ██╔══██╗██╔══╝ ██   ██║██║   ██║██║██║╚██╗██║
+       ██║  ██║███████╗╚█████╔╝╚██████╔╝██║██║ ╚████║
+       ╚═╝  ╚═╝╚══════╝ ╚════╝  ╚═════╝ ╚═╝╚═╝  ╚═══╝{RESET}
+{BOLD_WHITE}            [ R O B L O X   A U T O   B O T ]{RESET}
+{CYAN}──────────────────────────────────────────────────────────────{RESET}
+
+{CYAN}  ╔═════════════════════════════════╗{RESET}
+{CYAN}  ║         📌 สถานะโปรแกรม         ║{RESET}
+{CYAN}  ╠═════════════════════════════════╣{RESET}
+{CYAN}  {status_box}{RESET}
+{CYAN}  ╚═════════════════════════════════╝{RESET}
+
+{ORANGE}  ╔═════════════════════════════════════════════════════╗{RESET}
+{ORANGE}  ║ 📝 RESULT (Live Logs){RESET}
+{ORANGE}  ╠═════════════════════════════════════════════════════╝{RESET}"""
+    print(ui)
+    
+    # พิมพ์ Log ล่าสุดลงในกล่อง Result
+    for line in LOG_HISTORY:
+        print(f"   {line}")
+        
+    # เติมบรรทัดว่างให้กรอบมีขนาดเท่าเดิมเสมอ
+    for _ in range(MAX_LOGS - len(LOG_HISTORY)):
+        print("")
+        
+    print(f"{ORANGE}  ───────────────────────────────────────────────────────{RESET}")
+    print(f"{YELLOW}         ( ⌨️ กดปุ่ม CTRL + C เพื่อกลับสู่เมนูหลัก ){RESET}\n")
 
 def log(msg, color=CYAN):
     now = datetime.now().strftime("%H:%M:%S")
-    print(f"{color}[{now}] {msg}{RESET}")
+    log_line = f"{color}[{now}] {msg}{RESET}"
     logger.info(msg)
-
+    
+    # เก็บประวัติ Log ไว้ 7 บรรทัดล่าสุด
+    LOG_HISTORY.append(log_line)
+    if len(LOG_HISTORY) > MAX_LOGS:
+        LOG_HISTORY.pop(0)
+        
+    # ถ้าระบบ Dashboard ทำงานอยู่ ให้ล้างจอและวาด UI ใหม่
+    if DASHBOARD_ACTIVE:
+        print_bot_dashboard()
+    else:
+        print(log_line)
 
 # ================= ฟังก์ชันแก้บัคพิมพ์ข้าม =================
 def safe_input(prompt_text):
@@ -141,7 +190,6 @@ def safe_input(prompt_text):
         return input(prompt_text).strip()
     except EOFError:
         return ""
-
 
 # ================= จัดการการตั้งค่า =================
 def load_config():
@@ -157,7 +205,6 @@ def load_config():
         cfg["allowed_users"] = []
     return cfg
 
-
 def save_config(cfg):
     with open(CONFIG_FILE, "w", encoding="utf-8") as f:
         json.dump(cfg, f, indent=4, ensure_ascii=False)
@@ -165,7 +212,6 @@ def save_config(cfg):
         os.chmod(CONFIG_FILE, 0o600)  # ไฟล์มี Bot Token ให้เจ้าของอ่านได้คนเดียว
     except OSError:
         pass
-
 
 # ================= คำสั่ง Root =================
 def run_root_text(cmd):
@@ -177,14 +223,11 @@ def run_root_text(cmd):
         logger.warning(f"run_root_text ผิดพลาด: {e}")
         return ""
 
-
 async def aroot(cmd):
     return await asyncio.to_thread(run_root_text, cmd)
 
-
 def clear_system_ram():
     run_root_text("sync && echo 3 > /proc/sys/vm/drop_caches")
-
 
 def clear_termux_junk():
     home = os.path.expanduser("~")
@@ -205,9 +248,7 @@ def clear_termux_junk():
     except Exception:
         pass
 
-
 def capture_screenshot_bytes():
-    # วิธีที่ 1: ส่งภาพออก stdout ตรงๆ
     try:
         res = subprocess.run(["su", "-c", "screencap -p"], stdout=subprocess.PIPE,
                              stderr=subprocess.PIPE, timeout=20)
@@ -215,7 +256,6 @@ def capture_screenshot_bytes():
             return res.stdout
     except Exception as e:
         logger.warning(f"screencap (stdout) พลาด: {e}")
-    # วิธีที่ 2: เขียนลงไฟล์ชั่วคราวแล้วอ่านกลับ (และลบทิ้งทุกครั้ง)
     try:
         cmd = f"screencap -p {SCREEN_TMP} && cat {SCREEN_TMP}; rm -f {SCREEN_TMP}"
         res = subprocess.run(["su", "-c", cmd], stdout=subprocess.PIPE,
@@ -226,9 +266,7 @@ def capture_screenshot_bytes():
         logger.warning(f"screencap (file) พลาด: {e}")
     return None
 
-
 async def check_internet():
-    """เช็คเน็ตด้วย TCP (ไม่พึ่ง ICMP/root) ลองหลายปลายทาง"""
     for host, port in (("1.1.1.1", 443), ("8.8.8.8", 53), ("google.com", 443)):
         try:
             _, w = await asyncio.wait_for(asyncio.open_connection(host, port), timeout=4)
@@ -237,7 +275,6 @@ async def check_internet():
         except Exception:
             continue
     return False
-
 
 # ================= ดึงข้อมูลสถานะเครื่อง =================
 def get_discord_embed(dev_name, is_paused):
@@ -285,7 +322,6 @@ def get_discord_embed(dev_name, is_paused):
     embed.add_field(name="⏰ Uptime", value=f"`{uptime_hrs} hours`", inline=True)
     return embed
 
-
 # ================= เข้าเกม / ตรวจสุขภาพเกม =================
 async def join_roblox_async(cfg):
     place_id = str(cfg.get("place_id", "")).strip()
@@ -312,10 +348,8 @@ async def join_roblox_async(cfg):
     await asyncio.sleep(wait)
     return True
 
-
 def _rx(pattern, text):
     return re.search(pattern, text) is not None
-
 
 def analyze_game_health(cfg):
     target_place_id = str(cfg.get("place_id", "")).strip()
@@ -374,7 +408,6 @@ def analyze_game_health(cfg):
 
     return True, "ปกติ"
 
-
 # ================= อัปเดตสคริปต์อย่างปลอดภัย =================
 def safe_update_script():
     script_path = os.path.abspath(sys.argv[0])
@@ -387,7 +420,6 @@ def safe_update_script():
     if len(data) < 5000:
         return False, "❌ ไฟล์ที่ดาวน์โหลดเล็กผิดปกติ ยกเลิกการอัปเดต (ไฟล์เดิมยังอยู่)"
 
-    # ถ้ากำหนด SHA-256 ไว้ใน config ให้ตรวจสอบก่อนติดตั้ง
     expected_hash = str(CFG.get("update_sha256", "")).strip().lower()
     if expected_hash:
         if not re.fullmatch(r"[0-9a-f]{64}", expected_hash):
@@ -410,7 +442,6 @@ def safe_update_script():
     except Exception as e:
         return False, f"❌ เขียนไฟล์ไม่สำเร็จ: {e}"
     return True, "✅ อัปเดตโค้ดเรียบร้อย (สำรองไฟล์เดิมเป็น .bak) กำลังรีสตาร์ทใน 2 วินาที..."
-
 
 # ================= เมนูหลัก =================
 def print_ui(cfg):
@@ -438,7 +469,6 @@ def print_ui(cfg):
 """
     print(banner)
 
-
 def menu_1_set_map(cfg):
     print(f"\n{BRIGHT_CYAN}--- [1] ตั้งค่าแมพสำหรับ Rejoin ---{RESET}")
     pid = safe_input(f"ใส่เลข Place ID [{cfg['place_id']}]: ")
@@ -455,7 +485,6 @@ def menu_1_set_map(cfg):
     save_config(cfg)
     print(f"{GREEN}✔ บันทึกเรียบร้อย!{RESET}")
     time.sleep(1.5)
-
 
 def menu_2_set_bot(cfg):
     print(f"\n{BRIGHT_CYAN}--- [2] ตั้งค่า Discord Bot ---{RESET}")
@@ -483,7 +512,6 @@ def menu_2_set_bot(cfg):
     print(f"{GREEN}✔ บันทึกการตั้งค่าบอทเรียบร้อย{RESET}")
     safe_input("\nกด Enter เพื่อกลับสู่เมนูหลัก...")
 
-
 def menu_4_ram(cfg):
     print(f"\n{BRIGHT_CYAN}--- [4] ตั้งค่า Auto Clear RAM ---{RESET}")
     val = safe_input("ระบบจะเคลียร์แคชทุกๆ กี่ชั่วโมง? (ใส่จุดทศนิยมได้ ขั้นต่ำ 0.1): ")
@@ -498,38 +526,12 @@ def menu_4_ram(cfg):
         print(f"{RED}✘ ค่าที่ใส่ไม่ใช่ตัวเลข{RESET}")
     safe_input("\nกด Enter เพื่อกลับสู่เมนูหลัก...")
 
-
-def print_bot_dashboard():
-    os.system("clear")
-    ui = f"""
-{BRIGHT_CYAN}       ██████╗ ███████╗    ██╗ ██████╗ ██╗███╗   ██╗
-       ██╔══██╗██╔════╝    ██║██╔═══██╗██║████╗  ██║
-       ██████╔╝█████╗      ██║██║   ██║██║██╔██╗ ██║
-       ██╔══██╗██╔══╝ ██   ██║██║   ██║██║██║╚██╗██║
-       ██║  ██║███████╗╚█████╔╝╚██████╔╝██║██║ ╚████║
-       ╚═╝  ╚═╝╚══════╝ ╚════╝  ╚═════╝ ╚═╝╚═╝  ╚═══╝{RESET}
-{BOLD_WHITE}            [ R O B L O X   A U T O   B O T ]{RESET}
-{CYAN}──────────────────────────────────────────────────────────────{RESET}
-
-{CYAN}     ╔════════════════════╗    {ORANGE}╔════════════════════╗{RESET}
-{CYAN}     ║  📌 สถานะโปรแกรม   ║    {ORANGE}║     📝 RESULT      ║{RESET}
-{CYAN}     ╠════════════════════╣    {ORANGE}╠════════════════════╣{RESET}
-{CYAN}     ║ {GREEN}🟢 บอทกำลังทำงาน {CYAN}  ║    {ORANGE}║ {YELLOW}🛡️ รอรับคำสั่ง.. {ORANGE}  ║{RESET}
-{CYAN}     ╚════════════════════╝    {ORANGE}╚════════════════════╝{RESET}
-
-{YELLOW}         ( ⌨️ กดปุ่ม CTRL + C เพื่อกลับสู่เมนูหลัก ){RESET}
-{CYAN}──────────────────────────────────────────────────────────────{RESET}
-"""
-    print(ui)
-
-
 # ================= รายงานและ Rejoin (ใช้ร่วมกันทั้งปุ่มและลูปเฝ้าจอ) =================
 def spawn(coro):
     t = asyncio.create_task(coro)
     BG_TASKS.add(t)
     t.add_done_callback(BG_TASKS.discard)
     return t
-
 
 async def send_bot_report(channel, message, include_screenshot=False):
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -550,9 +552,7 @@ async def send_bot_report(channel, message, include_screenshot=False):
     except Exception as e:
         log(f"ส่งรายงานพลาด: {e}", RED)
 
-
 async def do_rejoin(channel, done_message):
-    """Rejoin โดยกันไม่ให้ทำซ้อนกัน"""
     async with STATE["lock"]:
         ok = await join_roblox_async(CFG)
         if ok:
@@ -564,7 +564,6 @@ async def do_rejoin(channel, done_message):
     if channel:
         await send_bot_report(channel, done_message if ok else "❌ Rejoin ไม่สำเร็จ (ตรวจสอบ Place ID / VIP Code)", True)
     return ok
-
 
 # ================= Popup (Modal) =================
 class MapModal(discord.ui.Modal, title='ตั้งค่าเปลี่ยนแมพ (Change Map)'):
@@ -583,7 +582,6 @@ class MapModal(discord.ui.Modal, title='ตั้งค่าเปลี่ย�
         save_config(CFG)
         await interaction.response.send_message(f"✅ บันทึกแมพ `{pid}` เรียบร้อย! กำลังดึงเข้าเกม...", ephemeral=True)
         spawn(do_rejoin(interaction.channel, f"✅ เปลี่ยนเป็นแมพ `{pid}` เสร็จสิ้น"))
-
 
 class AddScriptModal(discord.ui.Modal, title='📝 เพิ่มสคริปต์ฟาร์ม (Add Script)'):
     filename_input = discord.ui.TextInput(label='ชื่อไฟล์ (ต้องลงท้ายด้วย .lua)', placeholder='เช่น farm.lua', required=True, max_length=60)
@@ -606,7 +604,6 @@ class AddScriptModal(discord.ui.Modal, title='📝 เพิ่มสคริ�
         await interaction.response.send_message(f"✅ สร้างไฟล์ `{filename}` ลงในโฟลเดอร์ AutoExecute สำเร็จ!", ephemeral=True)
         log(f"บันทึกไฟล์สคริปต์ใหม่: {filename}", GREEN)
 
-
 class DeleteScriptModal(discord.ui.Modal, title='🗑️ ลบสคริปต์ฟาร์ม (Delete Script)'):
     filename_input = discord.ui.TextInput(label='ชื่อไฟล์ที่ต้องการลบ (รวม .lua)', placeholder='เช่น farm.lua', required=True, max_length=60)
 
@@ -627,7 +624,6 @@ class DeleteScriptModal(discord.ui.Modal, title='🗑️ ลบสคริป�
         else:
             await interaction.response.send_message(f"❌ หาไฟล์ `{filename}` ไม่พบในโฟลเดอร์ {path}", ephemeral=True)
             log(f"พยายามลบสคริปต์ {filename} แต่หาไฟล์ไม่เจอ", RED)
-
 
 class SettingsModal(discord.ui.Modal, title='⚙️ แก้ไขการตั้งค่าโปรแกรม (Settings)'):
     def __init__(self):
@@ -674,7 +670,6 @@ class SettingsModal(discord.ui.Modal, title='⚙️ แก้ไขการต�
         else:
             errors.append("โฟลเดอร์ AutoExec ต้องขึ้นต้นด้วย /sdcard, /storage หรือ /data/local/tmp")
 
-        # Atomic validation: ถ้ามีช่องใดผิด จะไม่บันทึกค่าใดเลย
         if errors:
             return await interaction.response.send_message(
                 "❌ **ยังไม่บันทึกการตั้งค่า**\n⚠️ กรุณาแก้ไข: " + ", ".join(errors),
@@ -689,7 +684,6 @@ class SettingsModal(discord.ui.Modal, title='⚙️ แก้ไขการต�
         await interaction.response.send_message(summary, ephemeral=True)
         log("อัปเดตการตั้งค่าระบบผ่าน Discord", GREEN)
 
-
 # ================= ปุ่มควบคุม =================
 class ControlView(discord.ui.View):
     def __init__(self):
@@ -702,7 +696,6 @@ class ControlView(discord.ui.View):
         log(f"ผู้ใช้ไม่มีสิทธิ์พยายามกดปุ่ม: {interaction.user} ({interaction.user.id})", RED)
         return False
 
-    # --- แถวที่ 1 ---
     @discord.ui.button(label="📊 Get Stats", style=discord.ButtonStyle.primary, row=0, custom_id="btn_stats")
     async def btn_stats(self, interaction: discord.Interaction, button: discord.ui.Button):
         log("ได้รับคำสั่งเช็คสถานะจากปุ่มกด", YELLOW)
@@ -724,7 +717,6 @@ class ControlView(discord.ui.View):
         await aroot(f"am force-stop {PACKAGE_NAME}")
         await interaction.response.send_message("🛑 สั่งบังคับปิดแอป Roblox แล้ว (บอทยังออนไลน์รอคำสั่ง — ถ้าไม่อยากให้ดึงกลับเข้าเกม ให้กด Pause Auto ก่อน)", ephemeral=True)
 
-    # --- แถวที่ 2 ---
     @discord.ui.button(label="🧹 Clear RAM", style=discord.ButtonStyle.secondary, row=1, custom_id="btn_ram")
     async def btn_ram(self, interaction: discord.Interaction, button: discord.ui.Button):
         log("ได้รับคำสั่งเคลียร์ RAM", YELLOW)
@@ -755,7 +747,6 @@ class ControlView(discord.ui.View):
                 os.execv(sys.executable, [sys.executable] + sys.argv)
             spawn(restart_process())
 
-    # --- แถวที่ 3 ---
     @discord.ui.button(label="⏸️ Pause Auto", style=discord.ButtonStyle.secondary, row=2, custom_id="btn_pause")
     async def btn_pause(self, interaction: discord.Interaction, button: discord.ui.Button):
         STATE["paused"] = True
@@ -777,7 +768,6 @@ class ControlView(discord.ui.View):
         await aroot(f"rm -rf {GAME_LOG_DIR}/*.log")
         await interaction.response.send_message("🗑️ ลบไฟล์ Log ของเกม Roblox เรียบร้อย!", ephemeral=True)
 
-    # --- แถวที่ 4 ---
     @discord.ui.button(label="⚙️ Edit Settings", style=discord.ButtonStyle.secondary, row=3, custom_id="btn_settings")
     async def btn_settings(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.send_modal(SettingsModal())
@@ -801,7 +791,6 @@ class ControlView(discord.ui.View):
     async def btn_del_script(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.send_modal(DeleteScriptModal())
 
-    # --- แถวที่ 5 ---
     @discord.ui.button(label="📜 View Game Log", style=discord.ButtonStyle.secondary, row=4, custom_id="btn_view_log")
     async def btn_view_log(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.defer(ephemeral=True)
@@ -812,9 +801,10 @@ class ControlView(discord.ui.View):
         text = text.replace("```", "'''")[-1800:]
         await interaction.followup.send(f"📜 **Log ล่าสุดของเกม:**\n```\n{text}\n```", ephemeral=True)
 
-
 # ================= เริ่มบอท =================
 def menu_3_start_bot(cfg):
+    global DASHBOARD_ACTIVE
+    
     if not cfg['place_id'] or not cfg['bot_token'] or not cfg['channel_id']:
         print(f"\n{RED}✘ กรุณาตั้งค่า Place ID, Bot Token และ Channel ID ก่อนครับ!{RESET}")
         time.sleep(2)
@@ -824,6 +814,7 @@ def menu_3_start_bot(cfg):
         time.sleep(3)
         return
 
+    DASHBOARD_ACTIVE = True
     print_bot_dashboard()
     subprocess.run(["termux-wake-lock"], stderr=subprocess.DEVNULL)
     STATE["dev_name"] = run_root_text("getprop ro.product.model") or "Android Device"
@@ -838,7 +829,7 @@ def menu_3_start_bot(cfg):
     @tasks.loop(seconds=max(5, int(cfg['check_interval'])))
     async def game_monitor_loop():
         try:
-            if STATE["paused"] or STATE["lock"].locked():
+            if STATE["paused"] or (STATE["lock"] and STATE["lock"].locked()):
                 return
 
             channel = bot.get_channel(int(cfg['channel_id']))
@@ -862,7 +853,7 @@ def menu_3_start_bot(cfg):
 
                 STATE["fail_count"] += 1
                 fails = STATE["fail_count"]
-                delay = min(30 * (fails - 1), 300)  # backoff: 0,30,60,... สูงสุด 5 นาที
+                delay = min(30 * (fails - 1), 300)
                 msg = f"⚠️ **ปัญหา:** {reason}\n🔄 Rejoin ครั้งที่ {fails} ติดต่อกัน"
                 if delay:
                     msg += f" (รอ {delay} วินาทีก่อนเข้าใหม่)"
@@ -877,7 +868,6 @@ def menu_3_start_bot(cfg):
                 await do_rejoin(channel, "✅ **Rejoin สำเร็จแล้ว**")
                 return
 
-            # สถานะปกติ: ถ้าเกมอยู่รอดเกิน 3 นาที ถือว่าหายแล้ว รีเซ็ตตัวนับ
             if STATE["fail_count"] and now - STATE["game_start_time"] > 180:
                 STATE["fail_count"] = 0
 
@@ -917,13 +907,13 @@ def menu_3_start_bot(cfg):
     @bot.event
     async def on_ready():
         log(f"✅ เชื่อมต่อบอท Discord: {bot.user.name} สำเร็จ!", GREEN)
-        if ready_once["done"]:  # เชื่อมต่อใหม่หลังหลุด ไม่ต้องทำซ้ำ
+        if ready_once["done"]:
             return
         ready_once["done"] = True
 
         if STATE["lock"] is None:
             STATE["lock"] = asyncio.Lock()
-        bot.add_view(ControlView())  # ให้ปุ่มของข้อความเก่ายังใช้ได้หลังรีสตาร์ท
+        bot.add_view(ControlView())
 
         channel = bot.get_channel(int(cfg['channel_id']))
         if channel:
@@ -941,19 +931,20 @@ def menu_3_start_bot(cfg):
     try:
         bot.run(cfg['bot_token'], log_handler=None)
     except discord.LoginFailure:
+        DASHBOARD_ACTIVE = False
         print(f"\n{RED}❌ Bot Token ไม่ถูกต้อง! ตรวจสอบอีกครั้งในเมนู 2{RESET}")
         time.sleep(2)
         return
     except KeyboardInterrupt:
         pass
 
+    DASHBOARD_ACTIVE = False
     subprocess.run(["termux-wake-unlock"], stderr=subprocess.DEVNULL)
     print(f"\n\n{YELLOW}🛑 ปิดบอทเฝ้าจอแล้ว (Offline){RESET}")
     ans = safe_input("ต้องการบังคับปิดแอป Roblox ด้วยไหม? (y/n): ").lower()
     if ans == 'y':
         run_root_text(f"am force-stop {PACKAGE_NAME}")
     time.sleep(1)
-
 
 # ================= ลูปหลักของโปรแกรม =================
 def main():
@@ -972,7 +963,6 @@ def main():
             menu_4_ram(CFG)
         elif choice == "0":
             sys.exit(0)
-
 
 if __name__ == "__main__":
     main()
