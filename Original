@@ -162,7 +162,6 @@ def print_bot_dashboard():
     place_str = trim_visible(CFG.get("place_id") or "-", 15)
     rejoins = STATE.get("rejoin_total", 0)
 
-    # ใช้ \033[44G เพื่อล็อกเส้นขอบขวา (║) ให้ตรงกันทุกบรรทัด 100%
     lines = [
         "\033[2J\033[H",
         f"  {BRIGHT_CYAN}╦═╗┌─┐  ╦┌─┐┬┌┐┌{RESET}   {BOLD_WHITE}[ ROBLOX AUTO BOT ]{RESET}",
@@ -313,8 +312,8 @@ def capture_screenshot_bytes():
 
 def detect_disconnect_dialog_screen():
     """
-    สแกนพิกเซลหน้าจอโดยตรงเพื่อตรวจจับกล่อง Disconnected สีเทาเข้ม (#393B3D)
-    คู่กับปุ่มสีขาว (Leave / Reconnect) ตรงกลางจอ ดักจับได้แม้เกมไม่เขียนไฟล์ Log
+    สแกนพิกเซลหน้าจอเพื่อตรวจจับกล่อง Disconnected สีเทาเข้ม (#393B3D)
+    คู่กับปุ่มสีขาว (Leave / Reconnect) ดักจับได้แม้เกมไม่เขียนไฟล์ Log
     """
     try:
         res = subprocess.run(
@@ -343,10 +342,11 @@ def detect_disconnect_dialog_screen():
             return buf[idx], buf[idx + 1], buf[idx + 2]
 
         def is_modal_gray(r, g, b):
-            return (50 <= r <= 65 and 52 <= g <= 67 and 54 <= b <= 69
-                    and abs(r - g) <= 4 and abs(g - b) <= 4 and b >= r)
+            # สีพื้นหลังกล่อง Disconnected ของ Roblox คือ RGB(57, 59, 61)
+            return (52 <= r <= 62 and 54 <= g <= 64 and 56 <= b <= 66
+                    and abs(r - g) <= 3 and abs(g - b) <= 3 and b >= r)
 
-        xs = [int(w * (0.36 + 0.28 * i / 24)) for i in range(25)]
+        xs = [int(w * (0.35 + 0.30 * i / 24)) for i in range(25)]
         ys = [int(h * (0.28 + 0.44 * j / 19)) for j in range(20)]
 
         flat_gray_pairs = 0
@@ -361,21 +361,21 @@ def detect_disconnect_dialog_screen():
                 else:
                     prev = None
 
-        if flat_gray_pairs < 55:
+        if flat_gray_pairs < 65:
             return False
 
-        btn_xs = [int(w * (0.35 + 0.30 * i / 29)) for i in range(30)]
-        btn_ys = [int(h * (0.46 + 0.30 * j / 19)) for j in range(20)]
+        btn_xs = [int(w * (0.36 + 0.28 * i / 29)) for i in range(30)]
+        btn_ys = [int(h * (0.48 + 0.26 * j / 19)) for j in range(20)]
         white_btn_rows = 0
         for py in btn_ys:
             white_streak = 0
             for px in btn_xs:
                 r, g, b = get_rgb(px, py)
-                if r >= 235 and g >= 235 and b >= 235:
+                if r >= 238 and g >= 238 and b >= 238:
                     white_streak += 1
                 else:
                     white_streak = 0
-                if white_streak >= 4:
+                if white_streak >= 6:
                     white_btn_rows += 1
                     break
 
@@ -390,7 +390,7 @@ def detect_disconnect_dialog_screen():
             if is_modal_gray(*get_rgb(int(w * 0.92), py)):
                 edge_gray += 1
 
-        return edge_gray <= 6
+        return edge_gray <= 4
     except Exception as e:
         logger.warning(f"detect_disconnect_dialog_screen ผิดพลาด: {e}")
         return False
@@ -451,7 +451,7 @@ def get_discord_embed(dev_name, is_paused):
     embed.add_field(name="⏰ Uptime", value=f"`{uptime_hrs} hours`", inline=True)
     return embed
 
-# ================= เข้าเกม / ตรวจสุขภาพเกม (4-Layer Detection) =================
+# ================= เข้าเกม / ตรวจสุขภาพเกม (ไร้ False Positive) =================
 async def join_roblox_async(cfg):
     place_id = str(cfg.get("place_id", "")).strip()
     vip_code = str(cfg.get("vip_link_code", "")).strip()
@@ -462,7 +462,7 @@ async def join_roblox_async(cfg):
 
     log("กำลังปิดเกมและเคลียร์ Log...", YELLOW)
     await aroot(f"am force-stop {PACKAGE_NAME}")
-    await aroot(f"rm -rf {GAME_LOG_DIR}/*.log {EXT_LOG_DIR}/*.log; logcat -c 2>/dev/null")
+    await aroot(f"rm -rf {GAME_LOG_DIR}/*.log {EXT_LOG_DIR}/*.log")
     await asyncio.to_thread(clear_system_ram)
     await asyncio.sleep(3)
 
@@ -480,9 +480,22 @@ async def join_roblox_async(cfg):
 def _rx(pattern, text):
     return re.search(pattern, text, re.IGNORECASE) is not None
 
-def analyze_game_health(cfg):
-    target_place_id = str(cfg.get("place_id", "")).strip()
+def extract_active_session_logs(raw_log_text):
+    """
+    ตัดเฉพาะบรรทัด Log ที่เกิดขึ้นหลังจากการเชื่อมต่อเซิร์ฟเวอร์ครั้งล่าสุด (! Joining game)
+    เพื่อป้องกันไม่ให้ประวัติตอนย้ายเซิร์ฟ/เทเลพอร์ตไปดันเจี้ยนในรอบก่อนหน้ามาทำให้เกิดแจ้งเตือนหลอก
+    """
+    if not raw_log_text:
+        return ""
+    lines = raw_log_text.splitlines()
+    last_join_idx = 0
+    for idx, line in enumerate(lines):
+        ll = line.lower()
+        if "! joining game" in ll or "joining game '" in ll or "connection accepted from" in ll:
+            last_join_idx = idx
+    return "\n".join(lines[last_join_idx:]).lower()
 
+def analyze_game_health(cfg):
     # --- ชั้นที่ 1: ตรวจสอบสถานะแอปและหน้าต่างระบบ Android ---
     dumpsys_focus = run_root_text("dumpsys window windows | grep -E 'mCurrentFocus|mFocusedApp'")
     if "com.android.vending" in dumpsys_focus or "Google Play" in dumpsys_focus:
@@ -494,100 +507,69 @@ def analyze_game_health(cfg):
     if "Application Not Responding" in dumpsys_focus:
         return False, "ตัวเกมค้างไม่ตอบสนอง (System ANR)"
 
-    # --- ชั้นที่ 2: สแกนไฟล์ Log ทั้งหมดและ Logcat หาสาเหตุการหลุดทุกชนิด ---
-    grep_pattern = (
-        "pss4|datastores not loading|please rejoin|you have been kicked|you were kicked|"
-        "kicked by this experience|moderation message|seterrormessage|errorprompt|"
-        "same account|different device|launched experience|already playing|"
-        "check your internet|lost connection|connection lost|timed out|connection attempt failed|"
-        "idle 20 minutes|idledisconnect|unexpected client behavior|security kick|"
-        "sending disconnect|received disconnect|disconnected from|id_connection_lost|id_disconnection_notification|"
-        "error code[: =]*[257][0-9]{2}|reason[: =]*[257][0-9]{2}|status[: =]*[257][0-9]{2}"
-    )
-    log_hits = run_root_text(
-        f"grep -iE '{grep_pattern}' {GAME_LOG_DIR}/*.log {EXT_LOG_DIR}/*.log 2>/dev/null | tail -n 150",
+    # --- ชั้นที่ 2: อ่านเฉพาะไฟล์ Log ล่าสุดของ Roblox (ไม่อ่าน logcat เพื่อกันแจ้งเตือนหลอก) ---
+    tail_n = max(800, int(cfg.get("log_tail_lines", 1000)))
+    raw_logs = run_root_text(
+        f"LATEST=$(ls -t {GAME_LOG_DIR}/*.log {EXT_LOG_DIR}/*.log 2>/dev/null | head -n 1); "
+        f"if [ -n \"$LATEST\" ]; then tail -n {tail_n} \"$LATEST\"; fi",
         timeout=15
     )
 
-    tail_n = max(500, int(cfg.get("log_tail_lines", 1000)))
-    log_tail = run_root_text(
-        f"tail -n {tail_n} {GAME_LOG_DIR}/*.log {EXT_LOG_DIR}/*.log 2>/dev/null | tail -n 1500",
-        timeout=15
-    )
+    active_logs = extract_active_session_logs(raw_logs)
 
-    logcat_hits = run_root_text(
-        f"logcat -d -t 1500 2>/dev/null | grep -iE '{grep_pattern}' | tail -n 60",
-        timeout=10
-    )
-
-    combined_logs = "\n".join(filter(None, [log_hits, log_tail, logcat_hits])).lower()
-
-    if combined_logs:
+    if active_logs:
+        # 1. ตรวจจับคนเข้าไอดีซ้อน (Error 273 / 264) - ใช้ \b ล็อกคำเฉพาะ ไม่จับ KeyCode=273
         if (
-            _rx(r"(error code|reason|status|code)[: =]*(273|264)\b", combined_logs)
-            or "same account" in combined_logs
-            or "different device" in combined_logs
-            or "already playing" in combined_logs
+            _rx(r"\b(?:error\s*code\s*[:=]\s*(?:273|264)|disconnect[^\n]*\breason\s*[:=]\s*(?:273|264))\b", active_logs)
+            or "same account launched" in active_logs
+            or "same account is currently" in active_logs
+            or "from different device" in active_logs
         ):
             return False, "ตรวจพบคนเข้าไอดีซ้อน! (Error Code: 273)"
 
-        if "pss4" in combined_logs or "datastores not loading" in combined_logs:
+        # 2. ตรวจจับเซิร์ฟเวอร์แมพโหลดข้อมูลไม่ขึ้น (Error Code PSS4)
+        if _rx(r"\berror\s*code\s*[:=]?\s*pss4\b", active_logs) or "datastores not loading" in active_logs:
             return False, "เซิร์ฟเวอร์โหลดข้อมูลไม่ขึ้น (Error PSS4 / 267)"
 
+        # 3. ตรวจจับการถูกเตะออกจากแมพ (Error Code: 267)
         if (
-            _rx(r"(error code|reason|status|code)[: =]*267\b", combined_logs)
-            or "you have been kicked" in combined_logs
-            or "you were kicked" in combined_logs
-            or "kicked by this experience" in combined_logs
-            or "moderation message" in combined_logs
+            _rx(r"\b(?:error\s*code\s*[:=]\s*267|disconnect[^\n]*\breason\s*[:=]\s*267)\b", active_logs)
+            or "you have been kicked" in active_logs
+            or "you were kicked" in active_logs
+            or "kicked by this experience" in active_logs
+            or "moderation message:" in active_logs
         ):
             return False, "ถูกเตะออกจากแมพ (Error Code: 267)"
 
+        # 4. ตรวจจับเน็ตหลุด / เซิร์ฟเวอร์ตัดการเชื่อมต่อ (Error Code: 277 / 279)
         if (
-            _rx(r"(error code|reason|status|code)[: =]*(277|266|279)\b", combined_logs)
-            or "check your internet" in combined_logs
-            or "lost connection" in combined_logs
-            or "connection lost" in combined_logs
-            or "connection timed out" in combined_logs
-            or "connection attempt failed" in combined_logs
-            or "id_connection_lost" in combined_logs
+            _rx(r"\b(?:error\s*code\s*[:=]\s*(?:277|279)|disconnect[^\n]*\breason\s*[:=]\s*(?:277|279))\b", active_logs)
+            or "please check your internet connection" in active_logs
+            or "lost connection to the game server" in active_logs
+            or "id_connection_lost" in active_logs
+            or "connection attempt failed" in active_logs
         ):
             return False, "เน็ตหลุดหรือเซิร์ฟเวอร์ตัด (Error Code: 277)"
 
+        # 5. ตรวจจับยืนนิ่ง AFK เกิน 20 นาที (Error Code: 278)
         if (
-            _rx(r"(error code|reason|status|code)[: =]*278\b", combined_logs)
-            or "idle 20 minutes" in combined_logs
-            or "idledisconnect" in combined_logs
+            _rx(r"\b(?:error\s*code\s*[:=]\s*278|disconnect[^\n]*\breason\s*[:=]\s*278)\b", active_logs)
+            or "idle 20 minutes" in active_logs
+            or "idledisconnect" in active_logs
         ):
             return False, "ยืนนิ่งเกิน 20 นาที (Error Code: 278 AFK)"
 
+        # 6. ตรวจจับเซิร์ฟเวอร์หรือระบบความปลอดภัยเตะ (Error Code: 268 / 272)
         if (
-            _rx(r"(error code|reason|status|code)[: =]*(268|272)\b", combined_logs)
-            or "unexpected client behavior" in combined_logs
-            or "security kick" in combined_logs
+            _rx(r"\b(?:error\s*code\s*[:=]\s*(?:268|272)|disconnect[^\n]*\breason\s*[:=]\s*(?:268|272))\b", active_logs)
+            or "unexpected client behavior" in active_logs
+            or "security kick" in active_logs
         ):
             return False, "เซิร์ฟเวอร์หรือระบบความปลอดภัยเตะ (Error: 268/272)"
 
-        if _rx(r"(error code|reason|status|code)[: =]*(260|261|262|524|529|773)\b", combined_logs):
+        # 7. ตรวจจับเซิร์ฟเวอร์มีปัญหาเข้าไม่ได้ (Error Code: 524 / 529 / 773)
+        if _rx(r"\berror\s*code\s*[:=]\s*(?:260|261|262|524|529|773)\b", active_logs):
             return False, "เชื่อมต่อแมพไม่สำเร็จ (Error: 529/524/26x)"
-
-        for sig in (
-            "disconnected from",
-            "sending disconnect",
-            "received disconnect",
-            "id_disconnection_notification",
-            "seterrormessage",
-            "errorprompt",
-        ):
-            if sig in combined_logs:
-                return False, f"ตรวจพบการตัดการเชื่อมต่อ ({sig})"
-
-        if target_place_id and log_tail:
-            for line in reversed(log_tail.splitlines()):
-                if "placeId:" in line or "placeid=" in line.lower():
-                    if target_place_id not in line:
-                        return False, f"อยู่ในแมพอื่นที่ไม่ใช่ Place ID: {target_place_id}"
-                    break
 
     # --- ชั้นที่ 3: ตรวจสอบ UI XML ---
     ui_xml = run_root_text(f"uiautomator dump {UI_TMP} >/dev/null 2>&1; cat {UI_TMP}; rm -f {UI_TMP}")
@@ -595,9 +577,9 @@ def analyze_game_health(cfg):
         ul = ui_xml.lower()
         if "upgrade" in ul and "roblox" in ul:
             return False, "หน้าจอแจ้งให้อัปเดตเวอร์ชัน (Upgrade Required)"
-        if "same account" in ul or "different device" in ul or _rx(r"error code[: ]*273\b", ul):
+        if "same account launched" in ul or _rx(r"\berror\s*code\s*[:=]\s*273\b", ul):
             return False, "ตรวจพบคนเข้าไอดีซ้อนบนจอ (Error 273)"
-        if "check your internet" in ul or _rx(r"error code[: ]*277\b", ul):
+        if "check your internet" in ul or _rx(r"\berror\s*code\s*[:=]\s*277\b", ul):
             return False, "หน้าจอแจ้งเตือนเน็ตหลุด (Error 277)"
         if "pss4" in ul or "datastores not loading" in ul:
             return False, "เซิร์ฟเวอร์แมพมีปัญหา (Error Code PSS4)"
@@ -980,7 +962,7 @@ class ControlView(discord.ui.View):
     @discord.ui.button(label="🗑️ Clear Logs", style=discord.ButtonStyle.secondary, row=2, custom_id="btn_clear_logs")
     async def btn_clear_logs(self, interaction: discord.Interaction, button: discord.ui.Button):
         log("สั่งลบไฟล์ Log เกม", YELLOW)
-        await aroot(f"rm -rf {GAME_LOG_DIR}/*.log {EXT_LOG_DIR}/*.log; logcat -c 2>/dev/null")
+        await aroot(f"rm -rf {GAME_LOG_DIR}/*.log {EXT_LOG_DIR}/*.log")
         await interaction.response.send_message("🗑️ ลบไฟล์ Log ของเกม Roblox เรียบร้อย!", ephemeral=True)
 
     @discord.ui.button(label="⚙️ Edit Settings", style=discord.ButtonStyle.secondary, row=3, custom_id="btn_settings")
@@ -1010,7 +992,8 @@ class ControlView(discord.ui.View):
     async def btn_view_log(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.defer(ephemeral=True)
         text = await aroot(
-            f"tail -n 25 {GAME_LOG_DIR}/*.log {EXT_LOG_DIR}/*.log 2>/dev/null | tail -n 35"
+            f"LATEST=$(ls -t {GAME_LOG_DIR}/*.log {EXT_LOG_DIR}/*.log 2>/dev/null | head -n 1); "
+            f"if [ -n \"$LATEST\" ]; then tail -n 30 \"$LATEST\"; fi"
         )
         if not text:
             text = "ไม่พบไฟล์ Log ของเกม"
