@@ -65,7 +65,8 @@ DEFAULT_CONFIG = {
     "update_sha256": "",  # ถ้าตั้งค่า SHA-256 จะตรวจไฟล์อัปเดตก่อนติดตั้ง
     "startup_grace_seconds": 90,
     "log_stale_seconds": 180,
-    "rejoin_cooldown_seconds": 45
+    "rejoin_cooldown_seconds": 45,
+    "frozen_screen_checks": 6   # จอนิ่งติดกันกี่รอบ (x check_interval) ถึงถือว่าค้าง
 }
 
 CFG = {}
@@ -81,6 +82,9 @@ STATE = {
     "last_rejoin_attempt": 0.0,
     "lock": None,
     "dev_name": "Android Device",
+    "last_frame_sig": None,
+    "frozen_count": 0,
+    "bg_count": 0,
 }
 BG_TASKS = set()
 
@@ -314,11 +318,9 @@ def capture_screenshot_bytes():
         logger.warning(f"screencap (file) พลาด: {e}")
     return None
 
-def detect_disconnect_dialog_screen():
-    """
-    สแกนพิกเซลหน้าจอเพื่อตรวจจับกล่อง Disconnected สีเทาเข้ม (#393B3D)
-    คู่กับปุ่มสีขาว (Leave / Reconnect) ดักจับได้แม้เกมไม่เขียนไฟล์ Log
-    """
+# ================= สแกนหน้าจอ: กล่อง Disconnected + จอนิ่ง =================
+def grab_raw_frame():
+    """จับภาพหน้าจอแบบ raw (รองรับทั้ง RGBA และ RGBX)"""
     try:
         res = subprocess.run(
             ["su", "-c", "screencap"],
@@ -328,76 +330,95 @@ def detect_disconnect_dialog_screen():
             timeout=15
         )
         buf = res.stdout
-        if not buf or len(buf) < 100000:
-            return False
+    except Exception as e:
+        logger.warning(f"grab_raw_frame ผิดพลาด: {e}")
+        return None
+    if not buf or len(buf) < 100000:
+        return None
+    w = int.from_bytes(buf[0:4], "little")
+    h = int.from_bytes(buf[4:8], "little")
+    fmt = int.from_bytes(buf[8:12], "little")
+    if w <= 0 or h <= 0 or w > 10000 or h > 10000 or fmt not in (1, 2):
+        return None
+    expected = w * h * 4
+    if len(buf) < expected + 12:
+        return None
+    hdr = len(buf) - expected
+    if hdr not in (12, 16):
+        hdr = 12
+    return buf, w, h, hdr
 
-        w = int.from_bytes(buf[0:4], "little")
-        h = int.from_bytes(buf[4:8], "little")
-        fmt = int.from_bytes(buf[8:12], "little")
-        expected = w * h * 4
-        if w <= 0 or h <= 0 or fmt != 1 or len(buf) < expected + 12:
-            return False
-        hdr = len(buf) - expected
-        if hdr not in (12, 16):
-            hdr = 12
+def frame_signature(frame):
+    """ลายนิ้วมือของภาพ ใช้ดูว่าหน้าจอนิ่งสนิทหรือไม่"""
+    buf, w, h, hdr = frame
+    sig = bytearray()
+    for j in range(24):
+        py = int(h * (j + 0.5) / 24)
+        for i in range(14):
+            px = int(w * (i + 0.5) / 14)
+            idx = hdr + (py * w + px) * 4
+            sig += bytes((buf[idx] >> 4, buf[idx + 1] >> 4, buf[idx + 2] >> 4))
+    return hashlib.md5(bytes(sig)).hexdigest()
+
+def inspect_screen():
+    """คืนค่า (เจอกล่อง Disconnected ไหม, ลายนิ้วมือภาพ)"""
+    try:
+        frame = grab_raw_frame()
+        if not frame:
+            return False, None
+        buf, w, h, hdr = frame
+        sig = frame_signature(frame)
 
         def get_rgb(px, py):
             idx = hdr + (py * w + px) * 4
             return buf[idx], buf[idx + 1], buf[idx + 2]
 
         def is_modal_gray(r, g, b):
-            # สีพื้นหลังกล่อง Disconnected ของ Roblox คือ RGB(57, 59, 61)
-            return (52 <= r <= 62 and 54 <= g <= 64 and 56 <= b <= 66
-                    and abs(r - g) <= 3 and abs(g - b) <= 3 and b >= r)
+            # สีพื้นหลังกล่อง Disconnected ของ Roblox ประมาณ RGB(57, 59, 61)
+            return (50 <= r <= 66 and 52 <= g <= 68 and 54 <= b <= 70
+                    and abs(r - g) <= 4 and abs(g - b) <= 4 and b >= r)
 
         xs = [int(w * (0.35 + 0.30 * i / 24)) for i in range(25)]
         ys = [int(h * (0.28 + 0.44 * j / 19)) for j in range(20)]
-
-        flat_gray_pairs = 0
+        flat_pairs = 0
         for py in ys:
             prev = None
             for px in xs:
                 rgb = get_rgb(px, py)
                 if is_modal_gray(*rgb):
-                    if prev is not None and abs(rgb[0] - prev[0]) <= 1 and abs(rgb[1] - prev[1]) <= 1:
-                        flat_gray_pairs += 1
+                    if prev is not None and abs(rgb[0] - prev[0]) <= 2 and abs(rgb[1] - prev[1]) <= 2:
+                        flat_pairs += 1
                     prev = rgb
                 else:
                     prev = None
-
-        if flat_gray_pairs < 65:
-            return False
+        if flat_pairs < 40:
+            return False, sig
 
         btn_xs = [int(w * (0.36 + 0.28 * i / 29)) for i in range(30)]
         btn_ys = [int(h * (0.48 + 0.26 * j / 19)) for j in range(20)]
-        white_btn_rows = 0
+        white_rows = 0
         for py in btn_ys:
-            white_streak = 0
+            streak = 0
             for px in btn_xs:
                 r, g, b = get_rgb(px, py)
-                if r >= 238 and g >= 238 and b >= 238:
-                    white_streak += 1
-                else:
-                    white_streak = 0
-                if white_streak >= 6:
-                    white_btn_rows += 1
+                streak = streak + 1 if (r >= 235 and g >= 235 and b >= 235) else 0
+                if streak >= 5:
+                    white_rows += 1
                     break
-
-        if white_btn_rows < 2:
-            return False
+        if white_rows < 1:
+            return False, sig
 
         edge_gray = 0
-        edge_ys = [int(h * (0.25 + 0.50 * j / 9)) for j in range(10)]
-        for py in edge_ys:
+        for j in range(10):
+            py = int(h * (0.25 + 0.50 * j / 9))
             if is_modal_gray(*get_rgb(int(w * 0.08), py)):
                 edge_gray += 1
             if is_modal_gray(*get_rgb(int(w * 0.92), py)):
                 edge_gray += 1
-
-        return edge_gray <= 4
+        return edge_gray <= 6, sig
     except Exception as e:
-        logger.warning(f"detect_disconnect_dialog_screen ผิดพลาด: {e}")
-        return False
+        logger.warning(f"inspect_screen ผิดพลาด: {e}")
+        return False, None
 
 async def check_internet():
     for host, port in (("1.1.1.1", 443), ("8.8.8.8", 53), ("google.com", 443)):
@@ -455,7 +476,7 @@ def get_discord_embed(dev_name, is_paused):
     embed.add_field(name="⏰ Uptime", value=f"`{uptime_hrs} hours`", inline=True)
     return embed
 
-# ================= เข้าเกม / ตรวจสุขภาพเกม (ไร้ False Positive) =================
+# ================= เข้าเกม / ตรวจสุขภาพเกม =================
 async def join_roblox_async(cfg):
     place_id = str(cfg.get("place_id", "")).strip()
     vip_code = str(cfg.get("vip_link_code", "")).strip()
@@ -499,10 +520,29 @@ def extract_active_session_logs(raw_log_text):
             last_join_idx = idx
     return "\n".join(lines[last_join_idx:]).lower()
 
+def get_focus_text():
+    """อ่านหน้าต่างที่โฟกัสอยู่ (ลองหลายคำสั่งเผื่อบางเครื่องไม่คืนค่า)"""
+    out = run_root_text("dumpsys window windows | grep -E 'mCurrentFocus|mFocusedApp'")
+    if not out.strip():
+        out = run_root_text("dumpsys window | grep -E 'mCurrentFocus|mFocusedApp'")
+    return out
+
+def get_log_age():
+    """อายุ (วินาที) ของไฟล์ log ล่าสุด คืน None ถ้าไม่พบไฟล์"""
+    txt = run_root_text(
+        f"LATEST=$(ls -t {GAME_LOG_DIR}/*.log {EXT_LOG_DIR}/*.log 2>/dev/null | head -n 1); "
+        f"if [ -n \"$LATEST\" ]; then NOW=$(date +%s); MT=$(stat -c %Y \"$LATEST\" 2>/dev/null); "
+        f"if [ -n \"$MT\" ]; then echo $((NOW-MT)); fi; fi"
+    )
+    try:
+        return int(txt.strip())
+    except (TypeError, ValueError):
+        return None
+
 def detect_long_session_stall(cfg):
     """
     Watchdog สำหรับอาการเล่นไปนาน ๆ แล้ว Roblox หลุด/ค้าง แต่ไม่มี Error ชัดเจน
-    ใช้ PID + อายุ log ล่าสุด + สถานะหน้าต่าง เพื่อบังคับ Rejoin เมื่อเกมเงียบผิดปกติ
+    ใช้ PID + อายุ log ล่าสุด + สถานะหน้าต่าง + จอนิ่ง เพื่อบังคับ Rejoin เมื่อเกมเงียบผิดปกติ
     """
     if not run_root_text(f"pidof {PACKAGE_NAME}"):
         return False, "แอป Roblox ปิดตัวลง (Watchdog)"
@@ -510,37 +550,42 @@ def detect_long_session_stall(cfg):
     now = time.time()
     grace = max(60, int(cfg.get("startup_grace_seconds", 90)))
     if now - STATE.get("game_start_time", 0) < grace:
+        STATE["bg_count"] = 0
         return True, "กำลังอยู่ในช่วงโหลดเกม"
 
     stale_limit = max(90, int(cfg.get("log_stale_seconds", 180)))
-    age_text = run_root_text(
-        f"LATEST=$(ls -t {GAME_LOG_DIR}/*.log {EXT_LOG_DIR}/*.log 2>/dev/null | head -n 1); "
-        f"if [ -n \"$LATEST\" ]; then NOW=$(date +%s); MT=$(stat -c %Y \"$LATEST\" 2>/dev/null); "
-        f"if [ -n \"$MT\" ]; then echo $((NOW-MT)); fi; fi"
-    )
-    try:
-        log_age = int(age_text.strip())
-    except (TypeError, ValueError):
-        log_age = None
-
-    focus = run_root_text("dumpsys window windows | grep -E 'mCurrentFocus|mFocusedApp'")
+    log_age = get_log_age()
+    focus = get_focus_text()
+    focus_known = bool(focus.strip())
     roblox_focused = PACKAGE_NAME in focus
 
-    # ถ้า Roblox ยังอยู่หน้าจอแต่ log เงียบนานมาก ให้ถือว่าค้าง/หลุดแบบตรวจไม่เจอ
+    if focus_known and not roblox_focused:
+        STATE["bg_count"] = STATE.get("bg_count", 0) + 1
+    else:
+        STATE["bg_count"] = 0
+
+    # Roblox อยู่หน้าจอแต่ log เงียบนานมาก = ค้าง/หลุดแบบตรวจไม่เจอ
     if roblox_focused and log_age is not None and log_age >= stale_limit:
         return False, f"Roblox เงียบ/ค้างนาน {log_age}s (Watchdog)"
 
-    # ถ้าแอปยังมี PID แต่หน้าต่างหลุดออกจาก Roblox และ log เงียบด้วย ก็ให้เข้าใหม่
-    if (not roblox_focused and log_age is not None
-            and log_age >= max(60, stale_limit // 2)):
-        return False, f"Roblox ไม่ได้อยู่หน้าจอและไม่มี Log ใหม่ {log_age}s"
+    # แอปยังมี PID แต่หน้าต่างหลุดออกจาก Roblox
+    if focus_known and not roblox_focused:
+        if log_age is None or log_age >= max(60, stale_limit // 2):
+            return False, "Roblox ไม่ได้อยู่หน้าจอและไม่มี Log ใหม่"
+        if STATE["bg_count"] >= 4:
+            return False, "Roblox หลุดไปอยู่เบื้องหลังนานเกินไป"
+
+    # จอนิ่งสนิทติดกันหลายรอบ + log เงียบ (หรือไม่มี log) = ค้าง/หลุด
+    frozen_need = max(3, int(cfg.get("frozen_screen_checks", 6)))
+    if STATE.get("frozen_count", 0) >= frozen_need and (log_age is None or log_age >= 60):
+        return False, "หน้าจอนิ่งสนิทและไม่มี Log ใหม่ (น่าจะหลุด/ค้าง)"
 
     return True, "ปกติ"
 
 
 def analyze_game_health(cfg):
     # --- ชั้นที่ 1: ตรวจสอบสถานะแอปและหน้าต่างระบบ Android ---
-    dumpsys_focus = run_root_text("dumpsys window windows | grep -E 'mCurrentFocus|mFocusedApp'")
+    dumpsys_focus = get_focus_text()
     if "com.android.vending" in dumpsys_focus or "Google Play" in dumpsys_focus:
         return False, "เด้งไป Play Store (เกมบังคับอัปเดตแพทช์)"
 
@@ -614,11 +659,16 @@ def analyze_game_health(cfg):
         if _rx(r"\berror\s*code\s*[:=]\s*(?:260|261|262|524|529|773)\b", active_logs):
             return False, "เชื่อมต่อแมพไม่สำเร็จ (Error: 529/524/26x)"
 
+        # 8. ตรวจจับ Disconnect ทั่วไปที่รหัสไม่ตรงกับข้างบน
+        if _rx(r"disconnect\w*[^\n]*\breason\s*[:=]\s*(?:2[6-9]\d|5\d\d|6\d\d|7\d\d)\b", active_logs) \
+                or "disconnection notification" in active_logs:
+            return False, "ถูกตัดการเชื่อมต่อจากเซิร์ฟเวอร์ (Disconnect)"
+
     # --- ชั้นที่ 3: ตรวจสอบ UI XML ---
     ui_xml = run_root_text(f"uiautomator dump {UI_TMP} >/dev/null 2>&1; cat {UI_TMP}; rm -f {UI_TMP}")
     if ui_xml:
         ul = ui_xml.lower()
-        if "upgrade" in ul and "roblox" in ul:
+        if any(k in ul for k in ("upgrade required", "update required", "needs to be updated", "please update")):
             return False, "หน้าจอแจ้งให้อัปเดตเวอร์ชัน (Upgrade Required)"
         if "same account launched" in ul or _rx(r"\berror\s*code\s*[:=]\s*273\b", ul):
             return False, "ตรวจพบคนเข้าไอดีซ้อนบนจอ (Error 273)"
@@ -633,9 +683,16 @@ def analyze_game_health(cfg):
         if ("log in" in ul and "sign up" in ul) or ("discover" in ul and "avatar" in ul and "connect" in ul):
             return False, "เด้งออกกลับมาหน้าเมนูหลัก Roblox"
 
-    # --- ชั้นที่ 4: สแกนพิกเซลหน้าจอจับกล่อง Disconnected สีเทาเข้ม (#393B3D) ---
-    if detect_disconnect_dialog_screen():
+    # --- ชั้นที่ 4: สแกนพิกเซลหน้าจอ + ตรวจจอนิ่ง ---
+    dialog, sig = inspect_screen()
+    if dialog:
         return False, "ตรวจพบกล่องแจ้งเตือน Disconnected บนหน้าจอเกม"
+    if sig:
+        if sig == STATE.get("last_frame_sig"):
+            STATE["frozen_count"] = STATE.get("frozen_count", 0) + 1
+        else:
+            STATE["frozen_count"] = 0
+            STATE["last_frame_sig"] = sig
 
     return True, "ปกติ"
 
@@ -795,6 +852,9 @@ async def do_rejoin(channel, done_message):
             STATE["last_ram_clear"] = now
             STATE["last_screenshot"] = now
             STATE["rejoin_total"] += 1
+            STATE["frozen_count"] = 0
+            STATE["last_frame_sig"] = None
+            STATE["bg_count"] = 0
 
     if ok:
         healthy, reason = await asyncio.to_thread(analyze_game_health, CFG)
@@ -1066,7 +1126,8 @@ def menu_3_start_bot(cfg):
     now = time.time()
     STATE.update({"paused": False, "last_screenshot": now, "last_ram_clear": now,
                   "game_start_time": now, "fail_count": 0, "loop_restarts": 0,
-                  "net_dropped": False, "last_rejoin_attempt": 0.0, "lock": None})
+                  "net_dropped": False, "last_rejoin_attempt": 0.0, "lock": None,
+                  "last_frame_sig": None, "frozen_count": 0, "bg_count": 0})
 
     LAST_RESULT_TEXT = f"{YELLOW}⏳ กำลังเชื่อมต่อ Discord...{RESET}"
     DASHBOARD_ACTIVE = True
