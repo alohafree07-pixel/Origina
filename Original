@@ -62,7 +62,10 @@ DEFAULT_CONFIG = {
     "join_wait_seconds": 35,
     "log_tail_lines": 1000,
     "autoexec_path": "/sdcard/Delta/autoexec",
-    "update_sha256": ""  # ถ้าตั้งค่า SHA-256 จะตรวจไฟล์อัปเดตก่อนติดตั้ง
+    "update_sha256": "",  # ถ้าตั้งค่า SHA-256 จะตรวจไฟล์อัปเดตก่อนติดตั้ง
+    "startup_grace_seconds": 90,
+    "log_stale_seconds": 180,
+    "rejoin_cooldown_seconds": 45
 }
 
 CFG = {}
@@ -75,6 +78,7 @@ STATE = {
     "rejoin_total": 0,
     "loop_restarts": 0,
     "net_dropped": False,
+    "last_rejoin_attempt": 0.0,
     "lock": None,
     "dev_name": "Android Device",
 }
@@ -495,6 +499,45 @@ def extract_active_session_logs(raw_log_text):
             last_join_idx = idx
     return "\n".join(lines[last_join_idx:]).lower()
 
+def detect_long_session_stall(cfg):
+    """
+    Watchdog สำหรับอาการเล่นไปนาน ๆ แล้ว Roblox หลุด/ค้าง แต่ไม่มี Error ชัดเจน
+    ใช้ PID + อายุ log ล่าสุด + สถานะหน้าต่าง เพื่อบังคับ Rejoin เมื่อเกมเงียบผิดปกติ
+    """
+    if not run_root_text(f"pidof {PACKAGE_NAME}"):
+        return False, "แอป Roblox ปิดตัวลง (Watchdog)"
+
+    now = time.time()
+    grace = max(60, int(cfg.get("startup_grace_seconds", 90)))
+    if now - STATE.get("game_start_time", 0) < grace:
+        return True, "กำลังอยู่ในช่วงโหลดเกม"
+
+    stale_limit = max(90, int(cfg.get("log_stale_seconds", 180)))
+    age_text = run_root_text(
+        f"LATEST=$(ls -t {GAME_LOG_DIR}/*.log {EXT_LOG_DIR}/*.log 2>/dev/null | head -n 1); "
+        f"if [ -n \"$LATEST\" ]; then NOW=$(date +%s); MT=$(stat -c %Y \"$LATEST\" 2>/dev/null); "
+        f"if [ -n \"$MT\" ]; then echo $((NOW-MT)); fi; fi"
+    )
+    try:
+        log_age = int(age_text.strip())
+    except (TypeError, ValueError):
+        log_age = None
+
+    focus = run_root_text("dumpsys window windows | grep -E 'mCurrentFocus|mFocusedApp'")
+    roblox_focused = PACKAGE_NAME in focus
+
+    # ถ้า Roblox ยังอยู่หน้าจอแต่ log เงียบนานมาก ให้ถือว่าค้าง/หลุดแบบตรวจไม่เจอ
+    if roblox_focused and log_age is not None and log_age >= stale_limit:
+        return False, f"Roblox เงียบ/ค้างนาน {log_age}s (Watchdog)"
+
+    # ถ้าแอปยังมี PID แต่หน้าต่างหลุดออกจาก Roblox และ log เงียบด้วย ก็ให้เข้าใหม่
+    if (not roblox_focused and log_age is not None
+            and log_age >= max(60, stale_limit // 2)):
+        return False, f"Roblox ไม่ได้อยู่หน้าจอและไม่มี Log ใหม่ {log_age}s"
+
+    return True, "ปกติ"
+
+
 def analyze_game_health(cfg):
     # --- ชั้นที่ 1: ตรวจสอบสถานะแอปและหน้าต่างระบบ Android ---
     dumpsys_focus = run_root_text("dumpsys window windows | grep -E 'mCurrentFocus|mFocusedApp'")
@@ -740,6 +783,11 @@ async def send_bot_report(channel, message, include_screenshot=False):
 
 async def do_rejoin(channel, done_message):
     async with STATE["lock"]:
+        cooldown = max(10, int(CFG.get("rejoin_cooldown_seconds", 45)))
+        since = time.time() - STATE.get("last_rejoin_attempt", 0.0)
+        if since < cooldown:
+            await asyncio.sleep(cooldown - since)
+        STATE["last_rejoin_attempt"] = time.time()
         ok = await join_roblox_async(CFG)
         if ok:
             now = time.time()
@@ -1018,7 +1066,7 @@ def menu_3_start_bot(cfg):
     now = time.time()
     STATE.update({"paused": False, "last_screenshot": now, "last_ram_clear": now,
                   "game_start_time": now, "fail_count": 0, "loop_restarts": 0,
-                  "net_dropped": False, "lock": None})
+                  "net_dropped": False, "last_rejoin_attempt": 0.0, "lock": None})
 
     LAST_RESULT_TEXT = f"{YELLOW}⏳ กำลังเชื่อมต่อ Discord...{RESET}"
     DASHBOARD_ACTIVE = True
@@ -1050,6 +1098,8 @@ def menu_3_start_bot(cfg):
                 return
 
             healthy, reason = await asyncio.to_thread(analyze_game_health, cfg)
+            if healthy:
+                healthy, reason = await asyncio.to_thread(detect_long_session_stall, cfg)
             now = time.time()
 
             if not healthy:
