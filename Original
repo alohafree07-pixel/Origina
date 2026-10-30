@@ -991,8 +991,12 @@ class SettingsModal(discord.ui.Modal, title='⚙️ แก้ไขการต�
 
 # ================= ปุ่มควบคุม =================
 class ControlView(discord.ui.View):
-    def __init__(self):
+    def __init__(self, sync_buttons: bool = True):
         super().__init__(timeout=None)
+        if sync_buttons:
+            is_paused = bool(STATE.get("paused", False))
+            self.btn_pause.disabled = is_paused
+            self.btn_resume.disabled = not is_paused
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if is_authorized(interaction.user.id):
@@ -1054,18 +1058,44 @@ class ControlView(discord.ui.View):
 
     @discord.ui.button(label="⏸️ Pause Auto", style=discord.ButtonStyle.secondary, row=2, custom_id="btn_pause")
     async def btn_pause(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if STATE["lock"] and STATE["lock"].locked():
+            return await interaction.response.send_message("⏳ กำลัง Rejoin อยู่แล้ว กรุณารอสักครู่", ephemeral=True)
+        if STATE["paused"]:
+            try:
+                await interaction.message.edit(view=ControlView())
+            except Exception:
+                pass
+            return await interaction.response.send_message("⚠️ ระบบเฝ้าจอถูกหยุดพัก (Paused) อยู่แล้วครับ", ephemeral=True)
+
         STATE["paused"] = True
         log("หยุดพักระบบเฝ้าจอ (Paused)", YELLOW)
         await interaction.response.send_message("⏸️ ระงับระบบเฝ้าจอชั่วคราวแล้ว!", ephemeral=True)
+        try:
+            await interaction.message.edit(view=ControlView())
+        except Exception:
+            pass
 
     @discord.ui.button(label="▶️ Resume Auto", style=discord.ButtonStyle.success, row=2, custom_id="btn_resume")
     async def btn_resume(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if STATE["lock"] and STATE["lock"].locked():
+            return await interaction.response.send_message("⏳ กำลัง Rejoin อยู่แล้ว กรุณารอสักครู่", ephemeral=True)
+        if not STATE["paused"]:
+            try:
+                await interaction.message.edit(view=ControlView())
+            except Exception:
+                pass
+            return await interaction.response.send_message("⚠️ ระบบ Auto Rejoin กำลังทำงานอยู่แล้วครับ!", ephemeral=True)
+
         STATE["paused"] = False
         STATE["fail_count"] = 0
         STATE["last_screenshot"] = time.time()
         STATE["last_ram_clear"] = time.time()
         log("เดินระบบเฝ้าจอต่อ (Resumed)", GREEN)
         await interaction.response.send_message("▶️ ระบบเฝ้าจอกลับมาทำงานต่อแล้ว!", ephemeral=True)
+        try:
+            await interaction.message.edit(view=ControlView())
+        except Exception:
+            pass
 
     @discord.ui.button(label="🗑️ Clear Logs", style=discord.ButtonStyle.secondary, row=2, custom_id="btn_clear_logs")
     async def btn_clear_logs(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -1234,7 +1264,7 @@ def menu_3_start_bot(cfg):
 
         if STATE["lock"] is None:
             STATE["lock"] = asyncio.Lock()
-        bot.add_view(ControlView())
+        bot.add_view(ControlView(sync_buttons=False))
 
         channel = bot.get_channel(int(cfg['channel_id']))
         if channel:
