@@ -819,7 +819,40 @@ def spawn(coro):
     t.add_done_callback(BG_TASKS.discard)
     return t
 
-async def send_bot_report(channel, message, include_screenshot=False):
+# ================= ข้อความรายงานชิ้นเดียว (แก้ไขข้อความเดิมแทนการส่งใหม่) =================
+DASH_FILE = "original_dash.json"
+DASH = {"msg": None, "lock": None, "shot_time": None}
+
+def _load_dash_id():
+    try:
+        with open(DASH_FILE, "r", encoding="utf-8") as f:
+            return int(json.load(f).get("message_id", 0)) or None
+    except Exception:
+        return None
+
+def _save_dash_id(mid):
+    try:
+        with open(DASH_FILE, "w", encoding="utf-8") as f:
+            json.dump({"message_id": mid}, f)
+    except Exception:
+        pass
+
+async def _get_dash_msg(channel):
+    """หาข้อความรายงานเดิม (จากหน่วยความจำ หรือจาก ID ที่บันทึกไว้ตอนรันครั้งก่อน)"""
+    if DASH["msg"]:
+        return DASH["msg"]
+    mid = _load_dash_id()
+    if mid:
+        try:
+            DASH["msg"] = await channel.fetch_message(mid)
+            return DASH["msg"]
+        except Exception:
+            pass
+    return None
+
+async def send_bot_report(channel, message, include_screenshot=False, force_new=False):
+    """อัปเดตข้อความรายงานเดิมในห้อง ถ้าไม่มี/ถูกลบ จะส่งใหม่แล้วจำ ID ไว้
+    force_new=True -> ส่งเป็นข้อความใหม่แยก (ใช้กับแจ้งเตือนสำคัญ จะได้มีแจ้งเตือนเด้งที่มือถือ)"""
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     pause_tag = " ⏸️ `[PAUSED]`" if STATE["paused"] else ""
     content = (f"🤖 **[ORIGINAL REPORT]**{pause_tag} (`{now_str}`)\n"
@@ -830,13 +863,49 @@ async def send_bot_report(channel, message, include_screenshot=False):
         embed = await asyncio.to_thread(get_discord_embed, STATE["dev_name"], STATE["paused"])
         view = ControlView()
         img_bytes = await asyncio.to_thread(capture_screenshot_bytes) if include_screenshot else None
+
+        def make_file():
+            return discord.File(io.BytesIO(img_bytes), filename="screenshot.png")
+
         if img_bytes:
-            file = discord.File(io.BytesIO(img_bytes), filename="screenshot.png")
-            await channel.send(content=content, embed=embed, file=file, view=view)
-        else:
-            await channel.send(content=content, embed=embed, view=view)
+            DASH["shot_time"] = datetime.now().strftime("%H:%M:%S")
+        elif DASH["shot_time"]:
+            # รอบนี้ไม่ได้แคปภาพใหม่ ภาพเดิมยังค้างอยู่ -> บอกเวลาของภาพให้ชัด
+            content += f"\n🖼️ ภาพหน้าจอล่าสุดเมื่อ `{DASH['shot_time']}`"
+
+        if force_new:
+            if img_bytes:
+                await channel.send(content=content, embed=embed, file=make_file(), view=view)
+            else:
+                await channel.send(content=content, embed=embed, view=view)
+            return
+
+        if DASH["lock"] is None:
+            DASH["lock"] = asyncio.Lock()
+        async with DASH["lock"]:
+            msg = await _get_dash_msg(channel)
+            if msg:
+                try:
+                    kwargs = dict(content=content, embed=embed, view=view)
+                    if img_bytes:
+                        kwargs["attachments"] = [make_file()]   # แทนที่ภาพเดิมด้วยภาพใหม่
+                    await msg.edit(**kwargs)
+                    return
+                except discord.NotFound:
+                    DASH["msg"] = None      # ข้อความถูกลบไปแล้ว -> ส่งใหม่ด้านล่าง
+                except discord.HTTPException as e:
+                    log(f"แก้ไขข้อความรายงานไม่สำเร็จ ({e}) จะส่งใหม่แทน", YELLOW)
+                    DASH["msg"] = None
+
+            if img_bytes:
+                new_msg = await channel.send(content=content, embed=embed, file=make_file(), view=view)
+            else:
+                new_msg = await channel.send(content=content, embed=embed, view=view)
+            DASH["msg"] = new_msg
+            _save_dash_id(new_msg.id)
     except Exception as e:
         log(f"ส่งรายงานพลาด: {e}", RED)
+
 
 async def do_rejoin(channel, done_message):
     async with STATE["lock"]:
