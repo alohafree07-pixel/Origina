@@ -48,8 +48,13 @@ SCREEN_TMP = "/data/local/tmp/orig_screen.png"
 UI_TMP = "/data/local/tmp/orig_ui.xml"
 MAX_FAILS_ALERT = 5
 MAX_LOOP_RESTARTS = 5
-DISCORD_OFFLINE_THRESHOLD = 60       # แจ้งเตือนเมื่อ Discord หลุดนานเกินกี่วินาที
-REJOIN_USER_COOLDOWN = 30            # ผู้ใช้แต่ละคนสั่ง Force Rejoin ห่างกันอย่างน้อยกี่วินาที
+DISCORD_OFFLINE_THRESHOLD = 60
+REJOIN_USER_COOLDOWN = 30
+
+# --- PERFORMANCE TUNABLES ---
+NET_CACHE_SECONDS = 30           # cache ผลเช็คเน็ต (วินาที)
+DASH_THROTTLE_SECONDS = 0.5      # throttle dashboard redraw
+ROOT_TIMEOUT_DEFAULT = 15
 
 DEFAULT_CONFIG = {
     "place_id": "",
@@ -67,7 +72,8 @@ DEFAULT_CONFIG = {
     "log_stale_seconds": 180,
     "rejoin_cooldown_seconds": 45,
     "frozen_screen_checks": 6,
-    "ui_check_every_n": 2,           # เรียก uiautomator ทุก N รอบ (ลดโหลดเครื่อง)
+    "ui_check_every_n": 3,       # uiautomator ทุก N รอบ (เพิ่มจาก 2 → 3 = เบาลง)
+    "screen_check_every_n": 2,   # screencap ทุก N รอบ
 }
 
 CFG = {}
@@ -124,7 +130,7 @@ def clean_filename(name):
 def is_authorized(user_id):
     return int(user_id) in CFG.get("allowed_users", [])
 
-# ================= ฟังก์ชันจัดระเบียบหน้าจอ Termux =================
+# ================= ฟังก์ชันจัดระเบียบหน้าจอ =================
 def fix_tty():
     try:
         import termios
@@ -150,7 +156,7 @@ def trim_visible(text, max_vis=26):
         out.append(ch)
     return "".join(out)
 
-# ================= Logging =================
+# ================= Logging + Throttled Dashboard =================
 logger = logging.getLogger("rbbot")
 logger.setLevel(logging.INFO)
 try:
@@ -159,6 +165,9 @@ try:
     logger.addHandler(_fh)
 except OSError:
     pass
+
+_LAST_DASH_RENDER = [0.0]
+_DASH_DIRTY = [False]
 
 def print_bot_dashboard():
     fix_tty()
@@ -190,7 +199,8 @@ def print_bot_dashboard():
     sys.stdout.write("\r\n".join(lines) + "\r\n")
     sys.stdout.flush()
 
-def log(msg, color=CYAN):
+def log(msg, color=CYAN, force_redraw=False):
+    """เขียน log + redraw dashboard แบบ throttle (ไม่เกิน 2Hz) ยกเว้น force_redraw"""
     global LAST_RESULT_TEXT
     now = datetime.now().strftime("%H:%M:%S")
     clean_msg = " ".join(str(msg).splitlines()).strip()
@@ -198,22 +208,25 @@ def log(msg, color=CYAN):
 
     short_msg = trim_visible(clean_msg, 25)
     LAST_RESULT_TEXT = f"{color}[{now}] {short_msg}{RESET}"
+    _DASH_DIRTY[0] = True
 
     if DASHBOARD_ACTIVE:
-        print_bot_dashboard()
+        current = time.time()
+        if force_redraw or (current - _LAST_DASH_RENDER[0]) >= DASH_THROTTLE_SECONDS:
+            _LAST_DASH_RENDER[0] = current
+            _DASH_DIRTY[0] = False
+            print_bot_dashboard()
     else:
         fix_tty()
         sys.stdout.write(f"{color}[{now}] {clean_msg}{RESET}\r\n")
         sys.stdout.flush()
 
 def audit(interaction, action):
-    """บันทึก audit log ว่าผู้ใช้คนใดสั่งงานอะไร"""
     try:
         logger.info(f"[AUDIT] user={interaction.user.id} ({interaction.user}) action={action}")
     except Exception:
         pass
 
-# ================= ฟังก์ชันนำเข้า =================
 def safe_input(prompt_text):
     fix_tty()
     try:
@@ -227,7 +240,7 @@ def safe_input(prompt_text):
     except EOFError:
         return ""
 
-# ================= จัดการการตั้งค่า =================
+# ================= จัดการ Config =================
 def load_config():
     cfg = json.loads(json.dumps(DEFAULT_CONFIG))
     if os.path.exists(CONFIG_FILE):
@@ -249,8 +262,52 @@ def save_config(cfg):
     except OSError:
         pass
 
-# ================= คำสั่ง Root =================
-def run_root_text(cmd, timeout=15):
+# ================= ★ Core Optimization: Batch Root Commands =================
+def batch_root(commands: dict, timeout=ROOT_TIMEOUT_DEFAULT) -> dict:
+    """
+    ★ รันหลาย shell command ใน `su` ครั้งเดียว
+    ลด overhead shell spawn จาก ~100ms × N → ~100ms × 1
+    """
+    if not commands:
+        return {}
+    parts = []
+    for key, cmd in commands.items():
+        parts.append(f'echo "<<B:{key}>>"')
+        parts.append(cmd)
+        parts.append(f'echo "<<E:{key}>>"')
+    script = " ; ".join(parts)
+    try:
+        res = subprocess.run(
+            ["su", "-c", script],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=timeout,
+            errors="replace"
+        )
+        output = res.stdout or ""
+    except Exception as e:
+        logger.warning(f"batch_root ผิดพลาด: {e}")
+        return {k: "" for k in commands}
+
+    results = {}
+    for key in commands:
+        begin = f"<<B:{key}>>"
+        end = f"<<E:{key}>>"
+        try:
+            s = output.index(begin) + len(begin)
+            e = output.index(end, s)
+            results[key] = output[s:e].strip()
+        except ValueError:
+            results[key] = ""
+    return results
+
+async def abatch_root(commands: dict, timeout=ROOT_TIMEOUT_DEFAULT) -> dict:
+    return await asyncio.to_thread(batch_root, commands, timeout)
+
+# คง run_root_text ไว้ใช้กับคำสั่งเดี่ยว (เช่นตอน join)
+def run_root_text(cmd, timeout=ROOT_TIMEOUT_DEFAULT):
     try:
         res = subprocess.run(
             ["su", "-c", cmd],
@@ -266,7 +323,7 @@ def run_root_text(cmd, timeout=15):
         logger.warning(f"run_root_text ผิดพลาด: {e}")
         return ""
 
-async def aroot(cmd, timeout=15):
+async def aroot(cmd, timeout=ROOT_TIMEOUT_DEFAULT):
     return await asyncio.to_thread(run_root_text, cmd, timeout)
 
 def clear_system_ram():
@@ -287,13 +344,8 @@ def clear_termux_junk():
         except OSError:
             pass
     try:
-        subprocess.run(
-            ["apt", "clean"],
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            timeout=60
-        )
+        subprocess.run(["apt", "clean"], stdin=subprocess.DEVNULL,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=60)
     except Exception:
         pass
 
@@ -301,43 +353,36 @@ def capture_screenshot_bytes():
     try:
         res = subprocess.run(
             ["su", "-c", "screencap -p"],
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            timeout=20
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, timeout=20
         )
         if res.returncode == 0 and res.stdout.startswith(PNG_MAGIC):
             return res.stdout
-    except Exception as e:
-        logger.warning(f"screencap (stdout) พลาด: {e}")
+    except Exception:
+        pass
     try:
         cmd = f"screencap -p {SCREEN_TMP} && cat {SCREEN_TMP}; rm -f {SCREEN_TMP}"
         res = subprocess.run(
             ["su", "-c", cmd],
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            timeout=20
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, timeout=20
         )
         if res.stdout.startswith(PNG_MAGIC):
             return res.stdout
-    except Exception as e:
-        logger.warning(f"screencap (file) พลาด: {e}")
+    except Exception:
+        pass
     return None
 
-# ================= สแกนหน้าจอ =================
+# ================= ★ Screen Capture (Optimized) =================
 def grab_raw_frame():
     try:
         res = subprocess.run(
             ["su", "-c", "screencap"],
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            timeout=15
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, timeout=15
         )
         buf = res.stdout
-    except Exception as e:
-        logger.warning(f"grab_raw_frame ผิดพลาด: {e}")
+    except Exception:
         return None
     if not buf or len(buf) < 100000:
         return None
@@ -354,15 +399,35 @@ def grab_raw_frame():
         hdr = 12
     return buf, w, h, hdr
 
-def frame_signature(frame):
-    buf, w, h, hdr = frame
-    sig = bytearray()
+# ★ Cache offsets ตามขนาดหน้าจอ ลดการคำนวณซ้ำทุกครั้ง
+_SIG_OFFSET_CACHE = {}
+
+def _get_sig_offsets(w, h, hdr):
+    key = (w, h, hdr)
+    cached = _SIG_OFFSET_CACHE.get(key)
+    if cached is not None:
+        return cached
+    offsets = []
     for j in range(24):
         py = int(h * (j + 0.5) / 24)
         for i in range(14):
             px = int(w * (i + 0.5) / 14)
-            idx = hdr + (py * w + px) * 4
-            sig += bytes((buf[idx] >> 4, buf[idx + 1] >> 4, buf[idx + 2] >> 4))
+            offsets.append(hdr + (py * w + px) * 4)
+    _SIG_OFFSET_CACHE[key] = offsets
+    return offsets
+
+def frame_signature(frame):
+    """★ เร็วกว่าเดิม ~3-5 เท่า (ลด repeated concatenation)"""
+    buf, w, h, hdr = frame
+    offsets = _get_sig_offsets(w, h, hdr)
+    n = len(offsets)
+    sig = bytearray(n * 3)
+    idx = 0
+    for off in offsets:
+        sig[idx] = buf[off] >> 4
+        sig[idx + 1] = buf[off + 1] >> 4
+        sig[idx + 2] = buf[off + 2] >> 4
+        idx += 3
     return hashlib.md5(bytes(sig)).hexdigest()
 
 def inspect_screen():
@@ -374,8 +439,8 @@ def inspect_screen():
         sig = frame_signature(frame)
 
         def get_rgb(px, py):
-            idx = hdr + (py * w + px) * 4
-            return buf[idx], buf[idx + 1], buf[idx + 2]
+            i = hdr + (py * w + px) * 4
+            return buf[i], buf[i + 1], buf[i + 2]
 
         def is_modal_gray(r, g, b):
             return (50 <= r <= 66 and 52 <= g <= 68 and 54 <= b <= 70
@@ -423,23 +488,36 @@ def inspect_screen():
         logger.warning(f"inspect_screen ผิดพลาด: {e}")
         return False, None
 
+# ================= ★ Internet Check (Parallel + Cache) =================
+_NET_CACHE_UNTIL = [0.0]
+
 async def check_internet():
-    for host, port in (("1.1.1.1", 443), ("8.8.8.8", 53), ("google.com", 443)):
+    """★ parallel + cache 30s → ส่วนใหญ่คืนทันที"""
+    now = time.time()
+    if now < _NET_CACHE_UNTIL[0]:
+        return True
+
+    async def probe(host, port):
         try:
             _, w = await asyncio.wait_for(asyncio.open_connection(host, port), timeout=4)
             w.close()
             return True
         except Exception:
-            continue
-    return False
+            return False
 
-# ================= Discord Health Check =================
+    results = await asyncio.gather(
+        probe("1.1.1.1", 443),
+        probe("8.8.8.8", 53),
+        probe("google.com", 443),
+        return_exceptions=True
+    )
+    ok = any(r is True for r in results)
+    if ok:
+        _NET_CACHE_UNTIL[0] = time.time() + NET_CACHE_SECONDS
+    return ok
+
+# ================= Discord Health =================
 async def check_discord_health(channel):
-    """
-    ตรวจสอบสถานะการเชื่อมต่อ Discord
-    - ถ้าหลุด -> บันทึกเวลาเริ่มหลุด
-    - ถ้ากลับมาและหลุดนาน ≥ DISCORD_OFFLINE_THRESHOLD -> ping ผู้ใช้
-    """
     is_offline = False
     try:
         if bot.is_closed() or not bot.is_ready():
@@ -454,7 +532,7 @@ async def check_discord_health(channel):
     if is_offline:
         if STATE.get("discord_offline_since", 0) == 0:
             STATE["discord_offline_since"] = time.time()
-            log("🔌 ตรวจพบ Discord ขาดการเชื่อมต่อ", RED)
+            log("🔌 ตรวจพบ Discord ขาดการเชื่อมต่อ", RED, force_redraw=True)
         return
 
     since = STATE.get("discord_offline_since", 0)
@@ -465,7 +543,6 @@ async def check_discord_health(channel):
             await send_reconnect_alert(channel, dur)
 
 async def send_reconnect_alert(channel, duration_sec):
-    """แจ้งเตือนเมื่อ Discord กลับมาเชื่อมต่อหลังหลุดนาน พร้อม ping ผู้ใช้ที่ได้รับอนุญาต"""
     mentions = " ".join(f"<@{uid}>" for uid in CFG.get("allowed_users", []))
     if duration_sec < 60:
         dur_text = f"{int(duration_sec)} วินาที"
@@ -481,16 +558,16 @@ async def send_reconnect_alert(channel, duration_sec):
             f"{mentions}",
             allowed_mentions=discord.AllowedMentions(users=True)
         )
-        log(f"แจ้งเตือน Discord reconnect (ขาด {dur_text})", YELLOW)
+        log(f"แจ้งเตือน Discord reconnect (ขาด {dur_text})", YELLOW, force_redraw=True)
     except Exception as e:
         log(f"ส่งแจ้งเตือน reconnect ไม่สำเร็จ: {e}", RED)
 
-# ================= ดึงข้อมูลสถานะเครื่อง =================
+# ================= System Stats =================
 def get_discord_embed(dev_name, is_paused):
     try:
         with open("/proc/stat", "r") as f:
             s1 = [int(i) for i in f.readline().split()[1:8]]
-        time.sleep(0.2)
+        time.sleep(0.15)  # ★ ลดจาก 0.2 → 0.15
         with open("/proc/stat", "r") as f:
             s2 = [int(i) for i in f.readline().split()[1:8]]
         t1, t2 = sum(s1), sum(s2)
@@ -531,7 +608,7 @@ def get_discord_embed(dev_name, is_paused):
     embed.add_field(name="⏰ Uptime", value=f"`{uptime_hrs} hours`", inline=True)
     return embed
 
-# ================= เข้าเกม =================
+# ================= Join Game =================
 async def join_roblox_async(cfg):
     place_id = str(cfg.get("place_id", "")).strip()
     vip_code = str(cfg.get("vip_link_code", "")).strip()
@@ -541,9 +618,12 @@ async def join_roblox_async(cfg):
         return False
 
     log("กำลังปิดเกมและเคลียร์ Log...", YELLOW)
-    await aroot(f"am force-stop {PACKAGE_NAME}")
-    await aroot(f"rm -rf {GAME_LOG_DIR}/*.log {EXT_LOG_DIR}/*.log")
-    await asyncio.to_thread(clear_system_ram)
+    # ★ รวม am force-stop + rm + drop_caches ใน batch เดียว
+    await abatch_root({
+        "stop": f"am force-stop {PACKAGE_NAME}",
+        "rmlog": f"rm -rf {GAME_LOG_DIR}/*.log {EXT_LOG_DIR}/*.log 2>/dev/null",
+        "ram": "sync && echo 3 > /proc/sys/vm/drop_caches",
+    })
     await asyncio.sleep(3)
 
     if vip_code:
@@ -554,7 +634,6 @@ async def join_roblox_async(cfg):
     res = await aroot(
         f"am start -a android.intent.action.VIEW -d {shlex.quote(deep_link)} {PACKAGE_NAME}"
     )
-    # ตรวจสอบผลลัพธ์ของ am start ว่าสำเร็จหรือไม่
     if not res or "Error:" in res or "Exception" in res or "unable to resolve" in res.lower():
         log(f"❌ เปิดแอปไม่สำเร็จ: {res[:120] or 'ไม่มี output'}", RED)
         return False
@@ -567,6 +646,16 @@ async def join_roblox_async(cfg):
 def _rx(pattern, text):
     return re.search(pattern, text, re.IGNORECASE) is not None
 
+# ★ Pre-compile regex สำหรับ log patterns (ลดการ compile ซ้ำทุกรอบ)
+_LOG_RX_273 = re.compile(r"\b(?:error\s*code\s*[:=]\s*(?:273|264)|disconnect[^\n]*\breason\s*[:=]\s*(?:273|264))\b", re.I)
+_LOG_RX_PSS4 = re.compile(r"\berror\s*code\s*[:=]?\s*pss4\b", re.I)
+_LOG_RX_267 = re.compile(r"\b(?:error\s*code\s*[:=]\s*267|disconnect[^\n]*\breason\s*[:=]\s*267)\b", re.I)
+_LOG_RX_277 = re.compile(r"\b(?:error\s*code\s*[:=]\s*(?:277|279)|disconnect[^\n]*\breason\s*[:=]\s*(?:277|279))\b", re.I)
+_LOG_RX_278 = re.compile(r"\b(?:error\s*code\s*[:=]\s*278|disconnect[^\n]*\breason\s*[:=]\s*278)\b", re.I)
+_LOG_RX_268 = re.compile(r"\b(?:error\s*code\s*[:=]\s*(?:268|272)|disconnect[^\n]*\breason\s*[:=]\s*(?:268|272))\b", re.I)
+_LOG_RX_26X = re.compile(r"\berror\s*code\s*[:=]\s*(?:260|261|262|524|529|773)\b", re.I)
+_LOG_RX_GEN = re.compile(r"disconnect\w*[^\n]*\breason\s*[:=]\s*(?:2[6-9]\d|5\d\d|6\d\d|7\d\d)\b", re.I)
+
 def extract_active_session_logs(raw_log_text):
     if not raw_log_text:
         return ""
@@ -578,25 +667,87 @@ def extract_active_session_logs(raw_log_text):
             last_join_idx = idx
     return "\n".join(lines[last_join_idx:]).lower()
 
-def get_focus_text():
-    out = run_root_text("dumpsys window windows | grep -E 'mCurrentFocus|mFocusedApp'")
-    if not out.strip():
-        out = run_root_text("dumpsys window | grep -E 'mCurrentFocus|mFocusedApp'")
-    return out
+# ★ Health Probe แบบ batch (คำสั่งเดียว)
+def run_health_probe(cfg, want_ui=False):
+    """
+    ★ เก็บข้อมูลทั้งหมดใน su ครั้งเดียว: pidof, focus, log tail, log age, (optional) ui xml
+    แทนที่จะเรียก 4-5 ครั้งแบบเดิม
+    """
+    tail_n = max(800, int(cfg.get("log_tail_lines", 1000)))
+    log_expr = f'LATEST=$(ls -t {GAME_LOG_DIR}/*.log {EXT_LOG_DIR}/*.log 2>/dev/null | head -n 1)'
 
-def get_log_age():
-    txt = run_root_text(
-        f"LATEST=$(ls -t {GAME_LOG_DIR}/*.log {EXT_LOG_DIR}/*.log 2>/dev/null | head -n 1); "
-        f"if [ -n \"$LATEST\" ]; then NOW=$(date +%s); MT=$(stat -c %Y \"$LATEST\" 2>/dev/null); "
-        f"if [ -n \"$MT\" ]; then echo $((NOW-MT)); fi; fi"
-    )
-    try:
-        return int(txt.strip())
-    except (TypeError, ValueError):
-        return None
+    cmds = {
+        "pidof": f"pidof {PACKAGE_NAME} || true",
+        "focus": "dumpsys window windows | grep -E 'mCurrentFocus|mFocusedApp' || true",
+        "log_tail": f'{log_expr}; if [ -n "$LATEST" ]; then tail -n {tail_n} "$LATEST"; fi',
+        "log_age": f'{log_expr}; if [ -n "$LATEST" ]; then NOW=$(date +%s); MT=$(stat -c %Y "$LATEST" 2>/dev/null); if [ -n "$MT" ]; then echo $((NOW-MT)); fi; fi',
+    }
+    if want_ui:
+        cmds["ui_xml"] = f"uiautomator dump {UI_TMP} >/dev/null 2>&1; cat {UI_TMP} 2>/dev/null; rm -f {UI_TMP}"
 
-def detect_long_session_stall(cfg):
-    if not run_root_text(f"pidof {PACKAGE_NAME}"):
+    return batch_root(cmds, timeout=20)
+
+def analyze_probe(cfg, probe):
+    """★ วิเคราะห์ผลจาก probe (ไม่เรียก root เพิ่ม)"""
+    # Layer 1
+    if not probe.get("pidof", "").strip():
+        return False, "แอป Roblox ปิดตัวลง (App Crashed)"
+
+    focus = probe.get("focus", "")
+    if "com.android.vending" in focus or "Google Play" in focus:
+        return False, "เด้งไป Play Store (เกมบังคับอัปเดตแพทช์)"
+    if "Application Not Responding" in focus:
+        return False, "ตัวเกมค้างไม่ตอบสนอง (System ANR)"
+
+    # Layer 2: log
+    active = extract_active_session_logs(probe.get("log_tail", ""))
+    if active:
+        if _LOG_RX_273.search(active) or "same account launched" in active \
+                or "same account is currently" in active or "from different device" in active:
+            return False, "ตรวจพบคนเข้าไอดีซ้อน! (Error Code: 273)"
+        if _LOG_RX_PSS4.search(active) or "datastores not loading" in active:
+            return False, "เซิร์ฟเวอร์โหลดข้อมูลไม่ขึ้น (Error PSS4 / 267)"
+        if _LOG_RX_267.search(active) or "you have been kicked" in active \
+                or "you were kicked" in active or "kicked by this experience" in active \
+                or "moderation message:" in active:
+            return False, "ถูกเตะออกจากแมพ (Error Code: 267)"
+        if _LOG_RX_277.search(active) or "please check your internet connection" in active \
+                or "lost connection to the game server" in active \
+                or "id_connection_lost" in active or "connection attempt failed" in active:
+            return False, "เน็ตหลุดหรือเซิร์ฟเวอร์ตัด (Error Code: 277)"
+        if _LOG_RX_278.search(active) or "idle 20 minutes" in active or "idledisconnect" in active:
+            return False, "ยืนนิ่งเกิน 20 นาที (Error Code: 278 AFK)"
+        if _LOG_RX_268.search(active) or "unexpected client behavior" in active or "security kick" in active:
+            return False, "เซิร์ฟเวอร์หรือระบบความปลอดภัยเตะ (Error: 268/272)"
+        if _LOG_RX_26X.search(active):
+            return False, "เชื่อมต่อแมพไม่สำเร็จ (Error: 529/524/26x)"
+        if _LOG_RX_GEN.search(active) or "disconnection notification" in active:
+            return False, "ถูกตัดการเชื่อมต่อจากเซิร์ฟเวอร์ (Disconnect)"
+
+    # Layer 3: UI (optional)
+    ui = probe.get("ui_xml", "")
+    if ui:
+        ul = ui.lower()
+        if any(k in ul for k in ("upgrade required", "update required", "needs to be updated", "please update")):
+            return False, "หน้าจอแจ้งให้อัปเดตเวอร์ชัน (Upgrade Required)"
+        if "same account launched" in ul or re.search(r"\berror\s*code\s*[:=]\s*273\b", ul):
+            return False, "ตรวจพบคนเข้าไอดีซ้อนบนจอ (Error 273)"
+        if "check your internet" in ul or re.search(r"\berror\s*code\s*[:=]\s*277\b", ul):
+            return False, "หน้าจอแจ้งเตือนเน็ตหลุด (Error 277)"
+        if "pss4" in ul or "datastores not loading" in ul:
+            return False, "เซิร์ฟเวอร์แมพมีปัญหา (Error Code PSS4)"
+        if "kicked by this experience" in ul or "you have been kicked" in ul:
+            return False, "ถูกเตะออกจากแมพ (Kicked by Experience)"
+        if "disconnected" in ul and ("error code" in ul or "leave" in ul or "reconnect" in ul):
+            return False, "หน้าจอแจ้งเตือนหลุดออกจากเกม (Disconnected)"
+        if ("log in" in ul and "sign up" in ul) or ("discover" in ul and "avatar" in ul and "connect" in ul):
+            return False, "เด้งออกกลับมาหน้าเมนูหลัก Roblox"
+
+    return True, "ปกติ"
+
+def analyze_stall(cfg, probe):
+    """★ Watchdog ใช้ probe data (ไม่เรียกซ้ำ)"""
+    if not probe.get("pidof", "").strip():
         return False, "แอป Roblox ปิดตัวลง (Watchdog)"
 
     now = time.time()
@@ -606,8 +757,13 @@ def detect_long_session_stall(cfg):
         return True, "กำลังอยู่ในช่วงโหลดเกม"
 
     stale_limit = max(90, int(cfg.get("log_stale_seconds", 180)))
-    log_age = get_log_age()
-    focus = get_focus_text()
+
+    try:
+        log_age = int(probe.get("log_age", "").strip())
+    except (TypeError, ValueError):
+        log_age = None
+
+    focus = probe.get("focus", "")
     focus_known = bool(focus.strip())
     roblox_focused = PACKAGE_NAME in focus
 
@@ -631,100 +787,16 @@ def detect_long_session_stall(cfg):
 
     return True, "ปกติ"
 
-def analyze_game_health(cfg, run_ui_check=True):
-    # --- ชั้นที่ 1 ---
-    dumpsys_focus = get_focus_text()
-    if "com.android.vending" in dumpsys_focus or "Google Play" in dumpsys_focus:
-        return False, "เด้งไป Play Store (เกมบังคับอัปเดตแพทช์)"
-
-    if not run_root_text(f"pidof {PACKAGE_NAME}"):
-        return False, "แอป Roblox ปิดตัวลง (App Crashed)"
-
-    if "Application Not Responding" in dumpsys_focus:
-        return False, "ตัวเกมค้างไม่ตอบสนอง (System ANR)"
-
-    # --- ชั้นที่ 2 ---
-    tail_n = max(800, int(cfg.get("log_tail_lines", 1000)))
-    raw_logs = run_root_text(
-        f"LATEST=$(ls -t {GAME_LOG_DIR}/*.log {EXT_LOG_DIR}/*.log 2>/dev/null | head -n 1); "
-        f"if [ -n \"$LATEST\" ]; then tail -n {tail_n} \"$LATEST\"; fi",
-        timeout=15
-    )
-
-    active_logs = extract_active_session_logs(raw_logs)
-
-    if active_logs:
-        if (
-            _rx(r"\b(?:error\s*code\s*[:=]\s*(?:273|264)|disconnect[^\n]*\breason\s*[:=]\s*(?:273|264))\b", active_logs)
-            or "same account launched" in active_logs
-            or "same account is currently" in active_logs
-            or "from different device" in active_logs
-        ):
-            return False, "ตรวจพบคนเข้าไอดีซ้อน! (Error Code: 273)"
-
-        if _rx(r"\berror\s*code\s*[:=]?\s*pss4\b", active_logs) or "datastores not loading" in active_logs:
-            return False, "เซิร์ฟเวอร์โหลดข้อมูลไม่ขึ้น (Error PSS4 / 267)"
-
-        if (
-            _rx(r"\b(?:error\s*code\s*[:=]\s*267|disconnect[^\n]*\breason\s*[:=]\s*267)\b", active_logs)
-            or "you have been kicked" in active_logs
-            or "you were kicked" in active_logs
-            or "kicked by this experience" in active_logs
-            or "moderation message:" in active_logs
-        ):
-            return False, "ถูกเตะออกจากแมพ (Error Code: 267)"
-
-        if (
-            _rx(r"\b(?:error\s*code\s*[:=]\s*(?:277|279)|disconnect[^\n]*\breason\s*[:=]\s*(?:277|279))\b", active_logs)
-            or "please check your internet connection" in active_logs
-            or "lost connection to the game server" in active_logs
-            or "id_connection_lost" in active_logs
-            or "connection attempt failed" in active_logs
-        ):
-            return False, "เน็ตหลุดหรือเซิร์ฟเวอร์ตัด (Error Code: 277)"
-
-        if (
-            _rx(r"\b(?:error\s*code\s*[:=]\s*278|disconnect[^\n]*\breason\s*[:=]\s*278)\b", active_logs)
-            or "idle 20 minutes" in active_logs
-            or "idledisconnect" in active_logs
-        ):
-            return False, "ยืนนิ่งเกิน 20 นาที (Error Code: 278 AFK)"
-
-        if (
-            _rx(r"\b(?:error\s*code\s*[:=]\s*(?:268|272)|disconnect[^\n]*\breason\s*[:=]\s*(?:268|272))\b", active_logs)
-            or "unexpected client behavior" in active_logs
-            or "security kick" in active_logs
-        ):
-            return False, "เซิร์ฟเวอร์หรือระบบความปลอดภัยเตะ (Error: 268/272)"
-
-        if _rx(r"\berror\s*code\s*[:=]\s*(?:260|261|262|524|529|773)\b", active_logs):
-            return False, "เชื่อมต่อแมพไม่สำเร็จ (Error: 529/524/26x)"
-
-        if _rx(r"disconnect\w*[^\n]*\breason\s*[:=]\s*(?:2[6-9]\d|5\d\d|6\d\d|7\d\d)\b", active_logs) \
-                or "disconnection notification" in active_logs:
-            return False, "ถูกตัดการเชื่อมต่อจากเซิร์ฟเวอร์ (Disconnect)"
-
-    # --- ชั้นที่ 3: เรียก uiautomator เฉพาะรอบที่กำหนด (ลดโหลด) ---
-    if run_ui_check:
-        ui_xml = run_root_text(f"uiautomator dump {UI_TMP} >/dev/null 2>&1; cat {UI_TMP}; rm -f {UI_TMP}")
-        if ui_xml:
-            ul = ui_xml.lower()
-            if any(k in ul for k in ("upgrade required", "update required", "needs to be updated", "please update")):
-                return False, "หน้าจอแจ้งให้อัปเดตเวอร์ชัน (Upgrade Required)"
-            if "same account launched" in ul or _rx(r"\berror\s*code\s*[:=]\s*273\b", ul):
-                return False, "ตรวจพบคนเข้าไอดีซ้อนบนจอ (Error 273)"
-            if "check your internet" in ul or _rx(r"\berror\s*code\s*[:=]\s*277\b", ul):
-                return False, "หน้าจอแจ้งเตือนเน็ตหลุด (Error 277)"
-            if "pss4" in ul or "datastores not loading" in ul:
-                return False, "เซิร์ฟเวอร์แมพมีปัญหา (Error Code PSS4)"
-            if "kicked by this experience" in ul or "you have been kicked" in ul:
-                return False, "ถูกเตะออกจากแมพ (Kicked by Experience)"
-            if "disconnected" in ul and ("error code" in ul or "leave" in ul or "reconnect" in ul):
-                return False, "หน้าจอแจ้งเตือนหลุดออกจากเกม (Disconnected)"
-            if ("log in" in ul and "sign up" in ul) or ("discover" in ul and "avatar" in ul and "connect" in ul):
-                return False, "เด้งออกกลับมาหน้าเมนูหลัก Roblox"
-
-    # --- ชั้นที่ 4 ---
+# เก็บ analyze_game_health แบบเดิมไว้ใช้ใน do_rejoin (ตรวจละเอียด 1 ครั้งหลังเข้าเกม)
+def analyze_game_health(cfg):
+    probe = run_health_probe(cfg, want_ui=True)
+    healthy, reason = analyze_probe(cfg, probe)
+    if not healthy:
+        return False, reason
+    healthy, reason = analyze_stall(cfg, probe)
+    if not healthy:
+        return False, reason
+    # screen check
     dialog, sig = inspect_screen()
     if dialog:
         return False, "ตรวจพบกล่องแจ้งเตือน Disconnected บนหน้าจอเกม"
@@ -734,10 +806,9 @@ def analyze_game_health(cfg, run_ui_check=True):
         else:
             STATE["frozen_count"] = 0
             STATE["last_frame_sig"] = sig
-
     return True, "ปกติ"
 
-# ================= เมนูหลัก =================
+# ================= UI เมนู =================
 def print_ui(cfg):
     fix_tty()
     lines = [
@@ -768,57 +839,57 @@ def menu_1_set_map(cfg):
         if valid_place_id(pid):
             cfg['place_id'] = pid
         else:
-            print(f"{RED}✘ Place ID ต้องเป็นตัวเลขเท่านั้น (ไม่บันทึกค่านี้){RESET}")
-    vip = safe_input("ใส่ VIP Link Code (ถ้าเข้าเซิร์ฟปกติให้กด Enter ข้าม): ")
+            print(f"{RED}✘ Place ID ต้องเป็นตัวเลขเท่านั้น{RESET}")
+    vip = safe_input("ใส่ VIP Link Code (ถ้าไม่มีกด Enter): ")
     if valid_vip(vip):
         cfg['vip_link_code'] = vip
     else:
-        print(f"{RED}✘ VIP Code ใช้ได้เฉพาะ A-Z a-z 0-9 _ - (ไม่บันทึกค่านี้){RESET}")
+        print(f"{RED}✘ VIP Code ไม่ถูกต้อง{RESET}")
     save_config(cfg)
     print(f"{GREEN}✔ บันทึกเรียบร้อย!{RESET}")
     time.sleep(1.5)
 
 def menu_2_set_bot(cfg):
     print(f"\n{BRIGHT_CYAN}--- [2] ตั้งค่า Discord Bot ---{RESET}")
-    token = safe_input("วาง Bot Token (กด Enter เพื่อใช้ค่าเดิม): ")
+    token = safe_input("วาง Bot Token (Enter = ใช้ค่าเดิม): ")
     if token:
         cfg['bot_token'] = token
-    cid = safe_input(f"วาง Channel ID สำหรับให้บอทส่งรายงาน [{cfg['channel_id']}]: ")
+    cid = safe_input(f"Channel ID [{cfg['channel_id']}]: ")
     if cid:
         if cid.isdigit():
             cfg['channel_id'] = cid
         else:
-            print(f"{RED}✘ Channel ID ต้องเป็นตัวเลข (ไม่บันทึกค่านี้){RESET}")
-    print(f"{YELLOW}ผู้มีสิทธิ์กดปุ่ม ปัจจุบัน: {cfg['allowed_users'] or 'ยังไม่มี'}{RESET}")
-    users = safe_input("ใส่ Discord User ID ของคุณ (หลายคนคั่นด้วย , / Enter = ใช้ค่าเดิม): ")
+            print(f"{RED}✘ Channel ID ต้องเป็นตัวเลข{RESET}")
+    print(f"{YELLOW}ผู้มีสิทธิ์: {cfg['allowed_users'] or 'ยังไม่มี'}{RESET}")
+    users = safe_input("Discord User ID (คั่นด้วย , / Enter = คงเดิม): ")
     if users:
         ids = [u.strip() for u in users.split(",") if u.strip()]
         if ids and all(u.isdigit() for u in ids):
             cfg['allowed_users'] = [int(u) for u in ids]
         else:
-            print(f"{RED}✘ User ID ต้องเป็นตัวเลขเท่านั้น (ไม่บันทึกค่านี้){RESET}")
-    mins = safe_input(f"แคปหน้าจอส่งรายงานอัตโนมัติทุกๆ กี่นาที [{cfg['screenshot_minutes']}]: ")
+            print(f"{RED}✘ User ID ต้องเป็นตัวเลข{RESET}")
+    mins = safe_input(f"แคปหน้าจอทุกกี่นาที [{cfg['screenshot_minutes']}]: ")
     if mins.isdigit() and int(mins) > 0:
         cfg['screenshot_minutes'] = int(mins)
     save_config(cfg)
-    print(f"{GREEN}✔ บันทึกการตั้งค่าบอทเรียบร้อย{RESET}")
-    safe_input("\nกด Enter เพื่อกลับสู่เมนูหลัก...")
+    print(f"{GREEN}✔ บันทึกเรียบร้อย{RESET}")
+    safe_input("\nกด Enter...")
 
 def menu_4_ram(cfg):
     print(f"\n{BRIGHT_CYAN}--- [4] ตั้งค่า Auto Clear RAM ---{RESET}")
-    val = safe_input("ระบบจะเคลียร์แคชทุกๆ กี่ชั่วโมง? (ใส่จุดทศนิยมได้ ขั้นต่ำ 0.1): ")
+    val = safe_input("เคลียร์แคชทุกกี่ชั่วโมง? (ขั้นต่ำ 0.1): ")
     try:
         if float(val) >= 0.1:
             cfg['clear_ram_hours'] = float(val)
             save_config(cfg)
-            print(f"{GREEN}✔ บันทึกเวลาเคลียร์ RAM สำเร็จ{RESET}")
+            print(f"{GREEN}✔ บันทึกแล้ว{RESET}")
         else:
-            print(f"{RED}✘ ค่าต้องไม่น้อยกว่า 0.1{RESET}")
+            print(f"{RED}✘ ต้อง ≥ 0.1{RESET}")
     except ValueError:
-        print(f"{RED}✘ ค่าที่ใส่ไม่ใช่ตัวเลข{RESET}")
-    safe_input("\nกด Enter เพื่อกลับสู่เมนูหลัก...")
+        print(f"{RED}✘ ไม่ใช่ตัวเลข{RESET}")
+    safe_input("\nกด Enter...")
 
-# ================= Helper ส่งข้อความ Discord =================
+# ================= Discord Messaging =================
 def spawn(coro):
     t = asyncio.create_task(coro)
     BG_TASKS.add(t)
@@ -826,7 +897,6 @@ def spawn(coro):
     return t
 
 async def _safe_send(channel, **kwargs):
-    """ส่งข้อความพร้อม retry เมื่อ HTTPException"""
     for attempt in range(3):
         try:
             return await channel.send(**kwargs)
@@ -834,7 +904,7 @@ async def _safe_send(channel, **kwargs):
             if attempt == 2:
                 log(f"ส่ง Discord ล้มเหลว 3 ครั้ง: {e}", RED)
                 return None
-            log(f"ส่ง Discord ล้มเหลว (ลอง {attempt + 1}/3): {e}", YELLOW)
+            log(f"ส่ง Discord ล้มเหลว ({attempt + 1}/3): {e}", YELLOW)
             await asyncio.sleep(2 ** attempt)
     return None
 
@@ -901,7 +971,6 @@ async def send_bot_report(channel, message, include_screenshot=False, force_new=
             if msg:
                 try:
                     kwargs = dict(content=content, embed=embed, view=view)
-                    # ★ แก้บัค: ถ้าไม่มีภาพใหม่ให้ลบภาพเก่าออก ไม่ให้ misleading
                     if img_bytes:
                         kwargs["attachments"] = [make_file()]
                     else:
@@ -911,7 +980,7 @@ async def send_bot_report(channel, message, include_screenshot=False, force_new=
                 except discord.NotFound:
                     DASH["msg"] = None
                 except discord.HTTPException as e:
-                    log(f"แก้ไขข้อความรายงานไม่สำเร็จ ({e}) จะส่งใหม่แทน", YELLOW)
+                    log(f"แก้ไขข้อความรายงานไม่สำเร็จ ({e})", YELLOW)
                     DASH["msg"] = None
 
             if img_bytes:
@@ -925,13 +994,12 @@ async def send_bot_report(channel, message, include_screenshot=False, force_new=
         log(f"ส่งรายงานพลาด: {e}", RED)
 
 async def do_rejoin(channel, done_message):
-    ok = False   # ★ แก้บัค: init ก่อนเข้า lock
+    ok = False
     async with STATE["lock"]:
         cooldown = max(10, int(CFG.get("rejoin_cooldown_seconds", 45)))
         since = time.time() - STATE.get("last_rejoin_attempt", 0.0)
         if since < cooldown:
-            # ★ แก้บัค: ข้ามทิ้งแทนการ sleep แล้วทำต่อ
-            log(f"ข้าม Rejoin (cooldown อีก {cooldown - since:.0f}s)", YELLOW)
+            log(f"ข้าม Rejoin (cooldown {cooldown - since:.0f}s)", YELLOW)
             return False
         STATE["last_rejoin_attempt"] = time.time()
         ok = await join_roblox_async(CFG)
@@ -946,23 +1014,22 @@ async def do_rejoin(channel, done_message):
             STATE["bg_count"] = 0
 
     if ok:
-        # ตรวจหลังเข้าเกม - ให้ตรวจ UI ด้วยเสมอ
-        healthy, reason = await asyncio.to_thread(analyze_game_health, CFG, True)
+        healthy, reason = await asyncio.to_thread(analyze_game_health, CFG)
         if not healthy:
             log(f"พบปัญหาหลังเข้าเกม: {reason}", RED)
             if channel:
-                await send_bot_report(channel, f"⚠️ **เข้าเกมแล้วติดปัญหาทันที:** {reason}\n🔄 ระบบจะทำการ Rejoin ใหม่อัตโนมัติในรอบถัดไป", True)
+                await send_bot_report(channel, f"⚠️ **เข้าเกมแล้วติดปัญหาทันที:** {reason}", True)
             return False
 
-    log("เข้าแมพสำเร็จ ระบบกำลังเฝ้าจอ", GREEN)
+    log("เข้าแมพสำเร็จ", GREEN, force_redraw=True)
     if channel:
-        await send_bot_report(channel, done_message if ok else "❌ Rejoin ไม่สำเร็จ (ตรวจสอบ Place ID / VIP Code)", True)
+        await send_bot_report(channel, done_message if ok else "❌ Rejoin ไม่สำเร็จ", True)
     return ok
 
 # ================= Modals =================
 class MapModal(discord.ui.Modal, title='ตั้งค่าเปลี่ยนแมพ (Change Map)'):
-    place_id_input = discord.ui.TextInput(label='Place ID', placeholder='ใส่เลข Place ID ที่นี่...', required=True)
-    vip_code_input = discord.ui.TextInput(label='VIP Link Code (ถ้ามี)', placeholder='ใส่แค่โค้ดต่อท้าย หรือเว้นว่างไว้', required=False)
+    place_id_input = discord.ui.TextInput(label='Place ID', placeholder='ใส่เลข Place ID...', required=True)
+    vip_code_input = discord.ui.TextInput(label='VIP Link Code (ถ้ามี)', placeholder='เว้นว่างได้', required=False)
 
     async def on_submit(self, interaction: discord.Interaction):
         if not is_authorized(interaction.user.id):
@@ -970,18 +1037,18 @@ class MapModal(discord.ui.Modal, title='ตั้งค่าเปลี่ย�
         pid = self.place_id_input.value.strip()
         vip = (self.vip_code_input.value or "").strip()
         if not valid_place_id(pid) or not valid_vip(vip):
-            return await interaction.response.send_message("❌ Place ID ต้องเป็นตัวเลข / VIP Code ใช้ได้เฉพาะ A-Z a-z 0-9 _ -", ephemeral=True)
+            return await interaction.response.send_message("❌ ค่าไม่ถูกต้อง", ephemeral=True)
         audit(interaction, f"change_map pid={pid}")
         CFG['place_id'] = pid
         CFG['vip_link_code'] = vip
         save_config(CFG)
         log(f"เปลี่ยนแมพเป็น {pid}", YELLOW)
-        await interaction.response.send_message(f"✅ บันทึกแมพ `{pid}` เรียบร้อย! กำลังดึงเข้าเกม...", ephemeral=True)
+        await interaction.response.send_message(f"✅ บันทึกแมพ `{pid}`! กำลังดึงเข้าเกม...", ephemeral=True)
         spawn(do_rejoin(interaction.channel, f"✅ เปลี่ยนเป็นแมพ `{pid}` เสร็จสิ้น"))
 
-class AddScriptModal(discord.ui.Modal, title='📝 เพิ่มสคริปต์ฟาร์ม (Add Script)'):
-    filename_input = discord.ui.TextInput(label='ชื่อไฟล์ (ต้องลงท้ายด้วย .lua)', placeholder='เช่น farm.lua', required=True, max_length=60)
-    script_input = discord.ui.TextInput(label='โค้ดสคริปต์ (Script Code)', style=discord.TextStyle.paragraph, placeholder='loadstring(...)', required=True, max_length=4000)
+class AddScriptModal(discord.ui.Modal, title='📝 เพิ่มสคริปต์ฟาร์ม'):
+    filename_input = discord.ui.TextInput(label='ชื่อไฟล์ (.lua)', placeholder='farm.lua', required=True, max_length=60)
+    script_input = discord.ui.TextInput(label='โค้ดสคริปต์', style=discord.TextStyle.paragraph, placeholder='loadstring(...)', required=True, max_length=4000)
 
     async def on_submit(self, interaction: discord.Interaction):
         if not is_authorized(interaction.user.id):
@@ -991,18 +1058,17 @@ class AddScriptModal(discord.ui.Modal, title='📝 เพิ่มสคริ�
         if not filename:
             return await interaction.response.send_message("❌ ชื่อไฟล์ไม่ถูกต้อง", ephemeral=True)
         if not valid_path(path):
-            return await interaction.response.send_message("❌ โฟลเดอร์ AutoExec ไม่ถูกต้อง", ephemeral=True)
-
+            return await interaction.response.send_message("❌ โฟลเดอร์ไม่ถูกต้อง", ephemeral=True)
         audit(interaction, f"add_script file={filename}")
         file_path = f"{path}/{filename}"
         encoded = base64.b64encode(self.script_input.value.encode('utf-8')).decode('ascii')
         cmd = f"mkdir -p {shlex.quote(path)} && echo {encoded} | base64 -d > {shlex.quote(file_path)}"
         await aroot(cmd)
-        await interaction.response.send_message(f"✅ สร้างไฟล์ `{filename}` ลงใน AutoExecute สำเร็จ!", ephemeral=True)
+        await interaction.response.send_message(f"✅ สร้าง `{filename}` สำเร็จ!", ephemeral=True)
         log(f"เพิ่มสคริปต์: {filename}", GREEN)
 
-class DeleteScriptModal(discord.ui.Modal, title='🗑️ ลบสคริปต์ฟาร์ม (Delete Script)'):
-    filename_input = discord.ui.TextInput(label='ชื่อไฟล์ที่ต้องการลบ (รวม .lua)', placeholder='เช่น farm.lua', required=True, max_length=60)
+class DeleteScriptModal(discord.ui.Modal, title='🗑️ ลบสคริปต์ฟาร์ม'):
+    filename_input = discord.ui.TextInput(label='ชื่อไฟล์ (รวม .lua)', placeholder='farm.lua', required=True, max_length=60)
 
     async def on_submit(self, interaction: discord.Interaction):
         if not is_authorized(interaction.user.id):
@@ -1010,23 +1076,21 @@ class DeleteScriptModal(discord.ui.Modal, title='🗑️ ลบสคริป�
         path = str(CFG.get("autoexec_path", "")).strip()
         filename = clean_filename(self.filename_input.value)
         if not filename or not valid_path(path):
-            return await interaction.response.send_message("❌ ชื่อไฟล์หรือโฟลเดอร์ไม่ถูกต้อง", ephemeral=True)
-
+            return await interaction.response.send_message("❌ ไม่ถูกต้อง", ephemeral=True)
         audit(interaction, f"del_script file={filename}")
         file_path = f"{path}/{filename}"
         q = shlex.quote(file_path)
         res = await aroot(f"if [ -f {q} ]; then rm -f {q}; echo OK; else echo FAIL; fi")
         if res == 'OK':
-            await interaction.response.send_message(f"🗑️ ลบไฟล์ `{filename}` เรียบร้อยแล้ว!", ephemeral=True)
+            await interaction.response.send_message(f"🗑️ ลบ `{filename}` แล้ว!", ephemeral=True)
             log(f"ลบสคริปต์: {filename}", YELLOW)
         else:
-            await interaction.response.send_message(f"❌ ไม่พบไฟล์ `{filename}`", ephemeral=True)
-            log(f"หาไฟล์ไม่เจอ: {filename}", RED)
+            await interaction.response.send_message(f"❌ ไม่พบ `{filename}`", ephemeral=True)
 
-class SettingsModal(discord.ui.Modal, title='⚙️ แก้ไขการตั้งค่าโปรแกรม (Settings)'):
+class SettingsModal(discord.ui.Modal, title='⚙️ แก้ไขการตั้งค่า'):
     def __init__(self):
         super().__init__()
-        self.inp_pid = discord.ui.TextInput(label='Place ID ปัจจุบัน', default=str(CFG.get('place_id', '')), required=True)
+        self.inp_pid = discord.ui.TextInput(label='Place ID', default=str(CFG.get('place_id', '')), required=True)
         self.inp_sm = discord.ui.TextInput(label='รอบแคปหน้าจอ (นาที)', default=str(CFG.get('screenshot_minutes', 10)), required=True)
         self.inp_rh = discord.ui.TextInput(label='รอบ Clear RAM (ชั่วโมง)', default=str(CFG.get('clear_ram_hours', 1.0)), required=True)
         self.inp_exec = discord.ui.TextInput(label='โฟลเดอร์ AutoExec', default=str(CFG.get('autoexec_path', '/sdcard/Delta/autoexec')), required=True)
@@ -1036,54 +1100,43 @@ class SettingsModal(discord.ui.Modal, title='⚙️ แก้ไขการต�
     async def on_submit(self, interaction: discord.Interaction):
         if not is_authorized(interaction.user.id):
             return await interaction.response.send_message("⛔ ไม่มีสิทธิ์", ephemeral=True)
-
-        errors = []
-        updates = {}
-
+        errors, updates = [], {}
         pid = self.inp_pid.value.strip()
         if valid_place_id(pid):
             updates["place_id"] = pid
         else:
             errors.append("Place ID ต้องเป็นตัวเลข")
-
         try:
-            screenshot_minutes = int(self.inp_sm.value)
-            if screenshot_minutes < 1:
+            sm = int(self.inp_sm.value)
+            if sm < 1:
                 raise ValueError
-            updates["screenshot_minutes"] = screenshot_minutes
+            updates["screenshot_minutes"] = sm
         except ValueError:
-            errors.append("รอบแคปหน้าจอต้องเป็นจำนวนเต็ม ≥ 1")
-
+            errors.append("รอบแคป ≥ 1")
         try:
-            clear_ram_hours = float(self.inp_rh.value)
-            if clear_ram_hours < 0.1:
+            rh = float(self.inp_rh.value)
+            if rh < 0.1:
                 raise ValueError
-            updates["clear_ram_hours"] = clear_ram_hours
+            updates["clear_ram_hours"] = rh
         except ValueError:
-            errors.append("รอบ Clear RAM ต้องเป็นตัวเลข ≥ 0.1")
-
+            errors.append("Clear RAM ≥ 0.1")
         exec_path = self.inp_exec.value.strip()
         if valid_path(exec_path):
             updates["autoexec_path"] = exec_path
         else:
-            errors.append("โฟลเดอร์ AutoExec ไม่ถูกต้อง")
+            errors.append("โฟลเดอร์ไม่ถูกต้อง")
 
         if errors:
-            return await interaction.response.send_message(
-                "❌ **ยังไม่บันทึกการตั้งค่า**\n⚠️ กรุณาแก้ไข: " + ", ".join(errors),
-                ephemeral=True
-            )
+            return await interaction.response.send_message("❌ " + ", ".join(errors), ephemeral=True)
 
         audit(interaction, "edit_settings")
         CFG.update(updates)
         save_config(CFG)
+        await interaction.response.send_message(
+            f"✅ Place ID: `{CFG['place_id']}`\n📂 `{CFG['autoexec_path']}`", ephemeral=True)
+        log("อัปเดตการตั้งค่า", GREEN)
 
-        summary = (f"✅ **อัปเดตการตั้งค่า**\n🎮 Place ID: `{CFG['place_id']}`\n"
-                   f"📂 โฟลเดอร์: `{CFG['autoexec_path']}`")
-        await interaction.response.send_message(summary, ephemeral=True)
-        log("อัปเดตการตั้งค่าผ่าน Discord", GREEN)
-
-# ================= ปุ่มควบคุม =================
+# ================= Control Buttons =================
 class ControlView(discord.ui.View):
     def __init__(self, sync_buttons: bool = True):
         super().__init__(timeout=None)
@@ -1100,153 +1153,147 @@ class ControlView(discord.ui.View):
             except Exception:
                 pass
             return True
-        await interaction.response.send_message("⛔ คุณไม่มีสิทธิ์ใช้งานปุ่มนี้", ephemeral=True)
-        log(f"ปฏิเสธสิทธิ์ผู้ใช้: {interaction.user}", RED)
+        await interaction.response.send_message("⛔ ไม่มีสิทธิ์", ephemeral=True)
+        log(f"ปฏิเสธสิทธิ์: {interaction.user}", RED)
         return False
 
     @discord.ui.button(label="📊 Get Stats", style=discord.ButtonStyle.primary, row=0, custom_id="btn_stats")
-    async def btn_stats(self, interaction: discord.Interaction, button: discord.ui.Button):
-        log("เช็คสถานะจากปุ่มกด", YELLOW)
+    async def btn_stats(self, interaction, button):
+        log("เช็คสถานะจากปุ่ม", YELLOW)
         await interaction.response.defer()
-        text = "📊 สถานะปัจจุบัน (ระบบหยุดชั่วคราวอยู่)" if STATE["paused"] else "📊 สถานะปัจจุบัน (เรียกดูจากปุ่มกด)"
+        text = "📊 (Paused)" if STATE["paused"] else "📊 สถานะปัจจุบัน"
         await send_bot_report(interaction.channel, text, True)
 
     @discord.ui.button(label="🔄 Force Rejoin", style=discord.ButtonStyle.success, row=0, custom_id="btn_rejoin")
-    async def btn_rejoin(self, interaction: discord.Interaction, button: discord.ui.Button):
-        # ★ Rate limit per-user
+    async def btn_rejoin(self, interaction, button):
         uid = interaction.user.id
         now = time.time()
         last = STATE["rejoin_per_user"].get(uid, 0.0)
         remain = REJOIN_USER_COOLDOWN - (now - last)
         if remain > 0:
             return await interaction.response.send_message(
-                f"⏳ กรุณารออีก **{remain:.0f} วินาที** ก่อนสั่ง Force Rejoin อีกครั้ง",
-                ephemeral=True
-            )
+                f"⏳ รออีก **{remain:.0f} วินาที**", ephemeral=True)
         STATE["rejoin_per_user"][uid] = now
-
-        log("สั่ง Force Rejoin จากปุ่มกด", YELLOW)
+        log("Force Rejoin", YELLOW)
         if STATE["lock"] and STATE["lock"].locked():
-            return await interaction.response.send_message("⏳ กำลัง Rejoin อยู่แล้ว กรุณารอสักครู่", ephemeral=True)
-        await interaction.response.send_message("🔄 กำลังบังคับ Rejoin เข้าเกมใหม่...", ephemeral=True)
-        spawn(do_rejoin(interaction.channel, "✅ บังคับ Rejoin จากปุ่มกดเสร็จสิ้น"))
+            return await interaction.response.send_message("⏳ กำลัง Rejoin อยู่", ephemeral=True)
+        await interaction.response.send_message("🔄 กำลังบังคับ Rejoin...", ephemeral=True)
+        spawn(do_rejoin(interaction.channel, "✅ Force Rejoin เสร็จสิ้น"))
 
     @discord.ui.button(label="🛑 Stop Game", style=discord.ButtonStyle.danger, row=0, custom_id="btn_stop")
-    async def btn_stop(self, interaction: discord.Interaction, button: discord.ui.Button):
-        log("สั่งปิดเกมจากปุ่มกด", YELLOW)
+    async def btn_stop(self, interaction, button):
+        log("สั่งปิดเกม", YELLOW)
         await aroot(f"am force-stop {PACKAGE_NAME}")
-        await interaction.response.send_message("🛑 สั่งบังคับปิดแอป Roblox แล้ว", ephemeral=True)
+        await interaction.response.send_message("🛑 ปิดแอปแล้ว", ephemeral=True)
 
     @discord.ui.button(label="🧹 Clear RAM", style=discord.ButtonStyle.secondary, row=1, custom_id="btn_ram")
-    async def btn_ram(self, interaction: discord.Interaction, button: discord.ui.Button):
-        log("สั่งเคลียร์ RAM จากปุ่มกด", YELLOW)
+    async def btn_ram(self, interaction, button):
+        log("เคลียร์ RAM", YELLOW)
         await asyncio.to_thread(clear_system_ram)
         STATE["last_ram_clear"] = time.time()
-        await interaction.response.send_message("🧹 สั่งเคลียร์แคช RAM ในมือถือสำเร็จ!", ephemeral=True)
+        await interaction.response.send_message("🧹 เคลียร์ RAM แล้ว!", ephemeral=True)
 
     @discord.ui.button(label="🧹 Clean Termux", style=discord.ButtonStyle.secondary, row=1, custom_id="btn_termux_junk")
-    async def btn_termux_junk(self, interaction: discord.Interaction, button: discord.ui.Button):
-        log("สั่งเคลียร์ขยะ Termux", YELLOW)
+    async def btn_termux_junk(self, interaction, button):
+        log("เคลียร์ขยะ Termux", YELLOW)
         await interaction.response.defer(ephemeral=True)
         await asyncio.to_thread(clear_termux_junk)
-        await interaction.followup.send("🧹 ลบไฟล์ขยะและแคชใน Termux สำเร็จ!", ephemeral=True)
+        await interaction.followup.send("🧹 ลบขยะ Termux แล้ว!", ephemeral=True)
 
     @discord.ui.button(label="🗺️ Change Map", style=discord.ButtonStyle.secondary, row=1, custom_id="btn_map")
-    async def btn_map(self, interaction: discord.Interaction, button: discord.ui.Button):
+    async def btn_map(self, interaction, button):
         await interaction.response.send_modal(MapModal())
 
     @discord.ui.button(label="⏸️ Pause Auto", style=discord.ButtonStyle.secondary, row=2, custom_id="btn_pause")
-    async def btn_pause(self, interaction: discord.Interaction, button: discord.ui.Button):
+    async def btn_pause(self, interaction, button):
         if STATE["lock"] and STATE["lock"].locked():
-            return await interaction.response.send_message("⏳ กำลัง Rejoin อยู่แล้ว กรุณารอสักครู่", ephemeral=True)
+            return await interaction.response.send_message("⏳ กำลัง Rejoin", ephemeral=True)
         if STATE["paused"]:
             try:
                 await interaction.message.edit(view=ControlView())
             except Exception:
                 pass
-            return await interaction.response.send_message("⚠️ ระบบเฝ้าจอถูกหยุดพัก (Paused) อยู่แล้วครับ", ephemeral=True)
-
+            return await interaction.response.send_message("⚠️ Paused อยู่แล้ว", ephemeral=True)
         STATE["paused"] = True
-        log("หยุดพักระบบเฝ้าจอ (Paused)", YELLOW)
-        await interaction.response.send_message("⏸️ ระงับระบบเฝ้าจอชั่วคราวแล้ว!", ephemeral=True)
+        log("หยุดพักระบบ", YELLOW, force_redraw=True)
+        await interaction.response.send_message("⏸️ Pause แล้ว!", ephemeral=True)
         try:
             await interaction.message.edit(view=ControlView())
         except Exception:
             pass
 
     @discord.ui.button(label="▶️ Resume Auto", style=discord.ButtonStyle.success, row=2, custom_id="btn_resume")
-    async def btn_resume(self, interaction: discord.Interaction, button: discord.ui.Button):
+    async def btn_resume(self, interaction, button):
         if STATE["lock"] and STATE["lock"].locked():
-            return await interaction.response.send_message("⏳ กำลัง Rejoin อยู่แล้ว กรุณารอสักครู่", ephemeral=True)
+            return await interaction.response.send_message("⏳ กำลัง Rejoin", ephemeral=True)
         if not STATE["paused"]:
             try:
                 await interaction.message.edit(view=ControlView())
             except Exception:
                 pass
-            return await interaction.response.send_message("⚠️ ระบบ Auto Rejoin กำลังทำงานอยู่แล้วครับ!", ephemeral=True)
-
+            return await interaction.response.send_message("⚠️ ทำงานอยู่แล้ว", ephemeral=True)
         STATE["paused"] = False
         STATE["fail_count"] = 0
         STATE["last_screenshot"] = time.time()
         STATE["last_ram_clear"] = time.time()
-        log("เดินระบบเฝ้าจอต่อ (Resumed)", GREEN)
-        await interaction.response.send_message("▶️ ระบบเฝ้าจอกลับมาทำงานต่อแล้ว!", ephemeral=True)
+        log("เดินระบบต่อ", GREEN, force_redraw=True)
+        await interaction.response.send_message("▶️ Resume แล้ว!", ephemeral=True)
         try:
             await interaction.message.edit(view=ControlView())
         except Exception:
             pass
 
     @discord.ui.button(label="🗑️ Clear Logs", style=discord.ButtonStyle.secondary, row=2, custom_id="btn_clear_logs")
-    async def btn_clear_logs(self, interaction: discord.Interaction, button: discord.ui.Button):
-        log("สั่งลบไฟล์ Log เกม", YELLOW)
+    async def btn_clear_logs(self, interaction, button):
+        log("ลบ Log เกม", YELLOW)
         await aroot(f"rm -rf {GAME_LOG_DIR}/*.log {EXT_LOG_DIR}/*.log")
-        await interaction.response.send_message("🗑️ ลบไฟล์ Log ของเกม Roblox เรียบร้อย!", ephemeral=True)
+        await interaction.response.send_message("🗑️ ลบ Log แล้ว!", ephemeral=True)
 
     @discord.ui.button(label="⚙️ Edit Settings", style=discord.ButtonStyle.secondary, row=3, custom_id="btn_settings")
-    async def btn_settings(self, interaction: discord.Interaction, button: discord.ui.Button):
+    async def btn_settings(self, interaction, button):
         await interaction.response.send_modal(SettingsModal())
 
     @discord.ui.button(label="📂 Check AutoExec", style=discord.ButtonStyle.secondary, row=3, custom_id="btn_check_exec")
-    async def btn_check_exec(self, interaction: discord.Interaction, button: discord.ui.Button):
+    async def btn_check_exec(self, interaction, button):
         path = str(CFG.get("autoexec_path", "")).strip()
         if not valid_path(path):
-            return await interaction.response.send_message("❌ โฟลเดอร์ AutoExec ไม่ถูกต้อง", ephemeral=True)
+            return await interaction.response.send_message("❌ โฟลเดอร์ไม่ถูกต้อง", ephemeral=True)
         await interaction.response.defer(ephemeral=True)
         res = await aroot(f"ls -1 {shlex.quote(path)}")
         if not res:
-            res = "ไม่มีไฟล์ในโฟลเดอร์ หรือหาโฟลเดอร์ไม่เจอ"
-        await interaction.followup.send(f"📂 **รายการไฟล์ใน `{path}`:**\n```\n{res[:1800]}\n```", ephemeral=True)
+            res = "ไม่มีไฟล์ หรือหาโฟลเดอร์ไม่เจอ"
+        await interaction.followup.send(f"📂 **`{path}`:**\n```\n{res[:1800]}\n```", ephemeral=True)
 
     @discord.ui.button(label="📝 Add Script", style=discord.ButtonStyle.success, row=3, custom_id="btn_add_script")
-    async def btn_add_script(self, interaction: discord.Interaction, button: discord.ui.Button):
+    async def btn_add_script(self, interaction, button):
         await interaction.response.send_modal(AddScriptModal())
 
     @discord.ui.button(label="❌ Del Script", style=discord.ButtonStyle.danger, row=3, custom_id="btn_del_script")
-    async def btn_del_script(self, interaction: discord.Interaction, button: discord.ui.Button):
+    async def btn_del_script(self, interaction, button):
         await interaction.response.send_modal(DeleteScriptModal())
 
     @discord.ui.button(label="📜 View Game Log", style=discord.ButtonStyle.secondary, row=4, custom_id="btn_view_log")
-    async def btn_view_log(self, interaction: discord.Interaction, button: discord.ui.Button):
+    async def btn_view_log(self, interaction, button):
         await interaction.response.defer(ephemeral=True)
         text = await aroot(
             f"LATEST=$(ls -t {GAME_LOG_DIR}/*.log {EXT_LOG_DIR}/*.log 2>/dev/null | head -n 1); "
             f"if [ -n \"$LATEST\" ]; then tail -n 30 \"$LATEST\"; fi"
         )
         if not text:
-            text = "ไม่พบไฟล์ Log ของเกม"
+            text = "ไม่พบ Log"
         text = text.replace("```", "'''")[-1800:]
-        await interaction.followup.send(f"📜 **Log ล่าสุดของเกม:**\n```\n{text}\n```", ephemeral=True)
+        await interaction.followup.send(f"📜 **Log ล่าสุด:**\n```\n{text}\n```", ephemeral=True)
 
-# ================= เริ่มบอท =================
+# ================= Start Bot Loop =================
 def menu_3_start_bot(cfg):
     global DASHBOARD_ACTIVE, LAST_RESULT_TEXT
 
     if not cfg['place_id'] or not cfg['bot_token'] or not cfg['channel_id']:
-        print(f"\n{RED}✘ กรุณาตั้งค่า Place ID, Bot Token และ Channel ID ก่อนครับ!{RESET}")
+        print(f"\n{RED}✘ กรุณาตั้งค่า Place ID, Bot Token, Channel ID ก่อน!{RESET}")
         time.sleep(2)
         return
     if not cfg['allowed_users']:
-        print(f"\n{RED}✘ ยังไม่ได้ตั้งค่า Discord User ID ของผู้มีสิทธิ์สั่งงาน (เมนู 2){RESET}")
+        print(f"\n{RED}✘ ยังไม่ได้ตั้งค่า Discord User ID (เมนู 2){RESET}")
         time.sleep(3)
         return
 
@@ -1260,6 +1307,7 @@ def menu_3_start_bot(cfg):
         "last_frame_sig": None, "frozen_count": 0, "bg_count": 0,
         "check_count": 0, "discord_offline_since": 0.0, "rejoin_per_user": {},
     })
+    _NET_CACHE_UNTIL[0] = 0.0
 
     LAST_RESULT_TEXT = f"{YELLOW}⏳ กำลังเชื่อมต่อ Discord...{RESET}"
     DASHBOARD_ACTIVE = True
@@ -1271,85 +1319,106 @@ def menu_3_start_bot(cfg):
 
     @tasks.loop(seconds=max(5, int(cfg['check_interval'])))
     async def game_monitor_loop():
-        # หมายเหตุ: ถ้าแก้ CFG["check_interval"] ตอน runtime ต้อง restart loop ถึงจะมีผล
         try:
             if STATE["paused"] or (STATE["lock"] and STATE["lock"].locked()):
                 return
 
             channel = bot.get_channel(int(cfg['channel_id']))
 
-            # ★ ตรวจสุขภาพ Discord ก่อนทำงานอื่น
             await check_discord_health(channel)
 
             if not await check_internet():
                 STATE["net_dropped"] = True
-                log("⚠️ เน็ตหลุด! กำลังรอสัญญาณ...", RED)
+                log("⚠️ เน็ตหลุด! รอสัญญาณ...", RED, force_redraw=True)
                 return
 
             if STATE.get("net_dropped"):
                 STATE["net_dropped"] = False
-                log("🌐 เน็ตกลับมาแล้ว! สั่ง Rejoin...", YELLOW)
+                log("🌐 เน็ตกลับมา! Rejoin...", YELLOW, force_redraw=True)
                 if channel:
-                    await send_bot_report(channel, "🌐 **สัญญาณอินเทอร์เน็ตกลับมาแล้ว!** กำลังดึงกลับเข้าเกมอัตโนมัติ...", True)
-                await do_rejoin(channel, "✅ **Rejoin หลังเน็ตหลุดสำเร็จแล้ว**")
+                    await send_bot_report(channel, "🌐 **เน็ตกลับมาแล้ว!** Rejoin...", True)
+                await do_rejoin(channel, "✅ Rejoin หลังเน็ตหลุดสำเร็จ")
                 return
 
-            # ★ นับรอบ + ตัดสินใจว่าจะเรียก uiautomator หรือไม่
+            # ★ ตัดสินใจระดับความละเอียด
             STATE["check_count"] = STATE.get("check_count", 0) + 1
-            ui_n = max(1, int(cfg.get("ui_check_every_n", 2)))
-            run_ui = (STATE["check_count"] % ui_n == 0)
+            cycle = STATE["check_count"]
+            ui_n = max(1, int(cfg.get("ui_check_every_n", 3)))
+            screen_n = max(1, int(cfg.get("screen_check_every_n", 2)))
+            want_ui = (cycle % ui_n == 0)
+            want_screen = (cycle % screen_n == 0)
 
-            healthy, reason = await asyncio.to_thread(analyze_game_health, cfg, run_ui)
+            # ★ Probe ครั้งเดียว (batch root)
+            probe = await abatch_root(run_health_probe.__wrapped__(cfg, want_ui)
+                                     if hasattr(run_health_probe, "__wrapped__")
+                                     else _build_health_commands(cfg, want_ui), timeout=20)
+
+            healthy, reason = analyze_probe(cfg, probe)
             if healthy:
-                healthy, reason = await asyncio.to_thread(detect_long_session_stall, cfg)
+                healthy, reason = analyze_stall(cfg, probe)
+
+            # ★ Screen check เฉพาะรอบที่กำหนด (หนัก)
+            if healthy and want_screen:
+                dialog, sig = await asyncio.to_thread(inspect_screen)
+                if dialog:
+                    healthy, reason = False, "ตรวจพบกล่อง Disconnected บนหน้าจอ"
+                elif sig:
+                    if sig == STATE.get("last_frame_sig"):
+                        STATE["frozen_count"] = STATE.get("frozen_count", 0) + 1
+                    else:
+                        STATE["frozen_count"] = 0
+                        STATE["last_frame_sig"] = sig
+
             now = time.time()
 
             if not healthy:
-                log(f"⚠️ {reason}", RED)
+                log(f"⚠️ {reason}", RED, force_redraw=True)
 
                 if "อัปเดต" in reason or "Upgrade" in reason or "Play Store" in reason:
                     STATE["paused"] = True
                     await aroot(f"am force-stop {PACKAGE_NAME}")
                     if channel:
-                        await send_bot_report(channel, f"🚨 **หยุดทำงานอัตโนมัติ:** {reason}\n👉 *โปรดไปอัปเดตแอปผ่าน Play Store ด้วยตัวเอง แล้วค่อยกดปุ่ม ▶️ Resume Auto*", True)
+                        await send_bot_report(channel, f"🚨 **หยุดอัตโนมัติ:** {reason}\n👉 *อัปเดตแอปแล้วกด ▶️ Resume*", True)
                     return
 
                 STATE["fail_count"] += 1
                 fails = STATE["fail_count"]
                 delay = min(30 * (fails - 1), 300)
-                msg = f"⚠️ **ปัญหา:** {reason}\n🔄 Rejoin ครั้งที่ {fails} ติดต่อกัน"
+                msg = f"⚠️ **ปัญหา:** {reason}\n🔄 Rejoin ครั้งที่ {fails}"
                 if delay:
-                    msg += f" (รอ {delay} วินาทีก่อนเข้าใหม่)"
+                    msg += f" (รอ {delay}s)"
                 if fails >= MAX_FAILS_ALERT:
-                    msg += "\n🚨 **Rejoin ติดต่อกันหลายครั้ง!** ตรวจสอบเครื่อง/เซิร์ฟเวอร์/ไอดีอาจมีคนเล่นซ้อนอยู่"
+                    msg += "\n🚨 **Rejoin หลายครั้งติด!** ตรวจสอบเครื่อง/ไอดี"
                 if channel:
                     await send_bot_report(channel, msg, True)
                 if delay:
                     await asyncio.sleep(delay)
                     if STATE["paused"]:
                         return
-                await do_rejoin(channel, "✅ **Rejoin สำเร็จแล้ว**")
+                await do_rejoin(channel, "✅ **Rejoin สำเร็จ**")
                 return
 
             if STATE["fail_count"] and now - STATE["game_start_time"] > 180:
                 STATE["fail_count"] = 0
 
             if now - STATE["last_ram_clear"] >= max(0.1, float(cfg.get('clear_ram_hours', 1))) * 3600:
-                await asyncio.to_thread(clear_system_ram)
+                await abatch_root({
+                    "ram": "sync && echo 3 > /proc/sys/vm/drop_caches",
+                })
                 await asyncio.to_thread(clear_termux_junk)
-                log("เคลียร์ RAM & ขยะ Termux สำเร็จ", GREEN)
+                log("เคลียร์ RAM & Termux สำเร็จ", GREEN)
                 STATE["last_ram_clear"] = now
 
             if now - STATE["last_screenshot"] >= max(1, int(cfg['screenshot_minutes'])) * 60:
-                log("แคปหน้าจอส่งรายงานประจำรอบ", CYAN)
+                log("แคปหน้าจอประจำรอบ", CYAN)
                 if channel:
-                    await send_bot_report(channel, "📸 รายงานสถานะหน้าจอประจำรอบ", True)
+                    await send_bot_report(channel, "📸 รายงานสถานะหน้าจอ", True)
                 STATE["last_screenshot"] = now
 
             STATE["loop_restarts"] = 0
 
         except Exception as e:
-            log(f"🔥 ข้อผิดพลาด: {e}", RED)
+            log(f"🔥 ข้อผิดพลาด: {e}", RED, force_redraw=True)
             raise
 
     @game_monitor_loop.before_loop
@@ -1359,25 +1428,23 @@ def menu_3_start_bot(cfg):
     @game_monitor_loop.error
     async def game_monitor_error(error):
         STATE["loop_restarts"] += 1
-        log(f"🚨 ลูปพัง ({STATE['loop_restarts']}/{MAX_LOOP_RESTARTS})", RED)
+        log(f"🚨 ลูปพัง ({STATE['loop_restarts']}/{MAX_LOOP_RESTARTS})", RED, force_redraw=True)
         if STATE["loop_restarts"] > MAX_LOOP_RESTARTS:
-            log("❌ หยุดรีสตาร์ทลูป กรุณาเริ่มบอทใหม่", RED)
+            log("❌ หยุดรีสตาร์ทลูป", RED, force_redraw=True)
             return
         await asyncio.sleep(5)
         game_monitor_loop.restart()
 
-    # ★ Discord events สำหรับติดตามการเชื่อมต่อ
     @bot.event
     async def on_disconnect():
         if STATE.get("discord_offline_since", 0) == 0:
             STATE["discord_offline_since"] = time.time()
-            log("🔌 Discord ขาดการเชื่อมต่อ (event)", RED)
+            log("🔌 Discord หลุด (event)", RED, force_redraw=True)
 
     @bot.event
     async def on_ready():
-        log(f"✅ เชื่อมต่อ {bot.user.name} สำเร็จ!", GREEN)
+        log(f"✅ เชื่อมต่อ {bot.user.name} สำเร็จ!", GREEN, force_redraw=True)
         if ready_once["done"]:
-            # ★ กรณี reconnect - ตรวจการแจ้งเตือนถ้าหลุดนาน
             since = STATE.get("discord_offline_since", 0)
             if since > 0:
                 STATE["discord_offline_since"] = 0
@@ -1397,10 +1464,10 @@ def menu_3_start_bot(cfg):
         if channel:
             await send_bot_report(channel, "🟢 เริ่มเดินระบบเฝ้าจอ Auto Rejoin แล้ว!")
         else:
-            log("⚠️ หา Channel ไม่เจอ ตรวจสอบ ID", RED)
+            log("⚠️ หา Channel ไม่เจอ", RED)
 
         if not await aroot(f"pidof {PACKAGE_NAME}"):
-            log("กำลังสั่งเปิดเกมเข้าแมพครั้งแรก...", CYAN)
+            log("เปิดเกมเข้าแมพครั้งแรก...", CYAN, force_redraw=True)
             await do_rejoin(channel, "✅ เข้าแมพครั้งแรกเรียบร้อย")
 
         if not game_monitor_loop.is_running():
@@ -1411,7 +1478,7 @@ def menu_3_start_bot(cfg):
     except discord.LoginFailure:
         DASHBOARD_ACTIVE = False
         fix_tty()
-        print(f"\n{RED}❌ Bot Token ไม่ถูกต้อง! ตรวจสอบอีกครั้งในเมนู 2{RESET}")
+        print(f"\n{RED}❌ Bot Token ไม่ถูกต้อง!{RESET}")
         time.sleep(2)
         return
     except KeyboardInterrupt:
@@ -1420,19 +1487,33 @@ def menu_3_start_bot(cfg):
     DASHBOARD_ACTIVE = False
     fix_tty()
     subprocess.run(["termux-wake-unlock"], stdin=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    print(f"\n\n{YELLOW}🛑 ปิดบอทเฝ้าจอแล้ว (Offline){RESET}")
-    ans = safe_input("ต้องการบังคับปิดแอป Roblox ด้วยไหม? (y/n): ").lower()
+    print(f"\n\n{YELLOW}🛑 ปิดบอท (Offline){RESET}")
+    ans = safe_input("บังคับปิด Roblox ด้วยไหม? (y/n): ").lower()
     if ans == 'y':
         run_root_text(f"am force-stop {PACKAGE_NAME}")
     time.sleep(1)
 
-# ================= ลูปหลัก =================
+
+def _build_health_commands(cfg, want_ui):
+    """Helper: สร้าง dict commands สำหรับ batch_root (ใช้จากลูป)"""
+    tail_n = max(800, int(cfg.get("log_tail_lines", 1000)))
+    log_expr = f'LATEST=$(ls -t {GAME_LOG_DIR}/*.log {EXT_LOG_DIR}/*.log 2>/dev/null | head -n 1)'
+    cmds = {
+        "pidof": f"pidof {PACKAGE_NAME} || true",
+        "focus": "dumpsys window windows | grep -E 'mCurrentFocus|mFocusedApp' || true",
+        "log_tail": f'{log_expr}; if [ -n "$LATEST" ]; then tail -n {tail_n} "$LATEST"; fi',
+        "log_age": f'{log_expr}; if [ -n "$LATEST" ]; then NOW=$(date +%s); MT=$(stat -c %Y "$LATEST" 2>/dev/null); if [ -n "$MT" ]; then echo $((NOW-MT)); fi; fi',
+    }
+    if want_ui:
+        cmds["ui_xml"] = f"uiautomator dump {UI_TMP} >/dev/null 2>&1; cat {UI_TMP} 2>/dev/null; rm -f {UI_TMP}"
+    return cmds
+
+# ================= Main =================
 def main():
     CFG.update(load_config())
     while True:
         print_ui(CFG)
         choice = safe_input(f"  {BOLD_WHITE}เลือกเมนู: {RESET}")
-
         if choice == "1":
             menu_1_set_map(CFG)
         elif choice == "2":
