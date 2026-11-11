@@ -13,7 +13,6 @@ import glob
 import logging
 import hashlib
 import math
-import urllib.request  # ★ นำกลับมาใช้สำหรับ Heartbeat
 from logging.handlers import RotatingFileHandler
 from datetime import datetime
 
@@ -59,9 +58,6 @@ ROOT_TIMEOUT_DEFAULT = 15
 WATCHDOG_INTERVAL = 30
 WATCHDOG_TIMEOUT = 60
 
-# --- ★ BOOT & HEARTBEAT ---
-BOOT_ALERT_THRESHOLD = 300  # ถ้า uptime เครื่อง < 5 นาที = เพิ่งบูต
-
 DEFAULT_CONFIG = {
     "place_id": "",
     "vip_link_code": "",
@@ -80,7 +76,6 @@ DEFAULT_CONFIG = {
     "frozen_screen_checks": 6,
     "ui_check_every_n": 3,
     "screen_check_every_n": 2,
-    "heartbeat_url": "",  # ★ เพิ่มช่องสำหรับ External Watchdog
 }
 
 CFG = {}
@@ -105,7 +100,6 @@ STATE = {
     "rejoin_per_user": {},
     "last_heartbeat": 0.0,
     "bot_unresponsive": False,
-    "boot_alerted": False,  # ★ กันแจ้งเตือนบูตซ้ำ
 }
 BG_TASKS = set()
 
@@ -116,9 +110,9 @@ THAI_COMBINING = set("\u0e31\u0e34\u0e35\u0e36\u0e37\u0e38\u0e39\u0e3a\u0e47\u0e
 # ================= ตัวตรวจสอบข้อมูล =================
 RE_PLACE = re.compile(r"\d{1,20}")
 RE_VIP = re.compile(r"[A-Za-z0-9_\-]{1,100}")
-RE_FILE = re.compile(r"[\w\-. ]{1,60}\.lua")
+# ★ อัปเดต Regex ให้รองรับหลายนามสกุล
+RE_FILE = re.compile(r"[\w\-. ]{1,60}\.(?:lua|txt|json|cfg|ini)", re.IGNORECASE)
 RE_PATH = re.compile(r"/(sdcard|storage|data/local/tmp)(/[\w\-. ]+)*")
-RE_URL = re.compile(r"^https?://[^\s]+$")  # ★ ตรวจสอบ URL
 
 def valid_place_id(v):
     return bool(RE_PLACE.fullmatch(str(v).strip()))
@@ -132,9 +126,12 @@ def valid_path(v):
     return bool(RE_PATH.fullmatch(v)) and ".." not in v
 
 def clean_filename(name):
+    # ★ อัปเดตให้รองรับหลายนามสกุล
     name = os.path.basename(str(name).strip())
-    if not name.lower().endswith(".lua"):
-        name += ".lua"
+    if not name:
+        return None
+    if not re.search(r"\.(lua|txt|json|cfg|ini)$", name, re.IGNORECASE):
+        name += ".lua"  # ถ้าไม่ใส่นามสกุลมา ให้เติม .lua เป็นค่าเริ่มต้น
     if name.startswith(".") or not RE_FILE.fullmatch(name):
         return None
     return name
@@ -492,7 +489,7 @@ def inspect_screen():
         logger.warning(f"inspect_screen ผิดพลาด: {e}")
         return False, None
 
-# ================= Internet + Discord + Heartbeat =================
+# ================= Internet + Discord =================
 _NET_CACHE_UNTIL = [0.0]
 
 async def check_internet():
@@ -518,50 +515,6 @@ async def check_internet():
     if ok:
         _NET_CACHE_UNTIL[0] = time.time() + NET_CACHE_SECONDS
     return ok
-
-async def send_heartbeat():
-    """★ ส่งสัญญาณ Heartbeat ไปยัง External Watchdog (เช่น healthchecks.io)"""
-    url = str(CFG.get("heartbeat_url", "")).strip()
-    if not url or not RE_URL.fullmatch(url):
-        return  # ไม่ได้ตั้งค่า หรือ URL ผิดรูปแบบ ให้ข้าม
-    try:
-        await asyncio.to_thread(urllib.request.urlopen, url, None, 5)
-    except Exception:
-        pass  # ถ้าส่งไม่ได้ (เน็ตหลุด) ปล่อยผ่าน ไม่ต้องแจ้ง error
-
-def get_device_uptime_sec():
-    """★ อ่าน uptime ของ Android (วินาที) จาก /proc/uptime"""
-    try:
-        with open("/proc/uptime", "r") as f:
-            return float(f.readline().split()[0])
-    except Exception:
-        return -1.0
-
-async def check_boot_alert(channel):
-    """★ แจ้งเตือนถ้าเครื่องเพิ่งบูตใหม่ (uptime < 5 นาที)"""
-    if STATE.get("boot_alerted", False):
-        return
-        
-    up = get_device_uptime_sec()
-    if up < 0:
-        return
-    
-    if up < BOOT_ALERT_THRESHOLD:
-        STATE["boot_alerted"] = True
-        uptime_min = int(up / 60)
-        uptime_sec = int(up % 60)
-        mentions = " ".join(f"<@{uid}>" for uid in CFG.get("allowed_users", []))
-        try:
-            await channel.send(
-                f"🔔 **ตรวจพบว่าเครื่องเพิ่งเปิดใหม่ (Reboot)!**\n"
-                f"⏱️ อัปไทม์เครื่อง: **{uptime_min} นาที {uptime_sec} วินาที**\n"
-                f"🔄 ระบบกำลังเข้าสู่โหมด Auto Rejoin อัตโนมัติ...\n"
-                f"{mentions}",
-                allowed_mentions=discord.AllowedMentions(users=True)
-            )
-            log(f"🔔 แจ้งเตือนเครื่องเพิ่งบูต (uptime {uptime_min}m)", YELLOW, force_redraw=True)
-        except Exception as e:
-            log(f"ส่งแจ้งเตือนบูตไม่สำเร็จ: {e}", RED)
 
 async def check_discord_health(channel):
     is_offline = False
@@ -1108,8 +1061,8 @@ class MapModal(discord.ui.Modal, title='ตั้งค่าเปลี่ย�
         spawn(do_rejoin(interaction.channel, f"✅ เปลี่ยนเป็นแมพ `{pid}` เสร็จสิ้น"))
 
 class AddScriptModal(discord.ui.Modal, title='📝 เพิ่มสคริปต์ฟาร์ม'):
-    filename_input = discord.ui.TextInput(label='ชื่อไฟล์ (.lua)', placeholder='farm.lua', required=True, max_length=60)
-    script_input = discord.ui.TextInput(label='โค้ดสคริปต์', style=discord.TextStyle.paragraph, placeholder='loadstring(...)', required=True, max_length=4000)
+    filename_input = discord.ui.TextInput(label='ชื่อไฟล์ (.lua, .txt, .json)', placeholder='เช่น farm.lua หรือ config.txt', required=True, max_length=60)
+    script_input = discord.ui.TextInput(label='โค้ดสคริปต์ / เนื้อหาไฟล์', style=discord.TextStyle.paragraph, placeholder='loadstring(...) หรือข้อความ', required=True, max_length=4000)
 
     async def on_submit(self, interaction: discord.Interaction):
         if not is_authorized(interaction.user.id):
@@ -1117,7 +1070,7 @@ class AddScriptModal(discord.ui.Modal, title='📝 เพิ่มสคริ�
         path = str(CFG.get("autoexec_path", "")).strip()
         filename = clean_filename(self.filename_input.value)
         if not filename:
-            return await interaction.response.send_message("❌ ชื่อไฟล์ไม่ถูกต้อง", ephemeral=True)
+            return await interaction.response.send_message("❌ ชื่อไฟล์ไม่ถูกต้อง (รองรับ .lua, .txt, .json, .cfg, .ini)", ephemeral=True)
         if not valid_path(path):
             return await interaction.response.send_message("❌ โฟลเดอร์ไม่ถูกต้อง", ephemeral=True)
         audit(interaction, f"add_script file={filename}")
@@ -1129,7 +1082,7 @@ class AddScriptModal(discord.ui.Modal, title='📝 เพิ่มสคริ�
         log(f"เพิ่มสคริปต์: {filename}", GREEN)
 
 class DeleteScriptModal(discord.ui.Modal, title='🗑️ ลบสคริปต์ฟาร์ม'):
-    filename_input = discord.ui.TextInput(label='ชื่อไฟล์ (รวม .lua)', placeholder='farm.lua', required=True, max_length=60)
+    filename_input = discord.ui.TextInput(label='ชื่อไฟล์ (รวมนามสกุล)', placeholder='เช่น farm.lua หรือ config.txt', required=True, max_length=60)
 
     async def on_submit(self, interaction: discord.Interaction):
         if not is_authorized(interaction.user.id):
@@ -1148,26 +1101,34 @@ class DeleteScriptModal(discord.ui.Modal, title='🗑️ ลบสคริป�
         else:
             await interaction.response.send_message(f"❌ ไม่พบ `{filename}`", ephemeral=True)
 
-class SettingsModal(discord.ui.Modal, title='⚙️ แก้ไขการตั้งค่า'):
+class SettingsModal(discord.ui.Modal, title='⚙️ แก้ไขการตั้งค่า (Settings)'):
     def __init__(self):
         super().__init__()
         self.inp_pid = discord.ui.TextInput(label='Place ID', default=str(CFG.get('place_id', '')), required=True)
+        self.inp_vip = discord.ui.TextInput(label='VIP Link Code (เว้นว่างได้)', default=str(CFG.get('vip_link_code', '')), required=False)
         self.inp_sm = discord.ui.TextInput(label='รอบแคปหน้าจอ (นาที)', default=str(CFG.get('screenshot_minutes', 10)), required=True)
         self.inp_rh = discord.ui.TextInput(label='รอบ Clear RAM (ชั่วโมง)', default=str(CFG.get('clear_ram_hours', 1.0)), required=True)
         self.inp_exec = discord.ui.TextInput(label='โฟลเดอร์ AutoExec', default=str(CFG.get('autoexec_path', '/sdcard/Delta/autoexec')), required=True)
-        self.inp_hb = discord.ui.TextInput(label='Heartbeat URL (ปล่อยว่างได้)', default=str(CFG.get('heartbeat_url', '')), required=False, placeholder='https://hc-ping.com/...')
-        for item in (self.inp_pid, self.inp_sm, self.inp_rh, self.inp_exec, self.inp_hb):
+        for item in (self.inp_pid, self.inp_vip, self.inp_sm, self.inp_rh, self.inp_exec):
             self.add_item(item)
 
     async def on_submit(self, interaction: discord.Interaction):
         if not is_authorized(interaction.user.id):
             return await interaction.response.send_message("⛔ ไม่มีสิทธิ์", ephemeral=True)
         errors, updates = [], {}
+        
         pid = self.inp_pid.value.strip()
         if valid_place_id(pid):
             updates["place_id"] = pid
         else:
             errors.append("Place ID ต้องเป็นตัวเลข")
+
+        vip = self.inp_vip.value.strip()
+        if valid_vip(vip):
+            updates["vip_link_code"] = vip
+        else:
+            errors.append("VIP Code ไม่ถูกต้อง")
+
         try:
             sm = int(self.inp_sm.value)
             if sm < 1:
@@ -1175,6 +1136,7 @@ class SettingsModal(discord.ui.Modal, title='⚙️ แก้ไขการต�
             updates["screenshot_minutes"] = sm
         except ValueError:
             errors.append("รอบแคป ≥ 1")
+            
         try:
             rh = float(self.inp_rh.value)
             if rh < 0.1:
@@ -1182,17 +1144,12 @@ class SettingsModal(discord.ui.Modal, title='⚙️ แก้ไขการต�
             updates["clear_ram_hours"] = rh
         except ValueError:
             errors.append("Clear RAM ≥ 0.1")
+            
         exec_path = self.inp_exec.value.strip()
         if valid_path(exec_path):
             updates["autoexec_path"] = exec_path
         else:
             errors.append("โฟลเดอร์ไม่ถูกต้อง")
-            
-        hb_url = self.inp_hb.value.strip()
-        if hb_url == "" or RE_URL.fullmatch(hb_url):
-            updates["heartbeat_url"] = hb_url
-        else:
-            errors.append("Heartbeat URL ต้องเริ่มด้วย http:// หรือ https://")
 
         if errors:
             return await interaction.response.send_message("❌ " + ", ".join(errors), ephemeral=True)
@@ -1201,8 +1158,8 @@ class SettingsModal(discord.ui.Modal, title='⚙️ แก้ไขการต�
         CFG.update(updates)
         save_config(CFG)
         await interaction.response.send_message(
-            f"✅ อัปเดตการตั้งค่าเรียบร้อย\n📌 Place ID: `{CFG['place_id']}`\n📂 AutoExec: `{CFG['autoexec_path']}`", ephemeral=True)
-        log("อัปเดตการตั้งค่า", GREEN)
+            f"✅ **อัปเดตการตั้งค่าสำเร็จ**\n🎮 Place ID: `{CFG['place_id']}`\n🔑 VIP: `{CFG['vip_link_code'] or '-'}`\n📂 AutoExec: `{CFG['autoexec_path']}`", ephemeral=True)
+        log("อัปเดตการตั้งค่าผ่าน Discord", GREEN)
 
 # ================= Control Buttons =================
 class ControlView(discord.ui.View):
@@ -1326,10 +1283,13 @@ class ControlView(discord.ui.View):
         if not valid_path(path):
             return await interaction.response.send_message("❌ โฟลเดอร์ไม่ถูกต้อง", ephemeral=True)
         await interaction.response.defer(ephemeral=True)
-        res = await aroot(f"ls -1 {shlex.quote(path)}")
-        if not res:
-            res = "ไม่มีไฟล์ หรือหาโฟลเดอร์ไม่เจอ"
-        await interaction.followup.send(f"📂 **`{path}`:**\n```\n{res[:1800]}\n```", ephemeral=True)
+        
+        # ★ อัปเดตให้ตรวจสอบว่ามีโฟลเดอร์อยู่จริงไหม และดึงไฟล์ทั้งหมดออกมา
+        res = await aroot(f"if [ -d {shlex.quote(path)} ]; then ls -1 {shlex.quote(path)}; else echo 'FOLDER_NOT_FOUND'; fi")
+        
+        if not res or res == 'FOLDER_NOT_FOUND':
+            res = "ไม่พบโฟลเดอร์ หรือโฟลเดอร์ยังว่างอยู่"
+        await interaction.followup.send(f"📂 **รายการไฟล์ทั้งหมดใน `{path}`:**\n```\n{res[:1800]}\n```", ephemeral=True)
 
     @discord.ui.button(label="📝 Add Script", style=discord.ButtonStyle.success, row=3, custom_id="btn_add_script")
     async def btn_add_script(self, interaction, button):
@@ -1374,7 +1334,7 @@ def menu_3_start_bot(cfg):
         "last_frame_sig": None, "frozen_count": 0, "bg_count": 0,
         "check_count": 0, "discord_offline_since": 0.0, "rejoin_per_user": {},
         "last_heartbeat": now, "bot_unresponsive": False,
-        "last_successful_rejoin": 0.0, "boot_alerted": False,
+        "last_successful_rejoin": 0.0,
     })
     _NET_CACHE_UNTIL[0] = 0.0
 
@@ -1393,7 +1353,6 @@ def menu_3_start_bot(cfg):
             STATE["bot_unresponsive"] = False
 
             if STATE["paused"] or (STATE["lock"] and STATE["lock"].locked()):
-                await send_heartbeat()  # ★ ส่ง heartbeat แม้อยู่ในช่วง pause
                 return
 
             channel = bot.get_channel(int(cfg['channel_id']))
@@ -1484,7 +1443,6 @@ def menu_3_start_bot(cfg):
                 STATE["last_screenshot"] = now
 
             STATE["loop_restarts"] = 0
-            await send_heartbeat() # ★ ส่ง Heartbeat ไป External Watchdog
 
         except Exception as e:
             log(f"🔥 ข้อผิดพลาด: {e}", RED, force_redraw=True)
@@ -1548,8 +1506,6 @@ def menu_3_start_bot(cfg):
 
         channel = bot.get_channel(int(cfg['channel_id']))
         if channel:
-            # ★ เรียกตรวจสอบว่าเครื่องเพิ่งบูตหรือไม่ ก่อนส่งข้อความปกติ
-            await check_boot_alert(channel)
             await send_bot_report(channel, "🟢 เริ่มเดินระบบเฝ้าจอ Auto Rejoin แล้ว!")
         else:
             log("⚠️ หา Channel ไม่เจอ", RED)
