@@ -13,6 +13,7 @@ import glob
 import logging
 import hashlib
 import math
+import urllib.request  # ★ นำกลับมาใช้สำหรับ Heartbeat
 from logging.handlers import RotatingFileHandler
 from datetime import datetime
 
@@ -52,9 +53,14 @@ DISCORD_OFFLINE_THRESHOLD = 60
 REJOIN_USER_COOLDOWN = 30
 
 # --- PERFORMANCE TUNABLES ---
-NET_CACHE_SECONDS = 30           # cache ผลเช็คเน็ต (วินาที)
-DASH_THROTTLE_SECONDS = 0.5      # throttle dashboard redraw
+NET_CACHE_SECONDS = 30
+DASH_THROTTLE_SECONDS = 0.5
 ROOT_TIMEOUT_DEFAULT = 15
+WATCHDOG_INTERVAL = 30
+WATCHDOG_TIMEOUT = 60
+
+# --- ★ BOOT & HEARTBEAT ---
+BOOT_ALERT_THRESHOLD = 300  # ถ้า uptime เครื่อง < 5 นาที = เพิ่งบูต
 
 DEFAULT_CONFIG = {
     "place_id": "",
@@ -72,8 +78,9 @@ DEFAULT_CONFIG = {
     "log_stale_seconds": 180,
     "rejoin_cooldown_seconds": 45,
     "frozen_screen_checks": 6,
-    "ui_check_every_n": 3,       # uiautomator ทุก N รอบ (เพิ่มจาก 2 → 3 = เบาลง)
-    "screen_check_every_n": 2,   # screencap ทุก N รอบ
+    "ui_check_every_n": 3,
+    "screen_check_every_n": 2,
+    "heartbeat_url": "",  # ★ เพิ่มช่องสำหรับ External Watchdog
 }
 
 CFG = {}
@@ -82,6 +89,7 @@ STATE = {
     "last_screenshot": 0.0,
     "last_ram_clear": 0.0,
     "game_start_time": 0.0,
+    "last_successful_rejoin": 0.0,
     "fail_count": 0,
     "rejoin_total": 0,
     "loop_restarts": 0,
@@ -95,6 +103,9 @@ STATE = {
     "check_count": 0,
     "discord_offline_since": 0.0,
     "rejoin_per_user": {},
+    "last_heartbeat": 0.0,
+    "bot_unresponsive": False,
+    "boot_alerted": False,  # ★ กันแจ้งเตือนบูตซ้ำ
 }
 BG_TASKS = set()
 
@@ -107,6 +118,7 @@ RE_PLACE = re.compile(r"\d{1,20}")
 RE_VIP = re.compile(r"[A-Za-z0-9_\-]{1,100}")
 RE_FILE = re.compile(r"[\w\-. ]{1,60}\.lua")
 RE_PATH = re.compile(r"/(sdcard|storage|data/local/tmp)(/[\w\-. ]+)*")
+RE_URL = re.compile(r"^https?://[^\s]+$")  # ★ ตรวจสอบ URL
 
 def valid_place_id(v):
     return bool(RE_PLACE.fullmatch(str(v).strip()))
@@ -156,7 +168,7 @@ def trim_visible(text, max_vis=26):
         out.append(ch)
     return "".join(out)
 
-# ================= Logging + Throttled Dashboard =================
+# ================= Logging =================
 logger = logging.getLogger("rbbot")
 logger.setLevel(logging.INFO)
 try:
@@ -200,7 +212,6 @@ def print_bot_dashboard():
     sys.stdout.flush()
 
 def log(msg, color=CYAN, force_redraw=False):
-    """เขียน log + redraw dashboard แบบ throttle (ไม่เกิน 2Hz) ยกเว้น force_redraw"""
     global LAST_RESULT_TEXT
     now = datetime.now().strftime("%H:%M:%S")
     clean_msg = " ".join(str(msg).splitlines()).strip()
@@ -262,12 +273,8 @@ def save_config(cfg):
     except OSError:
         pass
 
-# ================= ★ Core Optimization: Batch Root Commands =================
+# ================= Core Root =================
 def batch_root(commands: dict, timeout=ROOT_TIMEOUT_DEFAULT) -> dict:
-    """
-    ★ รันหลาย shell command ใน `su` ครั้งเดียว
-    ลด overhead shell spawn จาก ~100ms × N → ~100ms × 1
-    """
     if not commands:
         return {}
     parts = []
@@ -306,7 +313,6 @@ def batch_root(commands: dict, timeout=ROOT_TIMEOUT_DEFAULT) -> dict:
 async def abatch_root(commands: dict, timeout=ROOT_TIMEOUT_DEFAULT) -> dict:
     return await asyncio.to_thread(batch_root, commands, timeout)
 
-# คง run_root_text ไว้ใช้กับคำสั่งเดี่ยว (เช่นตอน join)
 def run_root_text(cmd, timeout=ROOT_TIMEOUT_DEFAULT):
     try:
         res = subprocess.run(
@@ -373,7 +379,7 @@ def capture_screenshot_bytes():
         pass
     return None
 
-# ================= ★ Screen Capture (Optimized) =================
+# ================= Screen Capture =================
 def grab_raw_frame():
     try:
         res = subprocess.run(
@@ -399,7 +405,6 @@ def grab_raw_frame():
         hdr = 12
     return buf, w, h, hdr
 
-# ★ Cache offsets ตามขนาดหน้าจอ ลดการคำนวณซ้ำทุกครั้ง
 _SIG_OFFSET_CACHE = {}
 
 def _get_sig_offsets(w, h, hdr):
@@ -417,7 +422,6 @@ def _get_sig_offsets(w, h, hdr):
     return offsets
 
 def frame_signature(frame):
-    """★ เร็วกว่าเดิม ~3-5 เท่า (ลด repeated concatenation)"""
     buf, w, h, hdr = frame
     offsets = _get_sig_offsets(w, h, hdr)
     n = len(offsets)
@@ -488,11 +492,10 @@ def inspect_screen():
         logger.warning(f"inspect_screen ผิดพลาด: {e}")
         return False, None
 
-# ================= ★ Internet Check (Parallel + Cache) =================
+# ================= Internet + Discord + Heartbeat =================
 _NET_CACHE_UNTIL = [0.0]
 
 async def check_internet():
-    """★ parallel + cache 30s → ส่วนใหญ่คืนทันที"""
     now = time.time()
     if now < _NET_CACHE_UNTIL[0]:
         return True
@@ -516,7 +519,50 @@ async def check_internet():
         _NET_CACHE_UNTIL[0] = time.time() + NET_CACHE_SECONDS
     return ok
 
-# ================= Discord Health =================
+async def send_heartbeat():
+    """★ ส่งสัญญาณ Heartbeat ไปยัง External Watchdog (เช่น healthchecks.io)"""
+    url = str(CFG.get("heartbeat_url", "")).strip()
+    if not url or not RE_URL.fullmatch(url):
+        return  # ไม่ได้ตั้งค่า หรือ URL ผิดรูปแบบ ให้ข้าม
+    try:
+        await asyncio.to_thread(urllib.request.urlopen, url, None, 5)
+    except Exception:
+        pass  # ถ้าส่งไม่ได้ (เน็ตหลุด) ปล่อยผ่าน ไม่ต้องแจ้ง error
+
+def get_device_uptime_sec():
+    """★ อ่าน uptime ของ Android (วินาที) จาก /proc/uptime"""
+    try:
+        with open("/proc/uptime", "r") as f:
+            return float(f.readline().split()[0])
+    except Exception:
+        return -1.0
+
+async def check_boot_alert(channel):
+    """★ แจ้งเตือนถ้าเครื่องเพิ่งบูตใหม่ (uptime < 5 นาที)"""
+    if STATE.get("boot_alerted", False):
+        return
+        
+    up = get_device_uptime_sec()
+    if up < 0:
+        return
+    
+    if up < BOOT_ALERT_THRESHOLD:
+        STATE["boot_alerted"] = True
+        uptime_min = int(up / 60)
+        uptime_sec = int(up % 60)
+        mentions = " ".join(f"<@{uid}>" for uid in CFG.get("allowed_users", []))
+        try:
+            await channel.send(
+                f"🔔 **ตรวจพบว่าเครื่องเพิ่งเปิดใหม่ (Reboot)!**\n"
+                f"⏱️ อัปไทม์เครื่อง: **{uptime_min} นาที {uptime_sec} วินาที**\n"
+                f"🔄 ระบบกำลังเข้าสู่โหมด Auto Rejoin อัตโนมัติ...\n"
+                f"{mentions}",
+                allowed_mentions=discord.AllowedMentions(users=True)
+            )
+            log(f"🔔 แจ้งเตือนเครื่องเพิ่งบูต (uptime {uptime_min}m)", YELLOW, force_redraw=True)
+        except Exception as e:
+            log(f"ส่งแจ้งเตือนบูตไม่สำเร็จ: {e}", RED)
+
 async def check_discord_health(channel):
     is_offline = False
     try:
@@ -562,12 +608,26 @@ async def send_reconnect_alert(channel, duration_sec):
     except Exception as e:
         log(f"ส่งแจ้งเตือน reconnect ไม่สำเร็จ: {e}", RED)
 
+# ================= Status Logic =================
+def get_status_text():
+    if STATE.get("bot_unresponsive", False):
+        return "⚠️ สถานะบอทไม่ตอบสนอง (ระบบค้าง)"
+    if STATE.get("paused", False):
+        return "⏸️ ตอนนี้อยู่ในเกมส์ (ปิดการรีจอย)"
+    if STATE.get("net_dropped", False):
+        return "🌐 เน็ตหลุด (กำลังรอสัญญาณ...)"
+    if STATE.get("loop_restarts", 0) > 0:
+        return f"⚠️ ลูปมีปัญหา (รีสตาร์ท {STATE['loop_restarts']} ครั้ง)"
+    if STATE.get("fail_count", 0) > 0:
+        return f"🔄 กำลังพยายาม Rejoin (ล้มเหลว {STATE['fail_count']} ครั้ง)"
+    return "🟢 บอททำงานปกติ (กำลังเฝ้าดูในเกม)"
+
 # ================= System Stats =================
 def get_discord_embed(dev_name, is_paused):
     try:
         with open("/proc/stat", "r") as f:
             s1 = [int(i) for i in f.readline().split()[1:8]]
-        time.sleep(0.15)  # ★ ลดจาก 0.2 → 0.15
+        time.sleep(0.15)
         with open("/proc/stat", "r") as f:
             s2 = [int(i) for i in f.readline().split()[1:8]]
         t1, t2 = sum(s1), sum(s2)
@@ -618,7 +678,6 @@ async def join_roblox_async(cfg):
         return False
 
     log("กำลังปิดเกมและเคลียร์ Log...", YELLOW)
-    # ★ รวม am force-stop + rm + drop_caches ใน batch เดียว
     await abatch_root({
         "stop": f"am force-stop {PACKAGE_NAME}",
         "rmlog": f"rm -rf {GAME_LOG_DIR}/*.log {EXT_LOG_DIR}/*.log 2>/dev/null",
@@ -646,7 +705,6 @@ async def join_roblox_async(cfg):
 def _rx(pattern, text):
     return re.search(pattern, text, re.IGNORECASE) is not None
 
-# ★ Pre-compile regex สำหรับ log patterns (ลดการ compile ซ้ำทุกรอบ)
 _LOG_RX_273 = re.compile(r"\b(?:error\s*code\s*[:=]\s*(?:273|264)|disconnect[^\n]*\breason\s*[:=]\s*(?:273|264))\b", re.I)
 _LOG_RX_PSS4 = re.compile(r"\berror\s*code\s*[:=]?\s*pss4\b", re.I)
 _LOG_RX_267 = re.compile(r"\b(?:error\s*code\s*[:=]\s*267|disconnect[^\n]*\breason\s*[:=]\s*267)\b", re.I)
@@ -667,15 +725,9 @@ def extract_active_session_logs(raw_log_text):
             last_join_idx = idx
     return "\n".join(lines[last_join_idx:]).lower()
 
-# ★ Health Probe แบบ batch (คำสั่งเดียว)
-def run_health_probe(cfg, want_ui=False):
-    """
-    ★ เก็บข้อมูลทั้งหมดใน su ครั้งเดียว: pidof, focus, log tail, log age, (optional) ui xml
-    แทนที่จะเรียก 4-5 ครั้งแบบเดิม
-    """
+def _build_health_commands(cfg, want_ui):
     tail_n = max(800, int(cfg.get("log_tail_lines", 1000)))
     log_expr = f'LATEST=$(ls -t {GAME_LOG_DIR}/*.log {EXT_LOG_DIR}/*.log 2>/dev/null | head -n 1)'
-
     cmds = {
         "pidof": f"pidof {PACKAGE_NAME} || true",
         "focus": "dumpsys window windows | grep -E 'mCurrentFocus|mFocusedApp' || true",
@@ -684,12 +736,9 @@ def run_health_probe(cfg, want_ui=False):
     }
     if want_ui:
         cmds["ui_xml"] = f"uiautomator dump {UI_TMP} >/dev/null 2>&1; cat {UI_TMP} 2>/dev/null; rm -f {UI_TMP}"
-
-    return batch_root(cmds, timeout=20)
+    return cmds
 
 def analyze_probe(cfg, probe):
-    """★ วิเคราะห์ผลจาก probe (ไม่เรียก root เพิ่ม)"""
-    # Layer 1
     if not probe.get("pidof", "").strip():
         return False, "แอป Roblox ปิดตัวลง (App Crashed)"
 
@@ -699,7 +748,6 @@ def analyze_probe(cfg, probe):
     if "Application Not Responding" in focus:
         return False, "ตัวเกมค้างไม่ตอบสนอง (System ANR)"
 
-    # Layer 2: log
     active = extract_active_session_logs(probe.get("log_tail", ""))
     if active:
         if _LOG_RX_273.search(active) or "same account launched" in active \
@@ -724,7 +772,6 @@ def analyze_probe(cfg, probe):
         if _LOG_RX_GEN.search(active) or "disconnection notification" in active:
             return False, "ถูกตัดการเชื่อมต่อจากเซิร์ฟเวอร์ (Disconnect)"
 
-    # Layer 3: UI (optional)
     ui = probe.get("ui_xml", "")
     if ui:
         ul = ui.lower()
@@ -746,7 +793,6 @@ def analyze_probe(cfg, probe):
     return True, "ปกติ"
 
 def analyze_stall(cfg, probe):
-    """★ Watchdog ใช้ probe data (ไม่เรียกซ้ำ)"""
     if not probe.get("pidof", "").strip():
         return False, "แอป Roblox ปิดตัวลง (Watchdog)"
 
@@ -787,7 +833,6 @@ def analyze_stall(cfg, probe):
 
     return True, "ปกติ"
 
-# เก็บ analyze_game_health แบบเดิมไว้ใช้ใน do_rejoin (ตรวจละเอียด 1 ครั้งหลังเข้าเกม)
 def analyze_game_health(cfg):
     probe = run_health_probe(cfg, want_ui=True)
     healthy, reason = analyze_probe(cfg, probe)
@@ -796,7 +841,6 @@ def analyze_game_health(cfg):
     healthy, reason = analyze_stall(cfg, probe)
     if not healthy:
         return False, reason
-    # screen check
     dialog, sig = inspect_screen()
     if dialog:
         return False, "ตรวจพบกล่องแจ้งเตือน Disconnected บนหน้าจอเกม"
@@ -807,6 +851,9 @@ def analyze_game_health(cfg):
             STATE["frozen_count"] = 0
             STATE["last_frame_sig"] = sig
     return True, "ปกติ"
+
+def run_health_probe(cfg, want_ui=False):
+    return batch_root(_build_health_commands(cfg, want_ui), timeout=20)
 
 # ================= UI เมนู =================
 def print_ui(cfg):
@@ -937,13 +984,26 @@ async def _get_dash_msg(channel):
             pass
     return None
 
-async def send_bot_report(channel, message, include_screenshot=False, force_new=False):
+async def send_bot_report(channel, message="", include_screenshot=False, force_new=False):
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     pause_tag = " ⏸️ `[PAUSED]`" if STATE["paused"] else ""
-    content = (f"🤖 **[ORIGINAL REPORT]**{pause_tag} (`{now_str}`)\n"
-               f"📌 **สถานะ:** {message}\n"
-               f"🎮 **Place ID:** `{CFG['place_id']}`\n"
-               f"🔁 **Rejoin รวม:** {STATE['rejoin_total']} ครั้ง")
+    
+    status_text = get_status_text()
+    
+    last_rejoin_str = "ยังไม่เคย Rejoin"
+    if STATE.get("last_successful_rejoin", 0.0) > 0:
+        last_rejoin_str = datetime.fromtimestamp(STATE["last_successful_rejoin"]).strftime("%Y-%m-%d %H:%M:%S")
+
+    content = f"🤖 **[ORIGINAL REPORT]**{pause_tag} (`{now_str}`)\n"
+    content += f"📌 **สถานะ:** {status_text}\n"
+    
+    if message:
+        content += f"📝 **รายละเอียด:** {message}\n"
+        
+    content += (f"🎮 **Place ID:** `{CFG['place_id']}`\n"
+                f"🔁 **Rejoin รวม:** {STATE['rejoin_total']} ครั้ง\n"
+                f"⏱️ **Rejoin ล่าสุด:** `{last_rejoin_str}`")
+                
     try:
         embed = await asyncio.to_thread(get_discord_embed, STATE["dev_name"], STATE["paused"])
         view = ControlView()
@@ -1008,6 +1068,7 @@ async def do_rejoin(channel, done_message):
             STATE["game_start_time"] = now
             STATE["last_ram_clear"] = now
             STATE["last_screenshot"] = now
+            STATE["last_successful_rejoin"] = now
             STATE["rejoin_total"] += 1
             STATE["frozen_count"] = 0
             STATE["last_frame_sig"] = None
@@ -1094,7 +1155,8 @@ class SettingsModal(discord.ui.Modal, title='⚙️ แก้ไขการต�
         self.inp_sm = discord.ui.TextInput(label='รอบแคปหน้าจอ (นาที)', default=str(CFG.get('screenshot_minutes', 10)), required=True)
         self.inp_rh = discord.ui.TextInput(label='รอบ Clear RAM (ชั่วโมง)', default=str(CFG.get('clear_ram_hours', 1.0)), required=True)
         self.inp_exec = discord.ui.TextInput(label='โฟลเดอร์ AutoExec', default=str(CFG.get('autoexec_path', '/sdcard/Delta/autoexec')), required=True)
-        for item in (self.inp_pid, self.inp_sm, self.inp_rh, self.inp_exec):
+        self.inp_hb = discord.ui.TextInput(label='Heartbeat URL (ปล่อยว่างได้)', default=str(CFG.get('heartbeat_url', '')), required=False, placeholder='https://hc-ping.com/...')
+        for item in (self.inp_pid, self.inp_sm, self.inp_rh, self.inp_exec, self.inp_hb):
             self.add_item(item)
 
     async def on_submit(self, interaction: discord.Interaction):
@@ -1125,6 +1187,12 @@ class SettingsModal(discord.ui.Modal, title='⚙️ แก้ไขการต�
             updates["autoexec_path"] = exec_path
         else:
             errors.append("โฟลเดอร์ไม่ถูกต้อง")
+            
+        hb_url = self.inp_hb.value.strip()
+        if hb_url == "" or RE_URL.fullmatch(hb_url):
+            updates["heartbeat_url"] = hb_url
+        else:
+            errors.append("Heartbeat URL ต้องเริ่มด้วย http:// หรือ https://")
 
         if errors:
             return await interaction.response.send_message("❌ " + ", ".join(errors), ephemeral=True)
@@ -1133,7 +1201,7 @@ class SettingsModal(discord.ui.Modal, title='⚙️ แก้ไขการต�
         CFG.update(updates)
         save_config(CFG)
         await interaction.response.send_message(
-            f"✅ Place ID: `{CFG['place_id']}`\n📂 `{CFG['autoexec_path']}`", ephemeral=True)
+            f"✅ อัปเดตการตั้งค่าเรียบร้อย\n📌 Place ID: `{CFG['place_id']}`\n📂 AutoExec: `{CFG['autoexec_path']}`", ephemeral=True)
         log("อัปเดตการตั้งค่า", GREEN)
 
 # ================= Control Buttons =================
@@ -1161,8 +1229,7 @@ class ControlView(discord.ui.View):
     async def btn_stats(self, interaction, button):
         log("เช็คสถานะจากปุ่ม", YELLOW)
         await interaction.response.defer()
-        text = "📊 (Paused)" if STATE["paused"] else "📊 สถานะปัจจุบัน"
-        await send_bot_report(interaction.channel, text, True)
+        await send_bot_report(interaction.channel, "ตรวจสอบสถานะจากปุ่มกด", True)
 
     @discord.ui.button(label="🔄 Force Rejoin", style=discord.ButtonStyle.success, row=0, custom_id="btn_rejoin")
     async def btn_rejoin(self, interaction, button):
@@ -1306,6 +1373,8 @@ def menu_3_start_bot(cfg):
         "net_dropped": False, "last_rejoin_attempt": 0.0, "lock": None,
         "last_frame_sig": None, "frozen_count": 0, "bg_count": 0,
         "check_count": 0, "discord_offline_since": 0.0, "rejoin_per_user": {},
+        "last_heartbeat": now, "bot_unresponsive": False,
+        "last_successful_rejoin": 0.0, "boot_alerted": False,
     })
     _NET_CACHE_UNTIL[0] = 0.0
 
@@ -1320,7 +1389,11 @@ def menu_3_start_bot(cfg):
     @tasks.loop(seconds=max(5, int(cfg['check_interval'])))
     async def game_monitor_loop():
         try:
+            STATE["last_heartbeat"] = time.time()
+            STATE["bot_unresponsive"] = False
+
             if STATE["paused"] or (STATE["lock"] and STATE["lock"].locked()):
+                await send_heartbeat()  # ★ ส่ง heartbeat แม้อยู่ในช่วง pause
                 return
 
             channel = bot.get_channel(int(cfg['channel_id']))
@@ -1340,7 +1413,6 @@ def menu_3_start_bot(cfg):
                 await do_rejoin(channel, "✅ Rejoin หลังเน็ตหลุดสำเร็จ")
                 return
 
-            # ★ ตัดสินใจระดับความละเอียด
             STATE["check_count"] = STATE.get("check_count", 0) + 1
             cycle = STATE["check_count"]
             ui_n = max(1, int(cfg.get("ui_check_every_n", 3)))
@@ -1348,16 +1420,12 @@ def menu_3_start_bot(cfg):
             want_ui = (cycle % ui_n == 0)
             want_screen = (cycle % screen_n == 0)
 
-            # ★ Probe ครั้งเดียว (batch root)
-            probe = await abatch_root(run_health_probe.__wrapped__(cfg, want_ui)
-                                     if hasattr(run_health_probe, "__wrapped__")
-                                     else _build_health_commands(cfg, want_ui), timeout=20)
+            probe = await abatch_root(_build_health_commands(cfg, want_ui), timeout=20)
 
             healthy, reason = analyze_probe(cfg, probe)
             if healthy:
                 healthy, reason = analyze_stall(cfg, probe)
 
-            # ★ Screen check เฉพาะรอบที่กำหนด (หนัก)
             if healthy and want_screen:
                 dialog, sig = await asyncio.to_thread(inspect_screen)
                 if dialog:
@@ -1412,17 +1480,35 @@ def menu_3_start_bot(cfg):
             if now - STATE["last_screenshot"] >= max(1, int(cfg['screenshot_minutes'])) * 60:
                 log("แคปหน้าจอประจำรอบ", CYAN)
                 if channel:
-                    await send_bot_report(channel, "📸 รายงานสถานะหน้าจอ", True)
+                    await send_bot_report(channel, "รายงานสถานะหน้าจอประจำรอบ", True)
                 STATE["last_screenshot"] = now
 
             STATE["loop_restarts"] = 0
+            await send_heartbeat() # ★ ส่ง Heartbeat ไป External Watchdog
 
         except Exception as e:
             log(f"🔥 ข้อผิดพลาด: {e}", RED, force_redraw=True)
             raise
 
+    @tasks.loop(seconds=WATCHDOG_INTERVAL)
+    async def bot_watchdog():
+        if STATE.get("paused") or STATE.get("last_heartbeat", 0) == 0:
+            return
+        elapsed = time.time() - STATE["last_heartbeat"]
+        limit = max(WATCHDOG_TIMEOUT, int(cfg['check_interval']) * 4)
+        if elapsed > limit and not STATE.get("bot_unresponsive"):
+            STATE["bot_unresponsive"] = True
+            log(f"🚨 บอทไม่ตอบสนองมานาน {int(elapsed)} วินาที!", RED, force_redraw=True)
+            channel = bot.get_channel(int(cfg['channel_id']))
+            if channel:
+                await send_bot_report(channel, f"🚨 **บอทไม่ตอบสนอง** (ลูปค้างนาน {int(elapsed)} วินาที)", force_new=True)
+
     @game_monitor_loop.before_loop
     async def before_game_monitor():
+        await bot.wait_until_ready()
+
+    @bot_watchdog.before_loop
+    async def before_watchdog():
         await bot.wait_until_ready()
 
     @game_monitor_loop.error
@@ -1462,6 +1548,8 @@ def menu_3_start_bot(cfg):
 
         channel = bot.get_channel(int(cfg['channel_id']))
         if channel:
+            # ★ เรียกตรวจสอบว่าเครื่องเพิ่งบูตหรือไม่ ก่อนส่งข้อความปกติ
+            await check_boot_alert(channel)
             await send_bot_report(channel, "🟢 เริ่มเดินระบบเฝ้าจอ Auto Rejoin แล้ว!")
         else:
             log("⚠️ หา Channel ไม่เจอ", RED)
@@ -1472,6 +1560,8 @@ def menu_3_start_bot(cfg):
 
         if not game_monitor_loop.is_running():
             game_monitor_loop.start()
+        if not bot_watchdog.is_running():
+            bot_watchdog.start()
 
     try:
         bot.run(cfg['bot_token'], log_handler=None)
@@ -1492,21 +1582,6 @@ def menu_3_start_bot(cfg):
     if ans == 'y':
         run_root_text(f"am force-stop {PACKAGE_NAME}")
     time.sleep(1)
-
-
-def _build_health_commands(cfg, want_ui):
-    """Helper: สร้าง dict commands สำหรับ batch_root (ใช้จากลูป)"""
-    tail_n = max(800, int(cfg.get("log_tail_lines", 1000)))
-    log_expr = f'LATEST=$(ls -t {GAME_LOG_DIR}/*.log {EXT_LOG_DIR}/*.log 2>/dev/null | head -n 1)'
-    cmds = {
-        "pidof": f"pidof {PACKAGE_NAME} || true",
-        "focus": "dumpsys window windows | grep -E 'mCurrentFocus|mFocusedApp' || true",
-        "log_tail": f'{log_expr}; if [ -n "$LATEST" ]; then tail -n {tail_n} "$LATEST"; fi',
-        "log_age": f'{log_expr}; if [ -n "$LATEST" ]; then NOW=$(date +%s); MT=$(stat -c %Y "$LATEST" 2>/dev/null); if [ -n "$MT" ]; then echo $((NOW-MT)); fi; fi',
-    }
-    if want_ui:
-        cmds["ui_xml"] = f"uiautomator dump {UI_TMP} >/dev/null 2>&1; cat {UI_TMP} 2>/dev/null; rm -f {UI_TMP}"
-    return cmds
 
 # ================= Main =================
 def main():
