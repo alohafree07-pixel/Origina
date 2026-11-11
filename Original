@@ -40,7 +40,7 @@ RESET = "\033[0m"
 
 CONFIG_FILE = "original_config.json"
 LOG_FILE = "original_bot.log"
-HISTORY_FILE = "rejoin_history.json" # ★ ไฟล์บันทึกประวัติ
+HISTORY_FILE = "rejoin_history.json"
 PACKAGE_NAME = "com.roblox.client"
 GAME_LOG_DIR = f"/data/data/{PACKAGE_NAME}/files/appData/logs"
 EXT_LOG_DIR = f"/sdcard/Android/data/{PACKAGE_NAME}/files/appData/logs"
@@ -51,7 +51,7 @@ MAX_FAILS_ALERT = 5
 MAX_LOOP_RESTARTS = 5
 DISCORD_OFFLINE_THRESHOLD = 60
 REJOIN_USER_COOLDOWN = 30
-MAX_HISTORY_RECORDS = 50 # ★ เก็บประวัติสูงสุด 50 รายการ
+MAX_HISTORY_RECORDS = 50
 
 # --- PERFORMANCE TUNABLES ---
 NET_CACHE_SECONDS = 30
@@ -106,7 +106,7 @@ STATE = {
     "bot_unresponsive": False,
 }
 BG_TASKS = set()
-REJOIN_HISTORY = [] # ★ เก็บประวัติในหน่วยความจำ
+REJOIN_HISTORY = []
 
 DASHBOARD_ACTIVE = False
 LAST_RESULT_TEXT = f"{YELLOW}🛡️ รอรับคำสั่ง...{RESET}"
@@ -167,7 +167,6 @@ def add_history(action, reason=""):
         "action": action,
         "reason": reason
     })
-    # ตัดให้เหลือแค่ MAX_HISTORY_RECORDS
     if len(REJOIN_HISTORY) > MAX_HISTORY_RECORDS:
         REJOIN_HISTORY.pop(0)
     save_history()
@@ -980,6 +979,26 @@ async def send_bot_report(channel, message="", include_screenshot=False, force_n
     if STATE.get("last_successful_rejoin", 0.0) > 0:
         last_rejoin_str = datetime.fromtimestamp(STATE["last_successful_rejoin"]).strftime("%Y-%m-%d %H:%M:%S")
 
+    # ★ คำนวณเวลานับถอยหลัง Auto Rejoin
+    auto_rejoin_hrs = float(CFG.get('auto_rejoin_hours', 0.0))
+    if auto_rejoin_hrs > 0:
+        target_time = STATE.get("last_auto_rejoin", 0) + (auto_rejoin_hrs * 3600)
+        remain_sec = target_time - time.time()
+        if remain_sec > 0:
+            hours = int(remain_sec // 3600)
+            mins = int((remain_sec % 3600) // 60)
+            secs = int(remain_sec % 60)
+            if hours > 0:
+                auto_rejoin_text = f"อีก {hours} ชม. {mins} นาที"
+            elif mins > 0:
+                auto_rejoin_text = f"อีก {mins} นาที {secs} วินาที"
+            else:
+                auto_rejoin_text = f"อีก {secs} วินาที"
+        else:
+            auto_rejoin_text = "กำลังจะเริ่ม..."
+    else:
+        auto_rejoin_text = "ปิดใช้งาน"
+
     content = f"🤖 **[ORIGINAL REPORT]**{pause_tag} (`{now_str}`)\n"
     content += f"📌 **สถานะ:** {status_text}\n"
     
@@ -988,7 +1007,8 @@ async def send_bot_report(channel, message="", include_screenshot=False, force_n
         
     content += (f"🎮 **Place ID:** `{CFG['place_id']}`\n"
                 f"🔁 **Rejoin รวม:** {STATE['rejoin_total']} ครั้ง\n"
-                f"⏱️ **Rejoin ล่าสุด:** `{last_rejoin_str}`")
+                f"⏱️ **Rejoin ล่าสุด:** `{last_rejoin_str}`\n"
+                f"⏳ **บังคับรีจอยอัตโนมัติ:** `{auto_rejoin_text}`") # ★ เพิ่มบรรทัดนับถอยหลัง
                 
     try:
         embed = await asyncio.to_thread(get_discord_embed, STATE["dev_name"], STATE["paused"])
@@ -1049,7 +1069,6 @@ async def do_rejoin(channel, done_message, reason="ไม่ระบุสา�
             return False
         STATE["last_rejoin_attempt"] = time.time()
         
-        # ★ บันทึกประวัติก่อนเริ่ม Rejoin
         add_history("Rejoin", reason)
         
         ok = await join_roblox_async(CFG)
@@ -1195,6 +1214,13 @@ class SettingsModal(discord.ui.Modal, title='⚙️ แก้ไขการต�
             return await interaction.response.send_message("❌ " + ", ".join(errors), ephemeral=True)
 
         audit(interaction, "edit_settings")
+        
+        # ★ ตรวจสอบว่ามีการแก้ไขเวลาบังคับรีจอยหรือไม่ ถ้าแก้ ให้เริ่มนับ 1 ใหม่
+        old_arh = float(CFG.get('auto_rejoin_hours', 0.0))
+        new_arh = updates.get("auto_rejoin_hours", old_arh)
+        if old_arh != new_arh:
+            STATE["last_auto_rejoin"] = time.time()
+            
         CFG.update(updates)
         save_config(CFG)
         await interaction.response.send_message(
@@ -1299,7 +1325,7 @@ class ControlView(discord.ui.View):
         STATE["fail_count"] = 0
         STATE["last_screenshot"] = time.time()
         STATE["last_ram_clear"] = time.time()
-        STATE["last_auto_rejoin"] = time.time()
+        STATE["last_auto_rejoin"] = time.time() # ★ รีเซ็ตเวลาบังคับรีจอย
         log("เดินระบบต่อ", GREEN, force_redraw=True)
         await interaction.response.send_message("▶️ Resume แล้ว!", delete_after=30)
         try:
@@ -1336,7 +1362,6 @@ class ControlView(discord.ui.View):
     async def btn_del_script(self, interaction, button):
         await interaction.response.send_modal(DeleteScriptModal())
 
-    # ★ เปลี่ยนปุ่ม View Game Log เป็น History
     @discord.ui.button(label="📜 ประวัติการทำงาน (History)", style=discord.ButtonStyle.secondary, row=4, custom_id="btn_history")
     async def btn_history(self, interaction, button):
         await interaction.response.defer()
@@ -1344,7 +1369,6 @@ class ControlView(discord.ui.View):
             msg = "ยังไม่มีประวัติการทำงาน"
         else:
             lines = ["**ประวัติการ Rejoin ล่าสุด (15 รายการ):**"]
-            # ดึง 15 รายการล่าสุดมาแสดง
             for h in reversed(REJOIN_HISTORY[-15:]):
                 time_str = h.get("time", "-")
                 action = h.get("action", "-")
@@ -1352,7 +1376,6 @@ class ControlView(discord.ui.View):
                 lines.append(f"⏱️ `{time_str}` | **{action}**\n└ สาเหตุ: {reason}")
             msg = "\n\n".join(lines)
         
-        # จำกัดข้อความไม่ให้เกิน 1900 ตัวอักษร
         if len(msg) > 1900:
             msg = msg[:1900] + "\n... (ตัดข้อความ)"
             
@@ -1373,7 +1396,7 @@ def menu_3_start_bot(cfg):
 
     subprocess.run(["termux-wake-lock"], stdin=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     STATE["dev_name"] = run_root_text("getprop ro.product.model") or "Android Device"
-    load_history() # ★ โหลดประวัติการทำงาน
+    load_history()
     
     now = time.time()
     STATE.update({
@@ -1474,7 +1497,6 @@ def menu_3_start_bot(cfg):
                 await do_rejoin(channel, "✅ **Rejoin สำเร็จ**", f"ตรวจพบปัญหา: {reason}")
                 return
 
-            # ★ ระบบบังคับรีจอยอัตโนมัติ
             auto_rejoin_hrs = float(cfg.get('auto_rejoin_hours', 0.0))
             if auto_rejoin_hrs > 0 and now - STATE.get("last_auto_rejoin", 0) >= auto_rejoin_hrs * 3600:
                 log(f"⏰ ถึงเวลาบังคับรีจอยอัตโนมัติ (รอบละ {auto_rejoin_hrs} ชม.)", YELLOW, force_redraw=True)
