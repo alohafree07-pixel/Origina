@@ -116,7 +116,8 @@ THAI_COMBINING = set("\u0e31\u0e34\u0e35\u0e36\u0e37\u0e38\u0e39\u0e3a\u0e47\u0e
 RE_PLACE = re.compile(r"\d{1,20}")
 RE_VIP = re.compile(r"[A-Za-z0-9_\-]{1,100}")
 RE_FILE = re.compile(r"[\w\-. ]{1,60}\.(?:lua|txt|json|cfg|ini)", re.IGNORECASE)
-RE_PATH = re.compile(r"/(sdcard|storage|data/local/tmp)(/[\w\-. ]+)*")
+# รองรับ path หลากหลายขึ้น + ครอบคลุม /data/..., /mnt/..., /system/... ฯลฯ
+RE_PATH = re.compile(r"^/(sdcard|storage|mnt|data|system|root|vendor)(/|$)")
 
 def valid_place_id(v):
     return bool(RE_PLACE.fullmatch(str(v).strip()))
@@ -127,7 +128,14 @@ def valid_vip(v):
 
 def valid_path(v):
     v = str(v).strip()
-    return bool(RE_PATH.fullmatch(v)) and ".." not in v
+    if not v or ".." in v or "\x00" in v:
+        return False
+    if not RE_PATH.match(v):
+        return False
+    # กัน shell metacharacters ที่อันตราย (แม้จะ shlex.quote แล้ว)
+    if any(c in v for c in "\n\r\t;&|`$()<>\\"):
+        return False
+    return True
 
 def clean_filename(name):
     name = os.path.basename(str(name).strip())
@@ -145,13 +153,16 @@ def is_authorized(user_id):
 # ================= ฟังก์ชันจัดการประวัติ (History) =================
 def load_history():
     global REJOIN_HISTORY
-    if os.path.exists(HISTORY_FILE):
-        try:
+    try:
+        if os.path.exists(HISTORY_FILE):
             with open(HISTORY_FILE, "r", encoding="utf-8") as f:
-                REJOIN_HISTORY = json.load(f)
-        except Exception as e:
-            logger.warning(f"อ่านไฟล์ประวัติไม่ได้: {e}")
-            REJOIN_HISTORY = []
+                data = json.load(f)
+            if isinstance(data, list):
+                REJOIN_HISTORY.clear()
+                REJOIN_HISTORY.extend(data[-MAX_HISTORY_RECORDS:])
+    except Exception as e:
+        logger.warning(f"อ่านไฟล์ประวัติไม่ได้: {e}")
+        REJOIN_HISTORY.clear()
 
 def save_history():
     try:
@@ -160,13 +171,12 @@ def save_history():
     except Exception as e:
         logger.warning(f"บันทึกไฟล์ประวัติไม่ได้: {e}")
 
-def add_history(action, reason=""):
+def add_history(action, reason="", extra=None):
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    REJOIN_HISTORY.append({
-        "time": now_str,
-        "action": action,
-        "reason": reason
-    })
+    entry = {"time": now_str, "action": action, "reason": reason}
+    if extra:
+        entry.update(extra)
+    REJOIN_HISTORY.append(entry)
     if len(REJOIN_HISTORY) > MAX_HISTORY_RECORDS:
         REJOIN_HISTORY.pop(0)
     save_history()
@@ -548,7 +558,8 @@ async def check_internet():
         _NET_CACHE_UNTIL[0] = time.time() + NET_CACHE_SECONDS
     return ok
 
-async def check_discord_health(channel):
+async def check_discord_health(bot, channel):
+    """✅ FIX: รับ bot เป็น parameter (เดิมอ้าง global bot ที่ไม่มี → NameError)"""
     is_offline = False
     try:
         if bot.is_closed() or not bot.is_ready():
@@ -972,14 +983,13 @@ async def _get_dash_msg(channel):
 async def send_bot_report(channel, message="", include_screenshot=False, force_new=False):
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     pause_tag = " ⏸️ `[PAUSED]`" if STATE["paused"] else ""
-    
+
     status_text = get_status_text()
-    
+
     last_rejoin_str = "ยังไม่เคย Rejoin"
     if STATE.get("last_successful_rejoin", 0.0) > 0:
         last_rejoin_str = datetime.fromtimestamp(STATE["last_successful_rejoin"]).strftime("%Y-%m-%d %H:%M:%S")
 
-    # ★ คำนวณเวลานับถอยหลัง Auto Rejoin
     auto_rejoin_hrs = float(CFG.get('auto_rejoin_hours', 0.0))
     if auto_rejoin_hrs > 0:
         target_time = STATE.get("last_auto_rejoin", 0) + (auto_rejoin_hrs * 3600)
@@ -1001,15 +1011,15 @@ async def send_bot_report(channel, message="", include_screenshot=False, force_n
 
     content = f"🤖 **[ORIGINAL REPORT]**{pause_tag} (`{now_str}`)\n"
     content += f"📌 **สถานะ:** {status_text}\n"
-    
+
     if message:
         content += f"📝 **รายละเอียด:** {message}\n"
-        
+
     content += (f"🎮 **Place ID:** `{CFG['place_id']}`\n"
                 f"🔁 **Rejoin รวม:** {STATE['rejoin_total']} ครั้ง\n"
                 f"⏱️ **Rejoin ล่าสุด:** `{last_rejoin_str}`\n"
-                f"⏳ **บังคับรีจอยอัตโนมัติ:** `{auto_rejoin_text}`") # ★ เพิ่มบรรทัดนับถอยหลัง
-                
+                f"⏳ **บังคับรีจอยอัตโนมัติ:** `{auto_rejoin_text}`")
+
     try:
         embed = await asyncio.to_thread(get_discord_embed, STATE["dev_name"], STATE["paused"])
         view = ControlView()
@@ -1068,9 +1078,9 @@ async def do_rejoin(channel, done_message, reason="ไม่ระบุสา�
             log(f"ข้าม Rejoin (cooldown {cooldown - since:.0f}s)", YELLOW)
             return False
         STATE["last_rejoin_attempt"] = time.time()
-        
+
         add_history("Rejoin", reason)
-        
+
         ok = await join_roblox_async(CFG)
         if ok:
             now = time.time()
@@ -1085,14 +1095,18 @@ async def do_rejoin(channel, done_message, reason="ไม่ระบุสา�
             STATE["bg_count"] = 0
 
     if ok:
-        healthy, reason = await asyncio.to_thread(analyze_game_health, CFG)
+        healthy, health_reason = await asyncio.to_thread(analyze_game_health, CFG)
         if not healthy:
-            log(f"พบปัญหาหลังเข้าเกม: {reason}", RED)
+            log(f"พบปัญหาหลังเข้าเกม: {health_reason}", RED)
+            add_history("Rejoin Failed", health_reason)
             if channel:
-                await send_bot_report(channel, f"⚠️ **เข้าเกมแล้วติดปัญหาทันที:** {reason}", True)
+                await send_bot_report(channel, f"⚠️ **เข้าเกมแล้วติดปัญหาทันที:** {health_reason}", True)
             return False
+        log("เข้าแมพสำเร็จ", GREEN, force_redraw=True)
+    else:
+        log("❌ Rejoin ล้มเหลว", RED, force_redraw=True)
+        add_history("Rejoin Failed", reason)
 
-    log("เข้าแมพสำเร็จ", GREEN, force_redraw=True)
     if channel:
         await send_bot_report(channel, done_message if ok else "❌ Rejoin ไม่สำเร็จ", True)
     return ok
@@ -1110,9 +1124,11 @@ class MapModal(discord.ui.Modal, title='ตั้งค่าเปลี่ย�
         if not valid_place_id(pid) or not valid_vip(vip):
             return await interaction.response.send_message("❌ ค่าไม่ถูกต้อง", ephemeral=True)
         audit(interaction, f"change_map pid={pid}")
+        old_pid = CFG.get('place_id', '-')
         CFG['place_id'] = pid
         CFG['vip_link_code'] = vip
         save_config(CFG)
+        add_history("Map Change", f"{old_pid} → {pid} โดย {interaction.user.name}")
         log(f"เปลี่ยนแมพเป็น {pid}", YELLOW)
         await interaction.response.send_message(f"✅ บันทึกแมพ `{pid}`! กำลังดึงเข้าเกม...", ephemeral=True)
         spawn(do_rejoin(interaction.channel, f"✅ เปลี่ยนเป็นแมพ `{pid}` เสร็จสิ้น", f"เปลี่ยนแมพโดย {interaction.user.name}"))
@@ -1135,6 +1151,7 @@ class AddScriptModal(discord.ui.Modal, title='📝 เพิ่มสคริ�
         encoded = base64.b64encode(self.script_input.value.encode('utf-8')).decode('ascii')
         cmd = f"mkdir -p {shlex.quote(path)} && echo {encoded} | base64 -d > {shlex.quote(file_path)}"
         await aroot(cmd)
+        add_history("Script Added", f"{filename} → {path}")
         await interaction.response.send_message(f"✅ สร้าง `{filename}` สำเร็จ!", ephemeral=True)
         log(f"เพิ่มสคริปต์: {filename}", GREEN)
 
@@ -1153,6 +1170,7 @@ class DeleteScriptModal(discord.ui.Modal, title='🗑️ ลบสคริป�
         q = shlex.quote(file_path)
         res = await aroot(f"if [ -f {q} ]; then rm -f {q}; echo OK; else echo FAIL; fi")
         if res == 'OK':
+            add_history("Script Deleted", f"{filename} → {path}")
             await interaction.response.send_message(f"🗑️ ลบ `{filename}` แล้ว!", ephemeral=True)
             log(f"ลบสคริปต์: {filename}", YELLOW)
         else:
@@ -1173,7 +1191,7 @@ class SettingsModal(discord.ui.Modal, title='⚙️ แก้ไขการต�
         if not is_authorized(interaction.user.id):
             return await interaction.response.send_message("⛔ ไม่มีสิทธิ์", ephemeral=True)
         errors, updates = [], {}
-        
+
         pid = self.inp_pid.value.strip()
         if valid_place_id(pid):
             updates["place_id"] = pid
@@ -1187,7 +1205,7 @@ class SettingsModal(discord.ui.Modal, title='⚙️ แก้ไขการต�
             updates["screenshot_minutes"] = sm
         except ValueError:
             errors.append("รอบแคป ≥ 1")
-            
+
         try:
             rh = float(self.inp_rh.value)
             if rh < 0.1:
@@ -1203,7 +1221,7 @@ class SettingsModal(discord.ui.Modal, title='⚙️ แก้ไขการต�
             updates["auto_rejoin_hours"] = arh
         except ValueError:
             errors.append("บังคับรีจอย ≥ 0")
-            
+
         exec_path = self.inp_exec.value.strip()
         if valid_path(exec_path):
             updates["autoexec_path"] = exec_path
@@ -1214,15 +1232,15 @@ class SettingsModal(discord.ui.Modal, title='⚙️ แก้ไขการต�
             return await interaction.response.send_message("❌ " + ", ".join(errors), ephemeral=True)
 
         audit(interaction, "edit_settings")
-        
-        # ★ ตรวจสอบว่ามีการแก้ไขเวลาบังคับรีจอยหรือไม่ ถ้าแก้ ให้เริ่มนับ 1 ใหม่
+
         old_arh = float(CFG.get('auto_rejoin_hours', 0.0))
         new_arh = updates.get("auto_rejoin_hours", old_arh)
         if old_arh != new_arh:
             STATE["last_auto_rejoin"] = time.time()
-            
+
         CFG.update(updates)
         save_config(CFG)
+        add_history("Settings", f"โดย {interaction.user.name}")
         await interaction.response.send_message(
             f"✅ **อัปเดตการตั้งค่าสำเร็จ**\n🎮 Place ID: `{CFG['place_id']}`\n⏰ บังคับรีจอย: `{CFG['auto_rejoin_hours']} ชม.`\n📂 AutoExec: `{CFG['autoexec_path']}`", ephemeral=True)
         log("อัปเดตการตั้งค่าผ่าน Discord", GREEN)
@@ -1273,6 +1291,7 @@ class ControlView(discord.ui.View):
     async def btn_stop(self, interaction, button):
         log("สั่งปิดเกม", YELLOW)
         await aroot(f"am force-stop {PACKAGE_NAME}")
+        add_history("Stop Game", f"โดย {interaction.user.name}")
         await interaction.response.send_message("🛑 ปิดแอปแล้ว", delete_after=30)
 
     @discord.ui.button(label="🧹 Clear RAM", style=discord.ButtonStyle.secondary, row=1, custom_id="btn_ram")
@@ -1280,6 +1299,7 @@ class ControlView(discord.ui.View):
         log("เคลียร์ RAM", YELLOW)
         await asyncio.to_thread(clear_system_ram)
         STATE["last_ram_clear"] = time.time()
+        add_history("Clear RAM", f"โดย {interaction.user.name}")
         await interaction.response.send_message("🧹 เคลียร์ RAM แล้ว!", delete_after=30)
 
     @discord.ui.button(label="🧹 Clean Termux", style=discord.ButtonStyle.secondary, row=1, custom_id="btn_termux_junk")
@@ -1287,6 +1307,7 @@ class ControlView(discord.ui.View):
         log("เคลียร์ขยะ Termux", YELLOW)
         await interaction.response.defer()
         await asyncio.to_thread(clear_termux_junk)
+        add_history("Clean Termux", f"โดย {interaction.user.name}")
         await interaction.followup.send("🧹 ลบขยะ Termux แล้ว!", delete_after=30)
 
     @discord.ui.button(label="🗺️ Change Map", style=discord.ButtonStyle.secondary, row=1, custom_id="btn_map")
@@ -1304,6 +1325,7 @@ class ControlView(discord.ui.View):
                 pass
             return await interaction.response.send_message("⚠️ Paused อยู่แล้ว", ephemeral=True)
         STATE["paused"] = True
+        add_history("Pause", f"โดย {interaction.user.name}")
         log("หยุดพักระบบ", YELLOW, force_redraw=True)
         await interaction.response.send_message("⏸️ Pause แล้ว!", delete_after=30)
         try:
@@ -1325,7 +1347,8 @@ class ControlView(discord.ui.View):
         STATE["fail_count"] = 0
         STATE["last_screenshot"] = time.time()
         STATE["last_ram_clear"] = time.time()
-        STATE["last_auto_rejoin"] = time.time() # ★ รีเซ็ตเวลาบังคับรีจอย
+        STATE["last_auto_rejoin"] = time.time()
+        add_history("Resume", f"โดย {interaction.user.name}")
         log("เดินระบบต่อ", GREEN, force_redraw=True)
         await interaction.response.send_message("▶️ Resume แล้ว!", delete_after=30)
         try:
@@ -1337,6 +1360,7 @@ class ControlView(discord.ui.View):
     async def btn_clear_logs(self, interaction, button):
         log("ลบ Log เกม", YELLOW)
         await aroot(f"rm -rf {GAME_LOG_DIR}/*.log {EXT_LOG_DIR}/*.log")
+        add_history("Clear Logs", f"โดย {interaction.user.name}")
         await interaction.response.send_message("🗑️ ลบ Log แล้ว!", delete_after=30)
 
     @discord.ui.button(label="⚙️ Edit Settings", style=discord.ButtonStyle.secondary, row=3, custom_id="btn_settings")
@@ -1345,14 +1369,70 @@ class ControlView(discord.ui.View):
 
     @discord.ui.button(label="📂 Check AutoExec", style=discord.ButtonStyle.secondary, row=3, custom_id="btn_check_exec")
     async def btn_check_exec(self, interaction, button):
+        """✅ FIX: แยก FOUND/NOT_DIR/NOT_FOUND + แสดง parent + รองรับโฟลเดอร์ว่าง"""
         path = str(CFG.get("autoexec_path", "")).strip()
-        if not valid_path(path):
-            return await interaction.response.send_message("❌ โฟลเดอร์ไม่ถูกต้อง", ephemeral=True)
         await interaction.response.defer()
-        res = await aroot(f"if [ -d {shlex.quote(path)} ]; then ls -1 {shlex.quote(path)}; else echo 'FOLDER_NOT_FOUND'; fi")
-        if not res or res == 'FOLDER_NOT_FOUND':
-            res = "ไม่พบโฟลเดอร์ หรือโฟลเดอร์ยังว่างอยู่"
-        await interaction.followup.send(f"📂 **รายการไฟล์ทั้งหมดใน `{path}`:**\n```\n{res[:1800]}\n```", delete_after=30)
+
+        if not path:
+            return await interaction.followup.send("❌ ยังไม่ได้ตั้งค่า AutoExec Path")
+        if not valid_path(path):
+            return await interaction.followup.send(
+                f"❌ Path ไม่ถูกต้อง: `{path}`\n"
+                f"💡 ต้องขึ้นต้นด้วย `/sdcard`, `/storage`, `/data`, `/mnt`, `/system`, `/root`, `/vendor`"
+            )
+
+        q = shlex.quote(path)
+        script = (
+            f'echo "TARGET:{path}"; '
+            f'if [ -d {q} ]; then echo "STATUS:FOUND"; '
+            f'  echo "---LS---"; ls -la {q} 2>&1 | head -60; echo "---ENDLS---"; '
+            f'elif [ -e {q} ]; then echo "STATUS:NOT_DIR"; '
+            f'else echo "STATUS:NOT_FOUND"; '
+            f'  P=$(dirname {q}); '
+            f'  if [ -d "$P" ]; then echo "PARENT:FOUND:$P"; '
+            f'    echo "---PARENTLS---"; ls -1 "$P" 2>&1 | head -15; echo "---ENDPARENT---"; '
+            f'  else echo "PARENT:NOT_FOUND:$P"; '
+            f'  fi; '
+            f'fi'
+        )
+        res = await aroot(script)
+
+        if "STATUS:FOUND" in res:
+            files = ""
+            if "---LS---" in res and "---ENDLS---" in res:
+                files = res.split("---LS---")[1].split("---ENDLS---")[0].strip()
+            # กรองบรรทัด . และ .. ออก แต่คงส่วนหัว (total ...)
+            lines = [ln for ln in files.splitlines() if not re.search(r"\s\.{1,2}\s*$", ln)]
+            body = "\n".join(lines) if lines else "(ว่างเปล่า)"
+            msg = f"📂 **พบโฟลเดอร์** `{path}`\n```\n{body[:1600]}\n```"
+            if len(lines) <= 1:
+                msg += "\n\n💡 กด **📝 Add Script** เพื่อสร้างไฟล์ (โฟลเดอร์ถูกสร้างให้อัตโนมัติ)"
+            return await interaction.followup.send(msg)
+
+        if "STATUS:NOT_DIR" in res:
+            return await interaction.followup.send(
+                f"⚠️ `{path}` มีอยู่แต่ **ไม่ใช่โฟลเดอร์**\n"
+                f"💡 ลองแก้ path ใน **⚙️ Edit Settings**"
+            )
+
+        extra = ""
+        if "PARENT:FOUND:" in res:
+            p = res.split("PARENT:FOUND:")[1].split("\n")[0].strip()
+            pc = ""
+            if "---PARENTLS---" in res and "---ENDPARENT---" in res:
+                pc = res.split("---PARENTLS---")[1].split("---ENDPARENT---")[0].strip()
+            extra = f"\n\n📁 **โฟลเดอร์แม่:** `{p}`\n```\n{pc[:800]}\n```"
+        elif "PARENT:NOT_FOUND:" in res:
+            p = res.split("PARENT:NOT_FOUND:")[1].split("\n")[0].strip()
+            extra = f"\n\n❌ โฟลเดอร์แม่ก็ไม่มี: `{p}`"
+
+        msg = (
+            f"❌ **ไม่พบโฟลเดอร์** `{path}`{extra}\n\n"
+            f"💡 **วิธีสร้าง:**\n"
+            f"• กดปุ่ม **📝 Add Script** (จะสร้างโฟลเดอร์ให้อัตโนมัติ)\n"
+            f"• หรือใช้ **⚙️ Edit Settings** แก้ path เป็นโฟลเดอร์ที่มีอยู่"
+        )
+        await interaction.followup.send(msg)
 
     @discord.ui.button(label="📝 Add Script", style=discord.ButtonStyle.success, row=3, custom_id="btn_add_script")
     async def btn_add_script(self, interaction, button):
@@ -1362,24 +1442,43 @@ class ControlView(discord.ui.View):
     async def btn_del_script(self, interaction, button):
         await interaction.response.send_modal(DeleteScriptModal())
 
-    @discord.ui.button(label="📜 ประวัติการทำงาน (History)", style=discord.ButtonStyle.secondary, row=4, custom_id="btn_history")
+    @discord.ui.button(label="📜 ประวัติ (History)", style=discord.ButtonStyle.secondary, row=4, custom_id="btn_history")
     async def btn_history(self, interaction, button):
+        """✅ FIX: แสดงสรุป + 20 รายการ + ไม่หายใน 30 วิ"""
         await interaction.response.defer()
         if not REJOIN_HISTORY:
-            msg = "ยังไม่มีประวัติการทำงาน"
-        else:
-            lines = ["**ประวัติการ Rejoin ล่าสุด (15 รายการ):**"]
-            for h in reversed(REJOIN_HISTORY[-15:]):
-                time_str = h.get("time", "-")
-                action = h.get("action", "-")
-                reason = h.get("reason", "-")
-                lines.append(f"⏱️ `{time_str}` | **{action}**\n└ สาเหตุ: {reason}")
-            msg = "\n\n".join(lines)
-        
-        if len(msg) > 1900:
-            msg = msg[:1900] + "\n... (ตัดข้อความ)"
-            
-        await interaction.followup.send(msg, delete_after=30)
+            return await interaction.followup.send("📜 ยังไม่มีประวัติการทำงาน")
+
+        counts = {}
+        for h in REJOIN_HISTORY:
+            a = h.get("action", "?")
+            counts[a] = counts.get(a, 0) + 1
+        summary = " | ".join(f"`{k}`: {v}" for k, v in counts.items())
+
+        lines = [
+            f"📜 **ประวัติการทำงาน** — ทั้งหมด **{len(REJOIN_HISTORY)}** รายการ",
+            f"📊 **สรุป:** {summary}",
+            "─────────────────────",
+        ]
+        for h in reversed(REJOIN_HISTORY[-20:]):
+            t = h.get("time", "-")
+            a = h.get("action", "-")
+            r = h.get("reason", "-")
+            lines.append(f"⏱️ `{t}` **{a}**\n> {r}")
+
+        msg = "\n".join(lines)
+        if len(msg) > 1950:
+            msg = msg[:1950] + "\n... (ตัดข้อความ)"
+        await interaction.followup.send(msg)
+
+    @discord.ui.button(label="🗑️ Clear History", style=discord.ButtonStyle.secondary, row=4, custom_id="btn_clear_history")
+    async def btn_clear_history(self, interaction, button):
+        count = len(REJOIN_HISTORY)
+        REJOIN_HISTORY.clear()
+        save_history()
+        log(f"ล้างประวัติ {count} รายการ", YELLOW)
+        add_history("History Cleared", f"โดย {interaction.user.name} ({count} รายการ)")
+        await interaction.response.send_message(f"🗑️ ล้างประวัติ {count} รายการแล้ว", delete_after=30)
 
 # ================= Start Bot Loop =================
 def menu_3_start_bot(cfg):
@@ -1397,7 +1496,8 @@ def menu_3_start_bot(cfg):
     subprocess.run(["termux-wake-lock"], stdin=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     STATE["dev_name"] = run_root_text("getprop ro.product.model") or "Android Device"
     load_history()
-    
+    add_history("Bot Start", "เริ่มระบบเฝ้าจอ")
+
     now = time.time()
     STATE.update({
         "paused": False, "last_screenshot": now, "last_ram_clear": now,
@@ -1429,15 +1529,18 @@ def menu_3_start_bot(cfg):
 
             channel = bot.get_channel(int(cfg['channel_id']))
 
-            await check_discord_health(channel)
+            await check_discord_health(bot, channel)   # ✅ FIX: pass bot
 
             if not await check_internet():
+                if not STATE["net_dropped"]:
+                    add_history("Net Drop", "ตรวจพบเน็ตหลุด")
                 STATE["net_dropped"] = True
                 log("⚠️ เน็ตหลุด! รอสัญญาณ...", RED, force_redraw=True)
                 return
 
             if STATE.get("net_dropped"):
                 STATE["net_dropped"] = False
+                add_history("Net Restore", "เน็ตกลับมาเชื่อมต่อ")
                 log("🌐 เน็ตกลับมา! Rejoin...", YELLOW, force_redraw=True)
                 if channel:
                     await send_bot_report(channel, "🌐 **เน็ตกลับมาแล้ว!** Rejoin...", True)
@@ -1476,6 +1579,7 @@ def menu_3_start_bot(cfg):
                 if "อัปเดต" in reason or "Upgrade" in reason or "Play Store" in reason:
                     STATE["paused"] = True
                     await aroot(f"am force-stop {PACKAGE_NAME}")
+                    add_history("Auto Pause", f"ต้องอัปเดต: {reason}")
                     if channel:
                         await send_bot_report(channel, f"🚨 **หยุดอัตโนมัติ:** {reason}\n👉 *อัปเดตแอปแล้วกด ▶️ Resume*", True)
                     return
@@ -1500,6 +1604,7 @@ def menu_3_start_bot(cfg):
             auto_rejoin_hrs = float(cfg.get('auto_rejoin_hours', 0.0))
             if auto_rejoin_hrs > 0 and now - STATE.get("last_auto_rejoin", 0) >= auto_rejoin_hrs * 3600:
                 log(f"⏰ ถึงเวลาบังคับรีจอยอัตโนมัติ (รอบละ {auto_rejoin_hrs} ชม.)", YELLOW, force_redraw=True)
+                add_history("Auto Rejoin", f"รอบ {auto_rejoin_hrs} ชม.")
                 if channel:
                     await send_bot_report(channel, f"⏰ **ถึงเวลาบังคับรีจอยอัตโนมัติ** (รอบละ {auto_rejoin_hrs} ชม.)", True)
                 await do_rejoin(channel, "✅ บังคับรีจอยอัตโนมัติสำเร็จ", f"ถึงเวลาบังคับรีจอยอัตโนมัติ ({auto_rejoin_hrs} ชม.)")
@@ -1613,6 +1718,7 @@ def menu_3_start_bot(cfg):
     DASHBOARD_ACTIVE = False
     fix_tty()
     subprocess.run(["termux-wake-unlock"], stdin=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    add_history("Bot Stop", "ปิดระบบ")
     print(f"\n\n{YELLOW}🛑 ปิดบอท (Offline){RESET}")
     ans = safe_input("บังคับปิด Roblox ด้วยไหม? (y/n): ").lower()
     if ans == 'y':
