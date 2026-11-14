@@ -1,30 +1,3 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-╔═══════════════════════════════════════════════════════════════╗
-║  Discord Bot — Termux All-in-One Edition                     ║
-║  ไฟล์เดียวจบ: ติดตั้ง + รันเบื้องหลัง + auto-start + wake-lock ║
-╚═══════════════════════════════════════════════════════════════╝
-
-วิธีใช้:
-    python bot.py               → รันครั้งแรก (ติดตั้ง service + เริ่มบอท)
-    python bot.py --foreground  → รันแบบ foreground (สำหรับ debug)
-    python bot.py --run-service → รันเฉพาะ bot (ใช้โดย service เท่านั้น)
-    python bot.py --status      → ดูสถานะ service
-    python bot.py --restart     → restart service
-    python bot.py --stop        → หยุด service
-    python bot.py --uninstall   → ลบ service + boot script ทั้งหมด
-    python bot.py --help        → แสดง help
-
-Token: อ่านจาก (ตามลำดับ)
-    1) ตัวแปรสภาพแวดล้อม DISCORD_TOKEN
-    2) ไฟล์ token.txt ในโฟลเดอร์เดียวกับ bot.py
-    3) ถามครั้งแรกและบันทึกให้อัตโนมัติ
-"""
-
-# ═══════════════════════════════════════════════════════════════
-# IMPORTS
-# ═══════════════════════════════════════════════════════════════
 import os
 import sys
 import time
@@ -40,492 +13,1734 @@ import glob
 import logging
 import hashlib
 import math
-import signal
 from logging.handlers import RotatingFileHandler
 from datetime import datetime
-from pathlib import Path
 
-# ─── ติดตั้ง discord.py อัตโนมัติ ───
 try:
     import discord
     from discord.ext import commands, tasks
 except ImportError:
-    print("กำลังติดตั้งไลบรารี discord.py ...")
+    print("กำลังติดตั้งไลบรารีสำหรับ Discord Bot...")
     r = subprocess.run([sys.executable, "-m", "pip", "install", "--quiet", "discord.py"])
     if r.returncode != 0:
-        print("ติดตั้ง discord.py ไม่สำเร็จ — ลอง: pip install discord.py")
+        print("ติดตั้ง discord.py ไม่สำเร็จ กรุณาติดตั้งเองด้วย: pip install discord.py")
         sys.exit(1)
     import discord
     from discord.ext import commands, tasks
 
+# ================= ตั้งค่าสีหน้าจอ =================
+CYAN = "\033[96m"
+BRIGHT_CYAN = "\033[1;96m"
+BOLD_WHITE = "\033[1;97m"
+GREEN = "\033[92m"
+YELLOW = "\033[93m"
+ORANGE = "\033[38;5;208m"
+RED = "\033[91m"
+RESET = "\033[0m"
 
-# ═══════════════════════════════════════════════════════════════
-# ANSI COLORS
-# ═══════════════════════════════════════════════════════════════
-RESET        = "\033[0m"
-CYAN         = "\033[96m"
-BRIGHT_CYAN  = "\033[1;96m"
-GREEN        = "\033[1;92m"
-BRIGHT_GREEN = "\033[1;92m"
-RED          = "\033[1;91m"
-BRIGHT_RED   = "\033[1;91m"
-YELLOW       = "\033[1;93m"
-BRIGHT_YELLOW= "\033[1;93m"
-BLUE         = "\033[94m"
-MAGENTA      = "\033[95m"
-WHITE        = "\033[97m"
-BOLD         = "\033[1m"
+CONFIG_FILE = "original_config.json"
+LOG_FILE = "original_bot.log"
+HISTORY_FILE = "rejoin_history.json"
+PACKAGE_NAME = "com.roblox.client"
+GAME_LOG_DIR = f"/data/data/{PACKAGE_NAME}/files/appData/logs"
+EXT_LOG_DIR = f"/sdcard/Android/data/{PACKAGE_NAME}/files/appData/logs"
+PNG_MAGIC = b"\x89PNG"
+SCREEN_TMP = "/data/local/tmp/orig_screen.png"
+UI_TMP = "/data/local/tmp/orig_ui.xml"
+MAX_FAILS_ALERT = 5
+MAX_LOOP_RESTARTS = 5
+DISCORD_OFFLINE_THRESHOLD = 60
+REJOIN_USER_COOLDOWN = 30
+MAX_HISTORY_RECORDS = 50
 
+# --- PERFORMANCE TUNABLES ---
+NET_CACHE_SECONDS = 30
+DASH_THROTTLE_SECONDS = 0.5
+ROOT_TIMEOUT_DEFAULT = 15
+WATCHDOG_INTERVAL = 30
+WATCHDOG_TIMEOUT = 60
 
-def _log(tag: str, color: str, msg: str) -> None:
-    ts = datetime.now().strftime("%H:%M:%S")
-    print(f"{color}[{tag}]{RESET} {WHITE}{ts}{RESET} {msg}", flush=True)
+DEFAULT_CONFIG = {
+    "place_id": "",
+    "vip_link_code": "",
+    "bot_token": "",
+    "channel_id": "",
+    "allowed_users": [],
+    "screenshot_minutes": 10,
+    "check_interval": 15,
+    "clear_ram_hours": 1.0,
+    "auto_rejoin_hours": 0.0,
+    "join_wait_seconds": 35,
+    "log_tail_lines": 1000,
+    "autoexec_path": "/sdcard/Delta/autoexec",
+    "startup_grace_seconds": 90,
+    "log_stale_seconds": 180,
+    "rejoin_cooldown_seconds": 45,
+    "frozen_screen_checks": 6,
+    "ui_check_every_n": 3,
+    "screen_check_every_n": 2,
+}
 
-def info(msg: str)  -> None: _log("INFO",  BRIGHT_CYAN, msg)
-def ok(msg: str)    -> None: _log("OK",    GREEN,       msg)
-def warn(msg: str)  -> None: _log("WARN",  YELLOW,      msg)
-def error(msg: str) -> None: _log("ERR",   RED,         msg)
+CFG = {}
+STATE = {
+    "paused": False,
+    "last_screenshot": 0.0,
+    "last_ram_clear": 0.0,
+    "game_start_time": 0.0,
+    "last_successful_rejoin": 0.0,
+    "last_auto_rejoin": 0.0,
+    "fail_count": 0,
+    "rejoin_total": 0,
+    "loop_restarts": 0,
+    "net_dropped": False,
+    "last_rejoin_attempt": 0.0,
+    "lock": None,
+    "dev_name": "Android Device",
+    "last_frame_sig": None,
+    "frozen_count": 0,
+    "bg_count": 0,
+    "check_count": 0,
+    "discord_offline_since": 0.0,
+    "rejoin_per_user": {},
+    "last_heartbeat": 0.0,
+    "bot_unresponsive": False,
+}
+BG_TASKS = set()
+REJOIN_HISTORY = []
 
+DASHBOARD_ACTIVE = False
+LAST_RESULT_TEXT = f"{YELLOW}🛡️ รอรับคำสั่ง...{RESET}"
+THAI_COMBINING = set("\u0e31\u0e34\u0e35\u0e36\u0e37\u0e38\u0e39\u0e3a\u0e47\u0e48\u0e49\u0e4a\u0e4b\u0e4c\u0e4d\u0e4e")
 
-# ═══════════════════════════════════════════════════════════════
-# PATHS & CONSTANTS
-# ═══════════════════════════════════════════════════════════════
-HOME          = Path(os.path.expanduser("~"))
-SCRIPT_PATH   = Path(__file__).resolve()
-SCRIPT_DIR    = SCRIPT_PATH.parent
-IS_TERMUX     = Path("/data/data/com.termux").is_dir()
-TERMUX_BIN    = Path("/data/data/com.termux/files/usr/bin")
+# ================= ตัวตรวจสอบข้อมูล =================
+RE_PLACE = re.compile(r"\d{1,20}")
+RE_VIP = re.compile(r"[A-Za-z0-9_\-]{1,100}")
+RE_FILE = re.compile(r"[\w\-. ]{1,60}\.(?:lua|txt|json|cfg|ini)", re.IGNORECASE)
+# รองรับ path หลากหลายขึ้น + ครอบคลุม /data/..., /mnt/..., /system/... ฯลฯ
+RE_PATH = re.compile(r"^/(sdcard|storage|mnt|data|system|root|vendor)(/|$)")
 
-SERVICE_NAME  = "discordbot"
-SERVICE_DIR   = HOME / ".termux" / "services" / SERVICE_NAME
-LOG_DIR       = SERVICE_DIR / "log" / "main"
-BOOT_DIR      = HOME / ".termux" / "boot"
-BOOT_SCRIPT   = BOOT_DIR / f"start-{SERVICE_NAME}.sh"
-TOKEN_FILE    = SCRIPT_DIR / "token.txt"
-PID_FILE      = SCRIPT_DIR / f".{SERVICE_NAME}.pid"
+def valid_place_id(v):
+    return bool(RE_PLACE.fullmatch(str(v).strip()))
 
+def valid_vip(v):
+    v = str(v).strip()
+    return v == "" or bool(RE_VIP.fullmatch(v))
 
-# ═══════════════════════════════════════════════════════════════
-# TERMUX SERVICE MANAGEMENT
-# ═══════════════════════════════════════════════════════════════
-def _which(cmd: str) -> str | None:
-    return shutil.which(cmd)
-
-def _run(cmd: list[str], **kw) -> subprocess.CompletedProcess:
-    return subprocess.run(cmd, capture_output=True, text=True, **kw)
-
-def is_installed() -> bool:
-    return SERVICE_DIR.is_dir() and (SERVICE_DIR / "run").exists()
-
-def install_service() -> bool:
-    if not IS_TERMUX:
-        error("ไม่ได้รันบน Termux — ไม่สามารถติดตั้ง service ได้")
+def valid_path(v):
+    v = str(v).strip()
+    if not v or ".." in v or "\x00" in v:
         return False
-
-    info(f"ติดตั้ง service: {SERVICE_NAME}")
-
-    # ติดตั้งแพ็กเกจที่จำเป็น
-    for pkg in ("python", "termux-services", "termux-api"):
-        check = _run(["dpkg", "-s", pkg])
-        if check.returncode != 0:
-            info(f"ติดตั้ง {pkg} ...")
-            r = _run(["pkg", "install", "-y", pkg])
-            if r.returncode != 0:
-                error(f"ติดตั้ง {pkg} ล้มเหลว")
-                return False
-            ok(f"{pkg} ติดตั้งสำเร็จ")
-
-    # สร้างโฟลเดอร์
-    LOG_DIR.mkdir(parents=True, exist_ok=True)
-
-    # run script
-    (SERVICE_DIR / "run").write_text(
-        f'#!/data/data/com.termux/files/usr/bin/sh\n'
-        f'termux-wake-lock\n'
-        f'exec {sys.executable} -u "{SCRIPT_PATH}" --run-service\n'
-    )
-    (SERVICE_DIR / "run").chmod(0o755)
-
-    # log script
-    (SERVICE_DIR / "log" / "run").write_text(
-        f'#!/data/data/com.termux/files/usr/bin/sh\n'
-        f'exec svlogd -tt "{LOG_DIR}"\n'
-    )
-    (SERVICE_DIR / "log" / "run").chmod(0o755)
-
-    ok(f"service พร้อม: {SERVICE_DIR}")
-
-    # boot auto-start
-    BOOT_DIR.mkdir(parents=True, exist_ok=True)
-    BOOT_SCRIPT.write_text(
-        f'#!/data/data/com.termux/files/usr/bin/sh\n'
-        f'termux-wake-lock\n'
-        f'sv up {SERVICE_NAME}\n'
-    )
-    BOOT_SCRIPT.chmod(0o755)
-    ok(f"boot script: {BOOT_SCRIPT}")
-    warn("ต้องติดตั้งแอป Termux:Boot จาก F-Droid → https://f-droid.org/packages/com.termux.boot/")
-
-    # root: whitelist battery
-    if _which("su"):
-        info("ตรวจพบ root — whitelist Termux จาก battery optimization")
-        _run(["su", "-c", "dumpsys deviceidle whitelist +com.termux"])
-        _run(["su", "-c", "cmd appops set com.termux RUN_IN_BACKGROUND allow"])
-        _run(["su", "-c", "cmd appops set com.termux RUN_ANY_IN_BACKGROUND allow"])
-        ok("whitelist สำเร็จ")
-
-    # sv-enable
-    _run(["sv-enable", SERVICE_NAME])
+    if not RE_PATH.match(v):
+        return False
+    # กัน shell metacharacters ที่อันตราย (แม้จะ shlex.quote แล้ว)
+    if any(c in v for c in "\n\r\t;&|`$()<>\\"):
+        return False
     return True
 
+def clean_filename(name):
+    name = os.path.basename(str(name).strip())
+    if not name:
+        return None
+    if not re.search(r"\.(lua|txt|json|cfg|ini)$", name, re.IGNORECASE):
+        name += ".lua"
+    if name.startswith(".") or not RE_FILE.fullmatch(name):
+        return None
+    return name
 
-def start_service() -> bool:
-    if not is_installed():
-        error("service ยังไม่ถูกติดตั้ง — รัน: python bot.py")
-        return False
-    r = _run(["sv", "up", SERVICE_NAME])
-    time.sleep(2)
-    return is_running()
+def is_authorized(user_id):
+    return int(user_id) in CFG.get("allowed_users", [])
 
+# ================= ฟังก์ชันจัดการประวัติ (History) =================
+def load_history():
+    global REJOIN_HISTORY
+    try:
+        if os.path.exists(HISTORY_FILE):
+            with open(HISTORY_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, list):
+                REJOIN_HISTORY.clear()
+                REJOIN_HISTORY.extend(data[-MAX_HISTORY_RECORDS:])
+    except Exception as e:
+        logger.warning(f"อ่านไฟล์ประวัติไม่ได้: {e}")
+        REJOIN_HISTORY.clear()
 
-def stop_service() -> bool:
-    _run(["sv", "down", SERVICE_NAME])
-    time.sleep(1)
-    return not is_running()
+def save_history():
+    try:
+        with open(HISTORY_FILE, "w", encoding="utf-8") as f:
+            json.dump(REJOIN_HISTORY[-MAX_HISTORY_RECORDS:], f, ensure_ascii=False)
+    except Exception as e:
+        logger.warning(f"บันทึกไฟล์ประวัติไม่ได้: {e}")
 
+def add_history(action, reason="", extra=None):
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    entry = {"time": now_str, "action": action, "reason": reason}
+    if extra:
+        entry.update(extra)
+    REJOIN_HISTORY.append(entry)
+    if len(REJOIN_HISTORY) > MAX_HISTORY_RECORDS:
+        REJOIN_HISTORY.pop(0)
+    save_history()
 
-def restart_service() -> bool:
-    _run(["sv", "restart", SERVICE_NAME])
-    time.sleep(2)
-    return is_running()
+# ================= ฟังก์ชันจัดระเบียบหน้าจอ =================
+def fix_tty():
+    try:
+        import termios
+        fd = sys.stdout.fileno()
+        attrs = termios.tcgetattr(fd)
+        attrs[1] |= termios.ONLCR | termios.OPOST
+        termios.tcsetattr(fd, termios.TCSANOW, attrs)
+    except Exception:
+        pass
 
+def trim_visible(text, max_vis=26):
+    vis = 0
+    out = []
+    for ch in str(text):
+        if ch in THAI_COMBINING:
+            out.append(ch)
+            continue
+        w = 2 if ord(ch) > 0x1F000 else 1
+        if vis + w > max_vis:
+            out.append("..")
+            break
+        vis += w
+        out.append(ch)
+    return "".join(out)
 
-def is_running() -> bool:
-    r = _run(["sv", "status", SERVICE_NAME])
-    return r.returncode == 0 and "run:" in r.stdout
+# ================= Logging =================
+logger = logging.getLogger("rbbot")
+logger.setLevel(logging.INFO)
+try:
+    _fh = RotatingFileHandler(LOG_FILE, maxBytes=512 * 1024, backupCount=2, encoding="utf-8")
+    _fh.setFormatter(logging.Formatter("%(asctime)s %(message)s"))
+    logger.addHandler(_fh)
+except OSError:
+    pass
 
+_LAST_DASH_RENDER = [0.0]
+_DASH_DIRTY = [False]
 
-def show_status() -> None:
-    if not is_installed():
-        warn("ยังไม่ได้ติดตั้ง service")
-        print(f"  → รัน: {sys.executable} {SCRIPT_PATH.name}")
-        return
-    r = _run(["sv", "status", SERVICE_NAME])
-    print(r.stdout.strip() if r.stdout else r.stderr.strip())
-    print()
-    if is_running():
-        ok("บอทกำลังทำงานอยู่ (running)")
+def print_bot_dashboard():
+    fix_tty()
+    if STATE.get("paused", False):
+        status_text = f"{YELLOW}⏸️ หยุดพักชั่วคราว (Paused){RESET}"
     else:
-        warn("บอทไม่ได้ทำงาน (stopped)")
-    print(f"   log file : {LOG_DIR / 'current'}")
-    print(f"   คำสั่ง    : tail -f {LOG_DIR / 'current'}")
+        status_text = f"{GREEN}🟢 บอทกำลังทำงาน (Running){RESET}"
 
+    place_str = trim_visible(CFG.get("place_id") or "-", 15)
+    rejoins = STATE.get("rejoin_total", 0)
 
-def uninstall_service() -> None:
-    info("ลบ service...")
-    _run(["sv-disable", SERVICE_NAME])
-    _run(["sv", "down", SERVICE_NAME])
-    if SERVICE_DIR.exists():
-        shutil.rmtree(SERVICE_DIR)
-    if BOOT_SCRIPT.exists():
-        BOOT_SCRIPT.unlink()
-    ok("ลบเรียบร้อย")
+    lines = [
+        "\033[2J\033[H",
+        f"  {BRIGHT_CYAN}╦═╗┌─┐  ╦┌─┐┬┌┐┌{RESET}   {BOLD_WHITE}[ ROBLOX AUTO BOT ]{RESET}",
+        f"  {BRIGHT_CYAN}╠╦╝├┤   ║│ │││││{RESET}   {CYAN}Map: {BOLD_WHITE}{place_str}{CYAN} | Rejoin: {GREEN}{rejoins}{RESET}",
+        f"  {BRIGHT_CYAN}╩╚═└─┘╚═╝└─┘┴┘└┘{RESET}",
+        f"  {CYAN}╔════════════════════════════════════════╗{RESET}",
+        f"  {CYAN}║{RESET} 📌 {BOLD_WHITE}สถานะโปรแกรม{RESET}\033[44G{CYAN}║{RESET}",
+        f"  {CYAN}╠════════════════════════════════════════╣{RESET}",
+        f"  {CYAN}║{RESET} {status_text}\033[44G{CYAN}║{RESET}",
+        f"  {CYAN}╚════════════════════════════════════════╝{RESET}",
+        f"  {ORANGE}╔════════════════════════════════════════╗{RESET}",
+        f"  {ORANGE}║{RESET} 📝 {BOLD_WHITE}RESULT{RESET}\033[44G{ORANGE}║{RESET}",
+        f"  {ORANGE}╠════════════════════════════════════════╣{RESET}",
+        f"  {ORANGE}║{RESET} {LAST_RESULT_TEXT}\033[44G{ORANGE}║{RESET}",
+        f"  {ORANGE}╚════════════════════════════════════════╝{RESET}",
+        f"    {YELLOW}( กดปุ่ม CTRL + C เพื่อกลับสู่เมนูหลัก ){RESET}",
+    ]
+    sys.stdout.write("\r\n".join(lines) + "\r\n")
+    sys.stdout.flush()
 
+def log(msg, color=CYAN, force_redraw=False):
+    global LAST_RESULT_TEXT
+    now = datetime.now().strftime("%H:%M:%S")
+    clean_msg = " ".join(str(msg).splitlines()).strip()
+    logger.info(clean_msg)
 
-# ═══════════════════════════════════════════════════════════════
-# TOKEN HANDLING
-# ═══════════════════════════════════════════════════════════════
-def load_token(interactive: bool = True) -> str | None:
-    # 1) env
-    t = os.environ.get("DISCORD_TOKEN", "").strip()
-    if t:
-        return t
-    # 2) ไฟล์
-    if TOKEN_FILE.exists():
-        t = TOKEN_FILE.read_text(encoding="utf-8").strip()
-        if t:
-            return t
-    # 3) ถาม (เฉพาะโหมด install)
-    if interactive and sys.stdin.isatty():
-        warn("ยังไม่มี Discord Bot Token")
-        print(f"   สร้างได้ที่: https://discord.com/developers/applications")
+    short_msg = trim_visible(clean_msg, 25)
+    LAST_RESULT_TEXT = f"{color}[{now}] {short_msg}{RESET}"
+    _DASH_DIRTY[0] = True
+
+    if DASHBOARD_ACTIVE:
+        current = time.time()
+        if force_redraw or (current - _LAST_DASH_RENDER[0]) >= DASH_THROTTLE_SECONDS:
+            _LAST_DASH_RENDER[0] = current
+            _DASH_DIRTY[0] = False
+            print_bot_dashboard()
+    else:
+        fix_tty()
+        sys.stdout.write(f"{color}[{now}] {clean_msg}{RESET}\r\n")
+        sys.stdout.flush()
+
+def audit(interaction, action):
+    try:
+        logger.info(f"[AUDIT] user={interaction.user.id} ({interaction.user}) action={action}")
+    except Exception:
+        pass
+
+def safe_input(prompt_text):
+    fix_tty()
+    try:
+        import termios
+        termios.tcflush(sys.stdin.fileno(), termios.TCIFLUSH)
+    except Exception:
+        pass
+    time.sleep(0.1)
+    try:
+        return input(prompt_text).strip()
+    except EOFError:
+        return ""
+
+# ================= จัดการ Config =================
+def load_config():
+    cfg = json.loads(json.dumps(DEFAULT_CONFIG))
+    if os.path.exists(CONFIG_FILE):
         try:
-            t = input(f"{BRIGHT_CYAN}วาง token ที่นี่: {RESET}").strip()
-        except (KeyboardInterrupt, EOFError):
-            return None
-        if t:
-            TOKEN_FILE.write_text(t, encoding="utf-8")
-            try:
-                TOKEN_FILE.chmod(0o600)
-            except Exception:
-                pass
-            ok(f"บันทึก token ที่: {TOKEN_FILE}")
-            return t
+            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            cfg.update({k: v for k, v in data.items() if k in DEFAULT_CONFIG})
+        except Exception as e:
+            logger.warning(f"อ่านไฟล์ config ไม่ได้: {e}")
+    if not isinstance(cfg.get("allowed_users"), list):
+        cfg["allowed_users"] = []
+    return cfg
+
+def save_config(cfg):
+    with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+        json.dump(cfg, f, indent=4, ensure_ascii=False)
+    try:
+        os.chmod(CONFIG_FILE, 0o600)
+    except OSError:
+        pass
+
+# ================= Core Root =================
+def batch_root(commands: dict, timeout=ROOT_TIMEOUT_DEFAULT) -> dict:
+    if not commands:
+        return {}
+    parts = []
+    for key, cmd in commands.items():
+        parts.append(f'echo "<<B:{key}>>"')
+        parts.append(cmd)
+        parts.append(f'echo "<<E:{key}>>"')
+    script = " ; ".join(parts)
+    try:
+        res = subprocess.run(
+            ["su", "-c", script],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=timeout,
+            errors="replace"
+        )
+        output = res.stdout or ""
+    except Exception as e:
+        logger.warning(f"batch_root ผิดพลาด: {e}")
+        return {k: "" for k in commands}
+
+    results = {}
+    for key in commands:
+        begin = f"<<B:{key}>>"
+        end = f"<<E:{key}>>"
+        try:
+            s = output.index(begin) + len(begin)
+            e = output.index(end, s)
+            results[key] = output[s:e].strip()
+        except ValueError:
+            results[key] = ""
+    return results
+
+async def abatch_root(commands: dict, timeout=ROOT_TIMEOUT_DEFAULT) -> dict:
+    return await asyncio.to_thread(batch_root, commands, timeout)
+
+def run_root_text(cmd, timeout=ROOT_TIMEOUT_DEFAULT):
+    try:
+        res = subprocess.run(
+            ["su", "-c", cmd],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=timeout,
+            errors="replace"
+        )
+        return res.stdout.strip()
+    except Exception as e:
+        logger.warning(f"run_root_text ผิดพลาด: {e}")
+        return ""
+
+async def aroot(cmd, timeout=ROOT_TIMEOUT_DEFAULT):
+    return await asyncio.to_thread(run_root_text, cmd, timeout)
+
+def clear_system_ram():
+    run_root_text("sync && echo 3 > /proc/sys/vm/drop_caches")
+
+def clear_termux_junk():
+    home = os.path.expanduser("~")
+    prefix = os.environ.get("PREFIX", "")
+    targets = glob.glob(os.path.join(home, ".cache", "*"))
+    if prefix:
+        targets += glob.glob(os.path.join(prefix, "tmp", "*"))
+    for p in targets:
+        try:
+            if os.path.isdir(p) and not os.path.islink(p):
+                shutil.rmtree(p, ignore_errors=True)
+            else:
+                os.remove(p)
+        except OSError:
+            pass
+    try:
+        subprocess.run(["apt", "clean"], stdin=subprocess.DEVNULL,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=60)
+    except Exception:
+        pass
+
+def capture_screenshot_bytes():
+    try:
+        res = subprocess.run(
+            ["su", "-c", "screencap -p"],
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, timeout=20
+        )
+        if res.returncode == 0 and res.stdout.startswith(PNG_MAGIC):
+            return res.stdout
+    except Exception:
+        pass
+    try:
+        cmd = f"screencap -p {SCREEN_TMP} && cat {SCREEN_TMP}; rm -f {SCREEN_TMP}"
+        res = subprocess.run(
+            ["su", "-c", cmd],
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, timeout=20
+        )
+        if res.stdout.startswith(PNG_MAGIC):
+            return res.stdout
+    except Exception:
+        pass
     return None
 
-
-# ═══════════════════════════════════════════════════════════════
-# LOGGING (สำหรับ bot runtime)
-# ═══════════════════════════════════════════════════════════════
-def setup_logger() -> logging.Logger:
-    logger = logging.getLogger("discord_bot")
-    if logger.handlers:
-        return logger
-    logger.setLevel(logging.INFO)
-    fmt = logging.Formatter(
-        "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-    )
-    # console
-    sh = logging.StreamHandler(sys.stdout)
-    sh.setFormatter(fmt)
-    logger.addHandler(sh)
-    # rotating file (ถ้ารันแบบ foreground)
+# ================= Screen Capture =================
+def grab_raw_frame():
     try:
-        fh = RotatingFileHandler(
-            SCRIPT_DIR / "bot.log",
-            maxBytes=5 * 1024 * 1024,
-            backupCount=3,
-            encoding="utf-8",
+        res = subprocess.run(
+            ["su", "-c", "screencap"],
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, timeout=15
         )
-        fh.setFormatter(fmt)
-        logger.addHandler(fh)
+        buf = res.stdout
     except Exception:
-        pass
-    return logger
+        return None
+    if not buf or len(buf) < 100000:
+        return None
+    w = int.from_bytes(buf[0:4], "little")
+    h = int.from_bytes(buf[4:8], "little")
+    fmt = int.from_bytes(buf[8:12], "little")
+    if w <= 0 or h <= 0 or w > 10000 or h > 10000 or fmt not in (1, 2):
+        return None
+    expected = w * h * 4
+    if len(buf) < expected + 12:
+        return None
+    hdr = len(buf) - expected
+    if hdr not in (12, 16):
+        hdr = 12
+    return buf, w, h, hdr
 
-log = setup_logger()
+_SIG_OFFSET_CACHE = {}
 
+def _get_sig_offsets(w, h, hdr):
+    key = (w, h, hdr)
+    cached = _SIG_OFFSET_CACHE.get(key)
+    if cached is not None:
+        return cached
+    offsets = []
+    for j in range(24):
+        py = int(h * (j + 0.5) / 24)
+        for i in range(14):
+            px = int(w * (i + 0.5) / 14)
+            offsets.append(hdr + (py * w + px) * 4)
+    _SIG_OFFSET_CACHE[key] = offsets
+    return offsets
 
-# ═══════════════════════════════════════════════════════════════
-# ╔═══════════════════════════════════════════════════════════╗
-# ║  BOT LOGIC — วางโค้ดบอทของคุณในส่วนนี้                     ║
-# ╚═══════════════════════════════════════════════════════════╝
-# ═══════════════════════════════════════════════════════════════
+def frame_signature(frame):
+    buf, w, h, hdr = frame
+    offsets = _get_sig_offsets(w, h, hdr)
+    n = len(offsets)
+    sig = bytearray(n * 3)
+    idx = 0
+    for off in offsets:
+        sig[idx] = buf[off] >> 4
+        sig[idx + 1] = buf[off + 1] >> 4
+        sig[idx + 2] = buf[off + 2] >> 4
+        idx += 3
+    return hashlib.md5(bytes(sig)).hexdigest()
 
-intents = discord.Intents.default()
-intents.message_content = True
-
-bot = commands.Bot(command_prefix="!", intents=intents)
-
-
-@bot.event
-async def on_ready():
-    log.info(f"Logged in as {bot.user} (ID: {bot.user.id})")
-    log.info(f"Discord.py version: {discord.__version__}")
-    print(f"{BRIGHT_CYAN}╔══════════════════════════════════════╗{RESET}")
-    print(f"{BRIGHT_CYAN}║   BOT ONLINE: {GREEN}{bot.user}{BRIGHT_CYAN}   ║{RESET}")
-    print(f"{BRIGHT_CYAN}╚══════════════════════════════════════╝{RESET}", flush=True)
-
-
-@bot.event
-async def on_command_error(ctx, exc):
-    if isinstance(exc, commands.CommandNotFound):
-        return
-    log.error(f"Command error: {exc}")
+def inspect_screen():
     try:
-        await ctx.send(f"❌ Error: `{exc}`")
-    except Exception:
-        pass
+        frame = grab_raw_frame()
+        if not frame:
+            return False, None
+        buf, w, h, hdr = frame
+        sig = frame_signature(frame)
 
+        def get_rgb(px, py):
+            i = hdr + (py * w + px) * 4
+            return buf[i], buf[i + 1], buf[i + 2]
 
-@bot.command(name="ping")
-async def cmd_ping(ctx):
-    """เช็ค latency"""
-    await ctx.send(f"🏓 Pong! `{round(bot.latency * 1000)}ms`")
+        def is_modal_gray(r, g, b):
+            return (50 <= r <= 66 and 52 <= g <= 68 and 54 <= b <= 70
+                    and abs(r - g) <= 4 and abs(g - b) <= 4 and b >= r)
 
+        xs = [int(w * (0.35 + 0.30 * i / 24)) for i in range(25)]
+        ys = [int(h * (0.28 + 0.44 * j / 19)) for j in range(20)]
+        flat_pairs = 0
+        for py in ys:
+            prev = None
+            for px in xs:
+                rgb = get_rgb(px, py)
+                if is_modal_gray(*rgb):
+                    if prev is not None and abs(rgb[0] - prev[0]) <= 2 and abs(rgb[1] - prev[1]) <= 2:
+                        flat_pairs += 1
+                    prev = rgb
+                else:
+                    prev = None
+        if flat_pairs < 40:
+            return False, sig
 
-@bot.command(name="info")
-async def cmd_info(ctx):
-    """ข้อมูลบอท"""
-    embed = discord.Embed(
-        title="Bot Info",
-        color=0x00ffff,
-        timestamp=datetime.now(),
-    )
-    embed.add_field(name="User",     value=str(bot.user),      inline=True)
-    embed.add_field(name="Guilds",   value=str(len(bot.guilds)), inline=True)
-    embed.add_field(name="Latency",  value=f"{round(bot.latency*1000)}ms", inline=True)
-    embed.add_field(name="Discord.py", value=discord.__version__, inline=True)
-    await ctx.send(embed=embed)
+        btn_xs = [int(w * (0.36 + 0.28 * i / 29)) for i in range(30)]
+        btn_ys = [int(h * (0.48 + 0.26 * j / 19)) for j in range(20)]
+        white_rows = 0
+        for py in btn_ys:
+            streak = 0
+            for px in btn_xs:
+                r, g, b = get_rgb(px, py)
+                streak = streak + 1 if (r >= 235 and g >= 235 and b >= 235) else 0
+                if streak >= 5:
+                    white_rows += 1
+                    break
+        if white_rows < 1:
+            return False, sig
 
-
-@bot.command(name="reload")
-@commands.is_owner()
-async def cmd_reload(ctx, ext: str = None):
-    """โหลด cogs ใหม่ (owner เท่านั้น)"""
-    try:
-        if ext:
-            bot.reload_extension(ext)
-            await ctx.send(f"✅ Reloaded `{ext}`")
-        else:
-            for name in list(bot.extensions):
-                bot.reload_extension(name)
-            await ctx.send("✅ Reloaded all extensions")
+        edge_gray = 0
+        for j in range(10):
+            py = int(h * (0.25 + 0.50 * j / 9))
+            if is_modal_gray(*get_rgb(int(w * 0.08), py)):
+                edge_gray += 1
+            if is_modal_gray(*get_rgb(int(w * 0.92), py)):
+                edge_gray += 1
+        return edge_gray <= 6, sig
     except Exception as e:
-        await ctx.send(f"❌ {e}")
+        logger.warning(f"inspect_screen ผิดพลาด: {e}")
+        return False, None
 
+# ================= Internet + Discord =================
+_NET_CACHE_UNTIL = [0.0]
 
-# ────────────────────────────────────────────────────────────
-# 📌 เพิ่มคำสั่ง / event ของคุณเองต่อจากบรรทัดนี้ได้เลย
-# ────────────────────────────────────────────────────────────
-# ตัวอย่าง:
-# @bot.command()
-# async def hello(ctx):
-#     await ctx.send(f"สวัสดี {ctx.author.mention}!")
+async def check_internet():
+    now = time.time()
+    if now < _NET_CACHE_UNTIL[0]:
+        return True
 
-
-# ═══════════════════════════════════════════════════════════════
-# RUNTIME MODES
-# ═══════════════════════════════════════════════════════════════
-def run_bot_foreground(service_mode: bool = False) -> None:
-    """รันบอทจริง (ใช้โดย service หรือ --foreground)"""
-    token = load_token(interactive=False)
-    if not token:
-        error("ไม่พบ Discord Bot Token")
-        print(f"   วิธีแก้: สร้างไฟล์ {TOKEN_FILE} แล้วใส่ token ลงไป")
-        print(f"   หรือ:    export DISCORD_TOKEN='your-token'")
-        sys.exit(1)
-
-    # บันทึก PID
-    try:
-        PID_FILE.write_text(str(os.getpid()))
-    except Exception:
-        pass
-
-    # graceful shutdown
-    def _sigterm(*_):
-        log.info("ได้รับ SIGTERM — กำลังปิดบอท...")
-        asyncio.create_task(bot.close())
-
-    try:
-        signal.signal(signal.SIGTERM, _sigterm)
-        signal.signal(signal.SIGINT,  _sigterm)
-    except Exception:
-        pass
-
-    try:
-        if service_mode:
-            log.info("=== BOT STARTING (service mode) ===")
-        bot.run(token, log_handler=None)
-    except Exception as e:
-        log.exception(f"Bot crashed: {e}")
-        sys.exit(1)
-    finally:
+    async def probe(host, port):
         try:
-            PID_FILE.unlink(missing_ok=True)
+            _, w = await asyncio.wait_for(asyncio.open_connection(host, port), timeout=4)
+            w.close()
+            return True
+        except Exception:
+            return False
+
+    results = await asyncio.gather(
+        probe("1.1.1.1", 443),
+        probe("8.8.8.8", 53),
+        probe("google.com", 443),
+        return_exceptions=True
+    )
+    ok = any(r is True for r in results)
+    if ok:
+        _NET_CACHE_UNTIL[0] = time.time() + NET_CACHE_SECONDS
+    return ok
+
+async def check_discord_health(bot, channel):
+    """✅ FIX: รับ bot เป็น parameter (เดิมอ้าง global bot ที่ไม่มี → NameError)"""
+    is_offline = False
+    try:
+        if bot.is_closed() or not bot.is_ready():
+            is_offline = True
+        else:
+            lat = bot.latency
+            if lat is None or (isinstance(lat, float) and math.isnan(lat)):
+                is_offline = True
+    except Exception:
+        is_offline = True
+
+    if is_offline:
+        if STATE.get("discord_offline_since", 0) == 0:
+            STATE["discord_offline_since"] = time.time()
+            log("🔌 ตรวจพบ Discord ขาดการเชื่อมต่อ", RED, force_redraw=True)
+        return
+
+    since = STATE.get("discord_offline_since", 0)
+    if since > 0:
+        STATE["discord_offline_since"] = 0
+        dur = time.time() - since
+        if dur >= DISCORD_OFFLINE_THRESHOLD and channel:
+            await send_reconnect_alert(channel, dur)
+
+async def send_reconnect_alert(channel, duration_sec):
+    mentions = " ".join(f"<@{uid}>" for uid in CFG.get("allowed_users", []))
+    if duration_sec < 60:
+        dur_text = f"{int(duration_sec)} วินาที"
+    elif duration_sec < 3600:
+        dur_text = f"{int(duration_sec / 60)} นาที"
+    else:
+        dur_text = f"{duration_sec / 3600:.1f} ชั่วโมง"
+    try:
+        await channel.send(
+            f"🔌 **บอทกลับมาเชื่อมต่อ Discord แล้ว!**\n"
+            f"⏱️ ขาดการเชื่อมต่อนานประมาณ **{dur_text}**\n"
+            f"🔄 ระบบเฝ้าจออาจไม่ได้แจ้งเตือนในช่วงเวลาดังกล่าว\n"
+            f"{mentions}",
+            allowed_mentions=discord.AllowedMentions(users=True)
+        )
+        log(f"แจ้งเตือน Discord reconnect (ขาด {dur_text})", YELLOW, force_redraw=True)
+    except Exception as e:
+        log(f"ส่งแจ้งเตือน reconnect ไม่สำเร็จ: {e}", RED)
+
+# ================= Status Logic =================
+def get_status_text():
+    if STATE.get("bot_unresponsive", False):
+        return "⚠️ สถานะบอทไม่ตอบสนอง (ระบบค้าง)"
+    if STATE.get("paused", False):
+        return "⏸️ ตอนนี้อยู่ในเกมส์ (ปิดการรีจอย)"
+    if STATE.get("net_dropped", False):
+        return "🌐 เน็ตหลุด (กำลังรอสัญญาณ...)"
+    if STATE.get("loop_restarts", 0) > 0:
+        return f"⚠️ ลูปมีปัญหา (รีสตาร์ท {STATE['loop_restarts']} ครั้ง)"
+    if STATE.get("fail_count", 0) > 0:
+        return f"🔄 กำลังพยายาม Rejoin (ล้มเหลว {STATE['fail_count']} ครั้ง)"
+    return "🟢 บอททำงานปกติ (กำลังเฝ้าดูในเกม)"
+
+# ================= System Stats =================
+def get_discord_embed(dev_name, is_paused):
+    try:
+        with open("/proc/stat", "r") as f:
+            s1 = [int(i) for i in f.readline().split()[1:8]]
+        time.sleep(0.15)
+        with open("/proc/stat", "r") as f:
+            s2 = [int(i) for i in f.readline().split()[1:8]]
+        t1, t2 = sum(s1), sum(s2)
+        i1, i2 = s1[3] + s1[4], s2[3] + s2[4]
+        cpu_usage = round(100 * ((t2 - t1) - (i2 - i1)) / (t2 - t1), 2) if t2 - t1 > 0 else 0
+    except Exception:
+        cpu_usage = 0
+
+    try:
+        with open("/proc/meminfo", "r") as f:
+            lines = f.readlines()
+        mem_total = mem_avail = 0
+        for l in lines:
+            if l.startswith("MemTotal:"):
+                mem_total = int(l.split()[1])
+            elif l.startswith("MemAvailable:"):
+                mem_avail = int(l.split()[1])
+        mem_total_gb = round(mem_total / (1024 * 1024), 2)
+        mem_avail_pct = round((mem_avail / mem_total) * 100, 2) if mem_total > 0 else 0
+        mem_usage_pct = round(100 - mem_avail_pct, 2)
+    except Exception:
+        mem_total_gb = mem_avail_pct = mem_usage_pct = 0
+
+    try:
+        with open("/proc/uptime", "r") as f:
+            up_sec = float(f.readline().split()[0])
+        uptime_hrs = round(up_sec / 3600, 2)
+    except Exception:
+        uptime_hrs = 0
+
+    status_color = 0xf1c40f if is_paused else 0x3498db
+    embed = discord.Embed(color=status_color)
+    embed.add_field(name="🔹 Device Name", value=f"`{dev_name}`", inline=True)
+    embed.add_field(name="⚙️ CPU Usage", value=f"`{cpu_usage}%`", inline=True)
+    embed.add_field(name="💾 Memory Usage", value=f"`{mem_usage_pct}%`", inline=True)
+    embed.add_field(name="💾 Memory Available", value=f"`{mem_avail_pct}%`", inline=True)
+    embed.add_field(name="💡 Total Memory", value=f"`{mem_total_gb} GB`", inline=True)
+    embed.add_field(name="⏰ Uptime", value=f"`{uptime_hrs} hours`", inline=True)
+    return embed
+
+# ================= Join Game =================
+async def join_roblox_async(cfg):
+    place_id = str(cfg.get("place_id", "")).strip()
+    vip_code = str(cfg.get("vip_link_code", "")).strip()
+
+    if not valid_place_id(place_id) or not valid_vip(vip_code):
+        log("Place ID หรือ VIP Code ไม่ถูกต้อง", RED)
+        return False
+
+    log("กำลังปิดเกมและเคลียร์ Log...", YELLOW)
+    await abatch_root({
+        "stop": f"am force-stop {PACKAGE_NAME}",
+        "rmlog": f"rm -rf {GAME_LOG_DIR}/*.log {EXT_LOG_DIR}/*.log 2>/dev/null",
+        "ram": "sync && echo 3 > /proc/sys/vm/drop_caches",
+    })
+    await asyncio.sleep(3)
+
+    if vip_code:
+        deep_link = f"roblox://placeId={place_id}&linkCode={vip_code}"
+    else:
+        deep_link = f"roblox://placeId={place_id}"
+
+    res = await aroot(
+        f"am start -a android.intent.action.VIEW -d {shlex.quote(deep_link)} {PACKAGE_NAME}"
+    )
+    if not res or "Error:" in res or "Exception" in res or "unable to resolve" in res.lower():
+        log(f"❌ เปิดแอปไม่สำเร็จ: {res[:120] or 'ไม่มี output'}", RED)
+        return False
+
+    wait = int(cfg.get("join_wait_seconds", 35))
+    log(f"กำลังโหลดเข้าแมพ ({wait}s)...", GREEN)
+    await asyncio.sleep(wait)
+    return True
+
+def _rx(pattern, text):
+    return re.search(pattern, text, re.IGNORECASE) is not None
+
+_LOG_RX_273 = re.compile(r"\b(?:error\s*code\s*[:=]\s*(?:273|264)|disconnect[^\n]*\breason\s*[:=]\s*(?:273|264))\b", re.I)
+_LOG_RX_PSS4 = re.compile(r"\berror\s*code\s*[:=]?\s*pss4\b", re.I)
+_LOG_RX_267 = re.compile(r"\b(?:error\s*code\s*[:=]\s*267|disconnect[^\n]*\breason\s*[:=]\s*267)\b", re.I)
+_LOG_RX_277 = re.compile(r"\b(?:error\s*code\s*[:=]\s*(?:277|279)|disconnect[^\n]*\breason\s*[:=]\s*(?:277|279))\b", re.I)
+_LOG_RX_278 = re.compile(r"\b(?:error\s*code\s*[:=]\s*278|disconnect[^\n]*\breason\s*[:=]\s*278)\b", re.I)
+_LOG_RX_268 = re.compile(r"\b(?:error\s*code\s*[:=]\s*(?:268|272)|disconnect[^\n]*\breason\s*[:=]\s*(?:268|272))\b", re.I)
+_LOG_RX_26X = re.compile(r"\berror\s*code\s*[:=]\s*(?:260|261|262|524|529|773)\b", re.I)
+_LOG_RX_GEN = re.compile(r"disconnect\w*[^\n]*\breason\s*[:=]\s*(?:2[6-9]\d|5\d\d|6\d\d|7\d\d)\b", re.I)
+
+def extract_active_session_logs(raw_log_text):
+    if not raw_log_text:
+        return ""
+    lines = raw_log_text.splitlines()
+    last_join_idx = 0
+    for idx, line in enumerate(lines):
+        ll = line.lower()
+        if "! joining game" in ll or "joining game '" in ll or "connection accepted from" in ll:
+            last_join_idx = idx
+    return "\n".join(lines[last_join_idx:]).lower()
+
+def _build_health_commands(cfg, want_ui):
+    tail_n = max(800, int(cfg.get("log_tail_lines", 1000)))
+    log_expr = f'LATEST=$(ls -t {GAME_LOG_DIR}/*.log {EXT_LOG_DIR}/*.log 2>/dev/null | head -n 1)'
+    cmds = {
+        "pidof": f"pidof {PACKAGE_NAME} || true",
+        "focus": "dumpsys window windows | grep -E 'mCurrentFocus|mFocusedApp' || true",
+        "log_tail": f'{log_expr}; if [ -n "$LATEST" ]; then tail -n {tail_n} "$LATEST"; fi',
+        "log_age": f'{log_expr}; if [ -n "$LATEST" ]; then NOW=$(date +%s); MT=$(stat -c %Y "$LATEST" 2>/dev/null); if [ -n "$MT" ]; then echo $((NOW-MT)); fi; fi',
+    }
+    if want_ui:
+        cmds["ui_xml"] = f"uiautomator dump {UI_TMP} >/dev/null 2>&1; cat {UI_TMP} 2>/dev/null; rm -f {UI_TMP}"
+    return cmds
+
+def analyze_probe(cfg, probe):
+    if not probe.get("pidof", "").strip():
+        return False, "แอป Roblox ปิดตัวลง (App Crashed)"
+
+    focus = probe.get("focus", "")
+    if "com.android.vending" in focus or "Google Play" in focus:
+        return False, "เด้งไป Play Store (เกมบังคับอัปเดตแพทช์)"
+    if "Application Not Responding" in focus:
+        return False, "ตัวเกมค้างไม่ตอบสนอง (System ANR)"
+
+    active = extract_active_session_logs(probe.get("log_tail", ""))
+    if active:
+        if _LOG_RX_273.search(active) or "same account launched" in active \
+                or "same account is currently" in active or "from different device" in active:
+            return False, "ตรวจพบคนเข้าไอดีซ้อน! (Error Code: 273)"
+        if _LOG_RX_PSS4.search(active) or "datastores not loading" in active:
+            return False, "เซิร์ฟเวอร์โหลดข้อมูลไม่ขึ้น (Error PSS4 / 267)"
+        if _LOG_RX_267.search(active) or "you have been kicked" in active \
+                or "you were kicked" in active or "kicked by this experience" in active \
+                or "moderation message:" in active:
+            return False, "ถูกเตะออกจากแมพ (Error Code: 267)"
+        if _LOG_RX_277.search(active) or "please check your internet connection" in active \
+                or "lost connection to the game server" in active \
+                or "id_connection_lost" in active or "connection attempt failed" in active:
+            return False, "เน็ตหลุดหรือเซิร์ฟเวอร์ตัด (Error Code: 277)"
+        if _LOG_RX_278.search(active) or "idle 20 minutes" in active or "idledisconnect" in active:
+            return False, "ยืนนิ่งเกิน 20 นาที (Error Code: 278 AFK)"
+        if _LOG_RX_268.search(active) or "unexpected client behavior" in active or "security kick" in active:
+            return False, "เซิร์ฟเวอร์หรือระบบความปลอดภัยเตะ (Error: 268/272)"
+        if _LOG_RX_26X.search(active):
+            return False, "เชื่อมต่อแมพไม่สำเร็จ (Error: 529/524/26x)"
+        if _LOG_RX_GEN.search(active) or "disconnection notification" in active:
+            return False, "ถูกตัดการเชื่อมต่อจากเซิร์ฟเวอร์ (Disconnect)"
+
+    ui = probe.get("ui_xml", "")
+    if ui:
+        ul = ui.lower()
+        if any(k in ul for k in ("upgrade required", "update required", "needs to be updated", "please update")):
+            return False, "หน้าจอแจ้งให้อัปเดตเวอร์ชัน (Upgrade Required)"
+        if "same account launched" in ul or re.search(r"\berror\s*code\s*[:=]\s*273\b", ul):
+            return False, "ตรวจพบคนเข้าไอดีซ้อนบนจอ (Error 273)"
+        if "check your internet" in ul or re.search(r"\berror\s*code\s*[:=]\s*277\b", ul):
+            return False, "หน้าจอแจ้งเตือนเน็ตหลุด (Error 277)"
+        if "pss4" in ul or "datastores not loading" in ul:
+            return False, "เซิร์ฟเวอร์แมพมีปัญหา (Error Code PSS4)"
+        if "kicked by this experience" in ul or "you have been kicked" in ul:
+            return False, "ถูกเตะออกจากแมพ (Kicked by Experience)"
+        if "disconnected" in ul and ("error code" in ul or "leave" in ul or "reconnect" in ul):
+            return False, "หน้าจอแจ้งเตือนหลุดออกจากเกม (Disconnected)"
+        if ("log in" in ul and "sign up" in ul) or ("discover" in ul and "avatar" in ul and "connect" in ul):
+            return False, "เด้งออกกลับมาหน้าเมนูหลัก Roblox"
+
+    return True, "ปกติ"
+
+def analyze_stall(cfg, probe):
+    if not probe.get("pidof", "").strip():
+        return False, "แอป Roblox ปิดตัวลง (Watchdog)"
+
+    now = time.time()
+    grace = max(60, int(cfg.get("startup_grace_seconds", 90)))
+    if now - STATE.get("game_start_time", 0) < grace:
+        STATE["bg_count"] = 0
+        return True, "กำลังอยู่ในช่วงโหลดเกม"
+
+    stale_limit = max(90, int(cfg.get("log_stale_seconds", 180)))
+
+    try:
+        log_age = int(probe.get("log_age", "").strip())
+    except (TypeError, ValueError):
+        log_age = None
+
+    focus = probe.get("focus", "")
+    focus_known = bool(focus.strip())
+    roblox_focused = PACKAGE_NAME in focus
+
+    if focus_known and not roblox_focused:
+        STATE["bg_count"] = STATE.get("bg_count", 0) + 1
+    else:
+        STATE["bg_count"] = 0
+
+    if roblox_focused and log_age is not None and log_age >= stale_limit:
+        return False, f"Roblox เงียบ/ค้างนาน {log_age}s (Watchdog)"
+
+    if focus_known and not roblox_focused:
+        if log_age is None or log_age >= max(60, stale_limit // 2):
+            return False, "Roblox ไม่ได้อยู่หน้าจอและไม่มี Log ใหม่"
+        if STATE["bg_count"] >= 4:
+            return False, "Roblox หลุดไปอยู่เบื้องหลังนานเกินไป"
+
+    frozen_need = max(3, int(cfg.get("frozen_screen_checks", 6)))
+    if STATE.get("frozen_count", 0) >= frozen_need and (log_age is None or log_age >= 60):
+        return False, "หน้าจอนิ่งสนิทและไม่มี Log ใหม่ (น่าจะหลุด/ค้าง)"
+
+    return True, "ปกติ"
+
+def analyze_game_health(cfg):
+    probe = run_health_probe(cfg, want_ui=True)
+    healthy, reason = analyze_probe(cfg, probe)
+    if not healthy:
+        return False, reason
+    healthy, reason = analyze_stall(cfg, probe)
+    if not healthy:
+        return False, reason
+    dialog, sig = inspect_screen()
+    if dialog:
+        return False, "ตรวจพบกล่องแจ้งเตือน Disconnected บนหน้าจอเกม"
+    if sig:
+        if sig == STATE.get("last_frame_sig"):
+            STATE["frozen_count"] = STATE.get("frozen_count", 0) + 1
+        else:
+            STATE["frozen_count"] = 0
+            STATE["last_frame_sig"] = sig
+    return True, "ปกติ"
+
+def run_health_probe(cfg, want_ui=False):
+    return batch_root(_build_health_commands(cfg, want_ui), timeout=20)
+
+# ================= UI เมนู =================
+def print_ui(cfg):
+    fix_tty()
+    lines = [
+        "\033[2J\033[H",
+        f"  {BRIGHT_CYAN}╦═╗┌─┐  ╦┌─┐┬┌┐┌{RESET}   {BOLD_WHITE}R O B L O X   S M A R T   B O T{RESET}",
+        f"  {BRIGHT_CYAN}╠╦╝├┤   ║│ │││││{RESET}   {CYAN}Termux • Rooted • Discord Edition{RESET}",
+        f"  {BRIGHT_CYAN}╩╚═└─┘╚═╝└─┘┴┘└┘{RESET}",
+        f"  {BRIGHT_CYAN}──────────────────────────────────────────────{RESET}",
+        f"  {CYAN}• Place ID       :{RESET} {BOLD_WHITE}{cfg['place_id'] or 'ยังไม่ได้ตั้งค่า'}{RESET}",
+        f"  {CYAN}• Bot Token      :{RESET} {GREEN if cfg['bot_token'] else RED}{'✅ ติดตั้งแล้ว' if cfg['bot_token'] else '❌ ยังไม่มี'}{RESET}",
+        f"  {CYAN}• ผู้มีสิทธิ์สั่งงาน :{RESET} {GREEN if cfg['allowed_users'] else RED}{len(cfg['allowed_users'])} คน{RESET}",
+        f"  {CYAN}• Auto RAM       :{RESET} {GREEN}ทุกๆ {cfg.get('clear_ram_hours', 1)} ชั่วโมง{RESET}",
+        f"  {BRIGHT_CYAN}──────────────────────────────────────────────{RESET}",
+        f"  {BOLD_WHITE}1) ตั้งค่าแมพที่จะ Rejoin (Place ID / VIP)",
+        f"  2) ตั้งค่า Discord Bot & ผู้มีสิทธิ์สั่งงาน",
+        f"  3) เริ่มเดินระบบบอทเฝ้าจอ",
+        f"  4) ตั้งค่าเวลา Auto Clear RAM",
+        f"  0) ออกจากโปรแกรม{RESET}",
+        ""
+    ]
+    sys.stdout.write("\r\n".join(lines) + "\r\n")
+    sys.stdout.flush()
+
+def menu_1_set_map(cfg):
+    print(f"\n{BRIGHT_CYAN}--- [1] ตั้งค่าแมพสำหรับ Rejoin ---{RESET}")
+    pid = safe_input(f"ใส่เลข Place ID [{cfg['place_id']}]: ")
+    if pid:
+        if valid_place_id(pid):
+            cfg['place_id'] = pid
+        else:
+            print(f"{RED}✘ Place ID ต้องเป็นตัวเลขเท่านั้น{RESET}")
+    vip = safe_input("ใส่ VIP Link Code (ถ้าไม่มีกด Enter): ")
+    if valid_vip(vip):
+        cfg['vip_link_code'] = vip
+    else:
+        print(f"{RED}✘ VIP Code ไม่ถูกต้อง{RESET}")
+    save_config(cfg)
+    print(f"{GREEN}✔ บันทึกเรียบร้อย!{RESET}")
+    time.sleep(1.5)
+
+def menu_2_set_bot(cfg):
+    print(f"\n{BRIGHT_CYAN}--- [2] ตั้งค่า Discord Bot ---{RESET}")
+    token = safe_input("วาง Bot Token (Enter = ใช้ค่าเดิม): ")
+    if token:
+        cfg['bot_token'] = token
+    cid = safe_input(f"Channel ID [{cfg['channel_id']}]: ")
+    if cid:
+        if cid.isdigit():
+            cfg['channel_id'] = cid
+        else:
+            print(f"{RED}✘ Channel ID ต้องเป็นตัวเลข{RESET}")
+    print(f"{YELLOW}ผู้มีสิทธิ์: {cfg['allowed_users'] or 'ยังไม่มี'}{RESET}")
+    users = safe_input("Discord User ID (คั่นด้วย , / Enter = คงเดิม): ")
+    if users:
+        ids = [u.strip() for u in users.split(",") if u.strip()]
+        if ids and all(u.isdigit() for u in ids):
+            cfg['allowed_users'] = [int(u) for u in ids]
+        else:
+            print(f"{RED}✘ User ID ต้องเป็นตัวเลข{RESET}")
+    mins = safe_input(f"แคปหน้าจอทุกกี่นาที [{cfg['screenshot_minutes']}]: ")
+    if mins.isdigit() and int(mins) > 0:
+        cfg['screenshot_minutes'] = int(mins)
+    save_config(cfg)
+    print(f"{GREEN}✔ บันทึกเรียบร้อย{RESET}")
+    safe_input("\nกด Enter...")
+
+def menu_4_ram(cfg):
+    print(f"\n{BRIGHT_CYAN}--- [4] ตั้งค่า Auto Clear RAM ---{RESET}")
+    val = safe_input("เคลียร์แคชทุกกี่ชั่วโมง? (ขั้นต่ำ 0.1): ")
+    try:
+        if float(val) >= 0.1:
+            cfg['clear_ram_hours'] = float(val)
+            save_config(cfg)
+            print(f"{GREEN}✔ บันทึกแล้ว{RESET}")
+        else:
+            print(f"{RED}✘ ต้อง ≥ 0.1{RESET}")
+    except ValueError:
+        print(f"{RED}✘ ไม่ใช่ตัวเลข{RESET}")
+    safe_input("\nกด Enter...")
+
+# ================= Discord Messaging =================
+def spawn(coro):
+    t = asyncio.create_task(coro)
+    BG_TASKS.add(t)
+    t.add_done_callback(BG_TASKS.discard)
+    return t
+
+async def _safe_send(channel, **kwargs):
+    for attempt in range(3):
+        try:
+            return await channel.send(**kwargs)
+        except discord.HTTPException as e:
+            if attempt == 2:
+                log(f"ส่ง Discord ล้มเหลว 3 ครั้ง: {e}", RED)
+                return None
+            log(f"ส่ง Discord ล้มเหลว ({attempt + 1}/3): {e}", YELLOW)
+            await asyncio.sleep(2 ** attempt)
+    return None
+
+DASH_FILE = "original_dash.json"
+DASH = {"msg": None, "lock": None, "shot_time": None}
+
+def _load_dash_id():
+    try:
+        with open(DASH_FILE, "r", encoding="utf-8") as f:
+            return int(json.load(f).get("message_id", 0)) or None
+    except Exception:
+        return None
+
+def _save_dash_id(mid):
+    try:
+        with open(DASH_FILE, "w", encoding="utf-8") as f:
+            json.dump({"message_id": mid}, f)
+    except Exception:
+        pass
+
+async def _get_dash_msg(channel):
+    if DASH["msg"]:
+        return DASH["msg"]
+    mid = _load_dash_id()
+    if mid:
+        try:
+            DASH["msg"] = await channel.fetch_message(mid)
+            return DASH["msg"]
+        except Exception:
+            pass
+    return None
+
+async def send_bot_report(channel, message="", include_screenshot=False, force_new=False):
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    pause_tag = " ⏸️ `[PAUSED]`" if STATE["paused"] else ""
+
+    status_text = get_status_text()
+
+    last_rejoin_str = "ยังไม่เคย Rejoin"
+    if STATE.get("last_successful_rejoin", 0.0) > 0:
+        last_rejoin_str = datetime.fromtimestamp(STATE["last_successful_rejoin"]).strftime("%Y-%m-%d %H:%M:%S")
+
+    auto_rejoin_hrs = float(CFG.get('auto_rejoin_hours', 0.0))
+    if auto_rejoin_hrs > 0:
+        target_time = STATE.get("last_auto_rejoin", 0) + (auto_rejoin_hrs * 3600)
+        remain_sec = target_time - time.time()
+        if remain_sec > 0:
+            hours = int(remain_sec // 3600)
+            mins = int((remain_sec % 3600) // 60)
+            secs = int(remain_sec % 60)
+            if hours > 0:
+                auto_rejoin_text = f"อีก {hours} ชม. {mins} นาที"
+            elif mins > 0:
+                auto_rejoin_text = f"อีก {mins} นาที {secs} วินาที"
+            else:
+                auto_rejoin_text = f"อีก {secs} วินาที"
+        else:
+            auto_rejoin_text = "กำลังจะเริ่ม..."
+    else:
+        auto_rejoin_text = "ปิดใช้งาน"
+
+    content = f"🤖 **[ORIGINAL REPORT]**{pause_tag} (`{now_str}`)\n"
+    content += f"📌 **สถานะ:** {status_text}\n"
+
+    if message:
+        content += f"📝 **รายละเอียด:** {message}\n"
+
+    content += (f"🎮 **Place ID:** `{CFG['place_id']}`\n"
+                f"🔁 **Rejoin รวม:** {STATE['rejoin_total']} ครั้ง\n"
+                f"⏱️ **Rejoin ล่าสุด:** `{last_rejoin_str}`\n"
+                f"⏳ **บังคับรีจอยอัตโนมัติ:** `{auto_rejoin_text}`")
+
+    try:
+        embed = await asyncio.to_thread(get_discord_embed, STATE["dev_name"], STATE["paused"])
+        view = ControlView()
+        img_bytes = await asyncio.to_thread(capture_screenshot_bytes) if include_screenshot else None
+
+        def make_file():
+            return discord.File(io.BytesIO(img_bytes), filename="screenshot.png")
+
+        if img_bytes:
+            DASH["shot_time"] = datetime.now().strftime("%H:%M:%S")
+        elif DASH["shot_time"]:
+            content += f"\n🖼️ ภาพหน้าจอล่าสุดเมื่อ `{DASH['shot_time']}`"
+
+        if force_new:
+            if img_bytes:
+                await _safe_send(channel, content=content, embed=embed, file=make_file(), view=view)
+            else:
+                await _safe_send(channel, content=content, embed=embed, view=view)
+            return
+
+        if DASH["lock"] is None:
+            DASH["lock"] = asyncio.Lock()
+        async with DASH["lock"]:
+            msg = await _get_dash_msg(channel)
+            if msg:
+                try:
+                    kwargs = dict(content=content, embed=embed, view=view)
+                    if img_bytes:
+                        kwargs["attachments"] = [make_file()]
+                    else:
+                        kwargs["attachments"] = []
+                    await msg.edit(**kwargs)
+                    return
+                except discord.NotFound:
+                    DASH["msg"] = None
+                except discord.HTTPException as e:
+                    log(f"แก้ไขข้อความรายงานไม่สำเร็จ ({e})", YELLOW)
+                    DASH["msg"] = None
+
+            if img_bytes:
+                new_msg = await _safe_send(channel, content=content, embed=embed, file=make_file(), view=view)
+            else:
+                new_msg = await _safe_send(channel, content=content, embed=embed, view=view)
+            if new_msg:
+                DASH["msg"] = new_msg
+                _save_dash_id(new_msg.id)
+    except Exception as e:
+        log(f"ส่งรายงานพลาด: {e}", RED)
+
+async def do_rejoin(channel, done_message, reason="ไม่ระบุสาเหตุ"):
+    ok = False
+    async with STATE["lock"]:
+        cooldown = max(10, int(CFG.get("rejoin_cooldown_seconds", 45)))
+        since = time.time() - STATE.get("last_rejoin_attempt", 0.0)
+        if since < cooldown:
+            log(f"ข้าม Rejoin (cooldown {cooldown - since:.0f}s)", YELLOW)
+            return False
+        STATE["last_rejoin_attempt"] = time.time()
+
+        add_history("Rejoin", reason)
+
+        ok = await join_roblox_async(CFG)
+        if ok:
+            now = time.time()
+            STATE["game_start_time"] = now
+            STATE["last_ram_clear"] = now
+            STATE["last_screenshot"] = now
+            STATE["last_successful_rejoin"] = now
+            STATE["last_auto_rejoin"] = now
+            STATE["rejoin_total"] += 1
+            STATE["frozen_count"] = 0
+            STATE["last_frame_sig"] = None
+            STATE["bg_count"] = 0
+
+    if ok:
+        healthy, health_reason = await asyncio.to_thread(analyze_game_health, CFG)
+        if not healthy:
+            log(f"พบปัญหาหลังเข้าเกม: {health_reason}", RED)
+            add_history("Rejoin Failed", health_reason)
+            if channel:
+                await send_bot_report(channel, f"⚠️ **เข้าเกมแล้วติดปัญหาทันที:** {health_reason}", True)
+            return False
+        log("เข้าแมพสำเร็จ", GREEN, force_redraw=True)
+    else:
+        log("❌ Rejoin ล้มเหลว", RED, force_redraw=True)
+        add_history("Rejoin Failed", reason)
+
+    if channel:
+        await send_bot_report(channel, done_message if ok else "❌ Rejoin ไม่สำเร็จ", True)
+    return ok
+
+# ================= Modals =================
+class MapModal(discord.ui.Modal, title='ตั้งค่าเปลี่ยนแมพ (Change Map)'):
+    place_id_input = discord.ui.TextInput(label='Place ID', placeholder='ใส่เลข Place ID...', required=True)
+    vip_code_input = discord.ui.TextInput(label='VIP Link Code (ถ้ามี)', placeholder='เว้นว่างได้', required=False)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if not is_authorized(interaction.user.id):
+            return await interaction.response.send_message("⛔ ไม่มีสิทธิ์", ephemeral=True)
+        pid = self.place_id_input.value.strip()
+        vip = (self.vip_code_input.value or "").strip()
+        if not valid_place_id(pid) or not valid_vip(vip):
+            return await interaction.response.send_message("❌ ค่าไม่ถูกต้อง", ephemeral=True)
+        audit(interaction, f"change_map pid={pid}")
+        old_pid = CFG.get('place_id', '-')
+        CFG['place_id'] = pid
+        CFG['vip_link_code'] = vip
+        save_config(CFG)
+        add_history("Map Change", f"{old_pid} → {pid} โดย {interaction.user.name}")
+        log(f"เปลี่ยนแมพเป็น {pid}", YELLOW)
+        await interaction.response.send_message(f"✅ บันทึกแมพ `{pid}`! กำลังดึงเข้าเกม...", ephemeral=True)
+        spawn(do_rejoin(interaction.channel, f"✅ เปลี่ยนเป็นแมพ `{pid}` เสร็จสิ้น", f"เปลี่ยนแมพโดย {interaction.user.name}"))
+
+class AddScriptModal(discord.ui.Modal, title='📝 เพิ่มสคริปต์ฟาร์ม'):
+    filename_input = discord.ui.TextInput(label='ชื่อไฟล์ (.lua, .txt, .json)', placeholder='เช่น farm.lua หรือ config.txt', required=True, max_length=60)
+    script_input = discord.ui.TextInput(label='โค้ดสคริปต์ / เนื้อหาไฟล์', style=discord.TextStyle.paragraph, placeholder='loadstring(...) หรือข้อความ', required=True, max_length=4000)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if not is_authorized(interaction.user.id):
+            return await interaction.response.send_message("⛔ ไม่มีสิทธิ์", ephemeral=True)
+        path = str(CFG.get("autoexec_path", "")).strip()
+        filename = clean_filename(self.filename_input.value)
+        if not filename:
+            return await interaction.response.send_message("❌ ชื่อไฟล์ไม่ถูกต้อง (รองรับ .lua, .txt, .json, .cfg, .ini)", ephemeral=True)
+        if not valid_path(path):
+            return await interaction.response.send_message("❌ โฟลเดอร์ไม่ถูกต้อง", ephemeral=True)
+        audit(interaction, f"add_script file={filename}")
+        file_path = f"{path}/{filename}"
+        encoded = base64.b64encode(self.script_input.value.encode('utf-8')).decode('ascii')
+        cmd = f"mkdir -p {shlex.quote(path)} && echo {encoded} | base64 -d > {shlex.quote(file_path)}"
+        await aroot(cmd)
+        add_history("Script Added", f"{filename} → {path}")
+        await interaction.response.send_message(f"✅ สร้าง `{filename}` สำเร็จ!", ephemeral=True)
+        log(f"เพิ่มสคริปต์: {filename}", GREEN)
+
+class DeleteScriptModal(discord.ui.Modal, title='🗑️ ลบสคริปต์ฟาร์ม'):
+    filename_input = discord.ui.TextInput(label='ชื่อไฟล์ (รวมนามสกุล)', placeholder='เช่น farm.lua หรือ config.txt', required=True, max_length=60)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if not is_authorized(interaction.user.id):
+            return await interaction.response.send_message("⛔ ไม่มีสิทธิ์", ephemeral=True)
+        path = str(CFG.get("autoexec_path", "")).strip()
+        filename = clean_filename(self.filename_input.value)
+        if not filename or not valid_path(path):
+            return await interaction.response.send_message("❌ ไม่ถูกต้อง", ephemeral=True)
+        audit(interaction, f"del_script file={filename}")
+        file_path = f"{path}/{filename}"
+        q = shlex.quote(file_path)
+        res = await aroot(f"if [ -f {q} ]; then rm -f {q}; echo OK; else echo FAIL; fi")
+        if res == 'OK':
+            add_history("Script Deleted", f"{filename} → {path}")
+            await interaction.response.send_message(f"🗑️ ลบ `{filename}` แล้ว!", ephemeral=True)
+            log(f"ลบสคริปต์: {filename}", YELLOW)
+        else:
+            await interaction.response.send_message(f"❌ ไม่พบ `{filename}`", ephemeral=True)
+
+class SettingsModal(discord.ui.Modal, title='⚙️ แก้ไขการตั้งค่า (Settings)'):
+    def __init__(self):
+        super().__init__()
+        self.inp_pid = discord.ui.TextInput(label='Place ID', default=str(CFG.get('place_id', '')), required=True)
+        self.inp_sm = discord.ui.TextInput(label='รอบแคปหน้าจอ (นาที)', default=str(CFG.get('screenshot_minutes', 10)), required=True)
+        self.inp_rh = discord.ui.TextInput(label='รอบ Clear RAM (ชั่วโมง)', default=str(CFG.get('clear_ram_hours', 1.0)), required=True)
+        self.inp_auto_rejoin = discord.ui.TextInput(label='บังคับรีจอยอัตโนมัติ (ชั่วโมง, 0=ปิด)', default=str(CFG.get('auto_rejoin_hours', 0.0)), required=True)
+        self.inp_exec = discord.ui.TextInput(label='โฟลเดอร์ AutoExec', default=str(CFG.get('autoexec_path', '/sdcard/Delta/autoexec')), required=True)
+        for item in (self.inp_pid, self.inp_sm, self.inp_rh, self.inp_auto_rejoin, self.inp_exec):
+            self.add_item(item)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if not is_authorized(interaction.user.id):
+            return await interaction.response.send_message("⛔ ไม่มีสิทธิ์", ephemeral=True)
+        errors, updates = [], {}
+
+        pid = self.inp_pid.value.strip()
+        if valid_place_id(pid):
+            updates["place_id"] = pid
+        else:
+            errors.append("Place ID ต้องเป็นตัวเลข")
+
+        try:
+            sm = int(self.inp_sm.value)
+            if sm < 1:
+                raise ValueError
+            updates["screenshot_minutes"] = sm
+        except ValueError:
+            errors.append("รอบแคป ≥ 1")
+
+        try:
+            rh = float(self.inp_rh.value)
+            if rh < 0.1:
+                raise ValueError
+            updates["clear_ram_hours"] = rh
+        except ValueError:
+            errors.append("Clear RAM ≥ 0.1")
+
+        try:
+            arh = float(self.inp_auto_rejoin.value)
+            if arh < 0:
+                raise ValueError
+            updates["auto_rejoin_hours"] = arh
+        except ValueError:
+            errors.append("บังคับรีจอย ≥ 0")
+
+        exec_path = self.inp_exec.value.strip()
+        if valid_path(exec_path):
+            updates["autoexec_path"] = exec_path
+        else:
+            errors.append("โฟลเดอร์ไม่ถูกต้อง")
+
+        if errors:
+            return await interaction.response.send_message("❌ " + ", ".join(errors), ephemeral=True)
+
+        audit(interaction, "edit_settings")
+
+        old_arh = float(CFG.get('auto_rejoin_hours', 0.0))
+        new_arh = updates.get("auto_rejoin_hours", old_arh)
+        if old_arh != new_arh:
+            STATE["last_auto_rejoin"] = time.time()
+
+        CFG.update(updates)
+        save_config(CFG)
+        add_history("Settings", f"โดย {interaction.user.name}")
+        await interaction.response.send_message(
+            f"✅ **อัปเดตการตั้งค่าสำเร็จ**\n🎮 Place ID: `{CFG['place_id']}`\n⏰ บังคับรีจอย: `{CFG['auto_rejoin_hours']} ชม.`\n📂 AutoExec: `{CFG['autoexec_path']}`", ephemeral=True)
+        log("อัปเดตการตั้งค่าผ่าน Discord", GREEN)
+
+# ================= Control Buttons =================
+class ControlView(discord.ui.View):
+    def __init__(self, sync_buttons: bool = True):
+        super().__init__(timeout=None)
+        if sync_buttons:
+            is_paused = bool(STATE.get("paused", False))
+            self.btn_pause.disabled = is_paused
+            self.btn_resume.disabled = not is_paused
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if is_authorized(interaction.user.id):
+            try:
+                cid = interaction.data.get("custom_id", "?") if interaction.data else "?"
+                logger.info(f"[AUDIT] user={interaction.user.id} ({interaction.user}) custom_id={cid}")
+            except Exception:
+                pass
+            return True
+        await interaction.response.send_message("⛔ ไม่มีสิทธิ์", ephemeral=True)
+        log(f"ปฏิเสธสิทธิ์: {interaction.user}", RED)
+        return False
+
+    @discord.ui.button(label="📊 Get Stats", style=discord.ButtonStyle.primary, row=0, custom_id="btn_stats")
+    async def btn_stats(self, interaction, button):
+        log("เช็คสถานะจากปุ่ม", YELLOW)
+        await interaction.response.defer()
+        await send_bot_report(interaction.channel, "ตรวจสอบสถานะจากปุ่มกด", True)
+
+    @discord.ui.button(label="🔄 Force Rejoin", style=discord.ButtonStyle.success, row=0, custom_id="btn_rejoin")
+    async def btn_rejoin(self, interaction, button):
+        uid = interaction.user.id
+        now = time.time()
+        last = STATE["rejoin_per_user"].get(uid, 0.0)
+        remain = REJOIN_USER_COOLDOWN - (now - last)
+        if remain > 0:
+            return await interaction.response.send_message(f"⏳ รออีก **{remain:.0f} วินาที**", ephemeral=True)
+        STATE["rejoin_per_user"][uid] = now
+        log("Force Rejoin", YELLOW)
+        if STATE["lock"] and STATE["lock"].locked():
+            return await interaction.response.send_message("⏳ กำลัง Rejoin อยู่", ephemeral=True)
+        await interaction.response.send_message("🔄 กำลังบังคับ Rejoin...", delete_after=30)
+        spawn(do_rejoin(interaction.channel, "✅ Force Rejoin เสร็จสิ้น", f"กดปุ่มโดย {interaction.user.name}"))
+
+    @discord.ui.button(label="🛑 Stop Game", style=discord.ButtonStyle.danger, row=0, custom_id="btn_stop")
+    async def btn_stop(self, interaction, button):
+        log("สั่งปิดเกม", YELLOW)
+        await aroot(f"am force-stop {PACKAGE_NAME}")
+        add_history("Stop Game", f"โดย {interaction.user.name}")
+        await interaction.response.send_message("🛑 ปิดแอปแล้ว", delete_after=30)
+
+    @discord.ui.button(label="🧹 Clear RAM", style=discord.ButtonStyle.secondary, row=1, custom_id="btn_ram")
+    async def btn_ram(self, interaction, button):
+        log("เคลียร์ RAM", YELLOW)
+        await asyncio.to_thread(clear_system_ram)
+        STATE["last_ram_clear"] = time.time()
+        add_history("Clear RAM", f"โดย {interaction.user.name}")
+        await interaction.response.send_message("🧹 เคลียร์ RAM แล้ว!", delete_after=30)
+
+    @discord.ui.button(label="🧹 Clean Termux", style=discord.ButtonStyle.secondary, row=1, custom_id="btn_termux_junk")
+    async def btn_termux_junk(self, interaction, button):
+        log("เคลียร์ขยะ Termux", YELLOW)
+        await interaction.response.defer()
+        await asyncio.to_thread(clear_termux_junk)
+        add_history("Clean Termux", f"โดย {interaction.user.name}")
+        await interaction.followup.send("🧹 ลบขยะ Termux แล้ว!", delete_after=30)
+
+    @discord.ui.button(label="🗺️ Change Map", style=discord.ButtonStyle.secondary, row=1, custom_id="btn_map")
+    async def btn_map(self, interaction, button):
+        await interaction.response.send_modal(MapModal())
+
+    @discord.ui.button(label="⏸️ Pause Auto", style=discord.ButtonStyle.secondary, row=2, custom_id="btn_pause")
+    async def btn_pause(self, interaction, button):
+        if STATE["lock"] and STATE["lock"].locked():
+            return await interaction.response.send_message("⏳ กำลัง Rejoin", ephemeral=True)
+        if STATE["paused"]:
+            try:
+                await interaction.message.edit(view=ControlView())
+            except Exception:
+                pass
+            return await interaction.response.send_message("⚠️ Paused อยู่แล้ว", ephemeral=True)
+        STATE["paused"] = True
+        add_history("Pause", f"โดย {interaction.user.name}")
+        log("หยุดพักระบบ", YELLOW, force_redraw=True)
+        await interaction.response.send_message("⏸️ Pause แล้ว!", delete_after=30)
+        try:
+            await interaction.message.edit(view=ControlView())
         except Exception:
             pass
 
+    @discord.ui.button(label="▶️ Resume Auto", style=discord.ButtonStyle.success, row=2, custom_id="btn_resume")
+    async def btn_resume(self, interaction, button):
+        if STATE["lock"] and STATE["lock"].locked():
+            return await interaction.response.send_message("⏳ กำลัง Rejoin", ephemeral=True)
+        if not STATE["paused"]:
+            try:
+                await interaction.message.edit(view=ControlView())
+            except Exception:
+                pass
+            return await interaction.response.send_message("⚠️ ทำงานอยู่แล้ว", ephemeral=True)
+        STATE["paused"] = False
+        STATE["fail_count"] = 0
+        STATE["last_screenshot"] = time.time()
+        STATE["last_ram_clear"] = time.time()
+        STATE["last_auto_rejoin"] = time.time()
+        add_history("Resume", f"โดย {interaction.user.name}")
+        log("เดินระบบต่อ", GREEN, force_redraw=True)
+        await interaction.response.send_message("▶️ Resume แล้ว!", delete_after=30)
+        try:
+            await interaction.message.edit(view=ControlView())
+        except Exception:
+            pass
 
-# ═══════════════════════════════════════════════════════════════
-# MAIN
-# ═══════════════════════════════════════════════════════════════
-HELP_TEXT = f"""{BRIGHT_CYAN}
-╔══════════════════════════════════════════════════════════╗
-║  Discord Bot — Termux All-in-One                         ║
-╚══════════════════════════════════════════════════════════╝{RESET}
+    @discord.ui.button(label="🗑️ Clear Logs", style=discord.ButtonStyle.secondary, row=2, custom_id="btn_clear_logs")
+    async def btn_clear_logs(self, interaction, button):
+        log("ลบ Log เกม", YELLOW)
+        await aroot(f"rm -rf {GAME_LOG_DIR}/*.log {EXT_LOG_DIR}/*.log")
+        add_history("Clear Logs", f"โดย {interaction.user.name}")
+        await interaction.response.send_message("🗑️ ลบ Log แล้ว!", delete_after=30)
 
-{YELLOW}การใช้งาน:{RESET}
-  python {SCRIPT_PATH.name}              ติดตั้งและเริ่มบอท (ครั้งแรก)
-  python {SCRIPT_PATH.name} --foreground รันแบบ foreground (debug)
-  python {SCRIPT_PATH.name} --status     ดูสถานะ
-  python {SCRIPT_PATH.name} --restart    restart service
-  python {SCRIPT_PATH.name} --stop       หยุด service
-  python {SCRIPT_PATH.name} --uninstall  ลบ service ทั้งหมด
+    @discord.ui.button(label="⚙️ Edit Settings", style=discord.ButtonStyle.secondary, row=3, custom_id="btn_settings")
+    async def btn_settings(self, interaction, button):
+        await interaction.response.send_modal(SettingsModal())
 
-{YELLOW}Token:{RESET}
-  export DISCORD_TOKEN='...'   หรือ   echo '...' > {TOKEN_FILE}
+    @discord.ui.button(label="📂 Check AutoExec", style=discord.ButtonStyle.secondary, row=3, custom_id="btn_check_exec")
+    async def btn_check_exec(self, interaction, button):
+        """✅ FIX: แยก FOUND/NOT_DIR/NOT_FOUND + แสดง parent + รองรับโฟลเดอร์ว่าง"""
+        path = str(CFG.get("autoexec_path", "")).strip()
+        await interaction.response.defer()
 
-{YELLOW}คำสั่ง Termux ที่ใช้บ่อย:{RESET}
-  sv status {SERVICE_NAME}
-  sv restart {SERVICE_NAME}
-  tail -f {LOG_DIR / 'current'}
-"""
+        if not path:
+            return await interaction.followup.send("❌ ยังไม่ได้ตั้งค่า AutoExec Path")
+        if not valid_path(path):
+            return await interaction.followup.send(
+                f"❌ Path ไม่ถูกต้อง: `{path}`\n"
+                f"💡 ต้องขึ้นต้นด้วย `/sdcard`, `/storage`, `/data`, `/mnt`, `/system`, `/root`, `/vendor`"
+            )
 
+        q = shlex.quote(path)
+        script = (
+            f'echo "TARGET:{path}"; '
+            f'if [ -d {q} ]; then echo "STATUS:FOUND"; '
+            f'  echo "---LS---"; ls -la {q} 2>&1 | head -60; echo "---ENDLS---"; '
+            f'elif [ -e {q} ]; then echo "STATUS:NOT_DIR"; '
+            f'else echo "STATUS:NOT_FOUND"; '
+            f'  P=$(dirname {q}); '
+            f'  if [ -d "$P" ]; then echo "PARENT:FOUND:$P"; '
+            f'    echo "---PARENTLS---"; ls -1 "$P" 2>&1 | head -15; echo "---ENDPARENT---"; '
+            f'  else echo "PARENT:NOT_FOUND:$P"; '
+            f'  fi; '
+            f'fi'
+        )
+        res = await aroot(script)
 
-def main() -> None:
-    args = sys.argv[1:]
+        if "STATUS:FOUND" in res:
+            files = ""
+            if "---LS---" in res and "---ENDLS---" in res:
+                files = res.split("---LS---")[1].split("---ENDLS---")[0].strip()
+            # กรองบรรทัด . และ .. ออก แต่คงส่วนหัว (total ...)
+            lines = [ln for ln in files.splitlines() if not re.search(r"\s\.{1,2}\s*$", ln)]
+            body = "\n".join(lines) if lines else "(ว่างเปล่า)"
+            msg = f"📂 **พบโฟลเดอร์** `{path}`\n```\n{body[:1600]}\n```"
+            if len(lines) <= 1:
+                msg += "\n\n💡 กด **📝 Add Script** เพื่อสร้างไฟล์ (โฟลเดอร์ถูกสร้างให้อัตโนมัติ)"
+            return await interaction.followup.send(msg)
 
-    if "--help" in args or "-h" in args:
-        print(HELP_TEXT)
+        if "STATUS:NOT_DIR" in res:
+            return await interaction.followup.send(
+                f"⚠️ `{path}` มีอยู่แต่ **ไม่ใช่โฟลเดอร์**\n"
+                f"💡 ลองแก้ path ใน **⚙️ Edit Settings**"
+            )
+
+        extra = ""
+        if "PARENT:FOUND:" in res:
+            p = res.split("PARENT:FOUND:")[1].split("\n")[0].strip()
+            pc = ""
+            if "---PARENTLS---" in res and "---ENDPARENT---" in res:
+                pc = res.split("---PARENTLS---")[1].split("---ENDPARENT---")[0].strip()
+            extra = f"\n\n📁 **โฟลเดอร์แม่:** `{p}`\n```\n{pc[:800]}\n```"
+        elif "PARENT:NOT_FOUND:" in res:
+            p = res.split("PARENT:NOT_FOUND:")[1].split("\n")[0].strip()
+            extra = f"\n\n❌ โฟลเดอร์แม่ก็ไม่มี: `{p}`"
+
+        msg = (
+            f"❌ **ไม่พบโฟลเดอร์** `{path}`{extra}\n\n"
+            f"💡 **วิธีสร้าง:**\n"
+            f"• กดปุ่ม **📝 Add Script** (จะสร้างโฟลเดอร์ให้อัตโนมัติ)\n"
+            f"• หรือใช้ **⚙️ Edit Settings** แก้ path เป็นโฟลเดอร์ที่มีอยู่"
+        )
+        await interaction.followup.send(msg)
+
+    @discord.ui.button(label="📝 Add Script", style=discord.ButtonStyle.success, row=3, custom_id="btn_add_script")
+    async def btn_add_script(self, interaction, button):
+        await interaction.response.send_modal(AddScriptModal())
+
+    @discord.ui.button(label="❌ Del Script", style=discord.ButtonStyle.danger, row=3, custom_id="btn_del_script")
+    async def btn_del_script(self, interaction, button):
+        await interaction.response.send_modal(DeleteScriptModal())
+
+    @discord.ui.button(label="📜 ประวัติ (History)", style=discord.ButtonStyle.secondary, row=4, custom_id="btn_history")
+    async def btn_history(self, interaction, button):
+        """✅ FIX: แสดงสรุป + 20 รายการ + ไม่หายใน 30 วิ"""
+        await interaction.response.defer()
+        if not REJOIN_HISTORY:
+            return await interaction.followup.send("📜 ยังไม่มีประวัติการทำงาน")
+
+        counts = {}
+        for h in REJOIN_HISTORY:
+            a = h.get("action", "?")
+            counts[a] = counts.get(a, 0) + 1
+        summary = " | ".join(f"`{k}`: {v}" for k, v in counts.items())
+
+        lines = [
+            f"📜 **ประวัติการทำงาน** — ทั้งหมด **{len(REJOIN_HISTORY)}** รายการ",
+            f"📊 **สรุป:** {summary}",
+            "─────────────────────",
+        ]
+        for h in reversed(REJOIN_HISTORY[-20:]):
+            t = h.get("time", "-")
+            a = h.get("action", "-")
+            r = h.get("reason", "-")
+            lines.append(f"⏱️ `{t}` **{a}**\n> {r}")
+
+        msg = "\n".join(lines)
+        if len(msg) > 1950:
+            msg = msg[:1950] + "\n... (ตัดข้อความ)"
+        await interaction.followup.send(msg)
+
+    @discord.ui.button(label="🗑️ Clear History", style=discord.ButtonStyle.secondary, row=4, custom_id="btn_clear_history")
+    async def btn_clear_history(self, interaction, button):
+        count = len(REJOIN_HISTORY)
+        REJOIN_HISTORY.clear()
+        save_history()
+        log(f"ล้างประวัติ {count} รายการ", YELLOW)
+        add_history("History Cleared", f"โดย {interaction.user.name} ({count} รายการ)")
+        await interaction.response.send_message(f"🗑️ ล้างประวัติ {count} รายการแล้ว", delete_after=30)
+
+# ================= Start Bot Loop =================
+def menu_3_start_bot(cfg):
+    global DASHBOARD_ACTIVE, LAST_RESULT_TEXT
+
+    if not cfg['place_id'] or not cfg['bot_token'] or not cfg['channel_id']:
+        print(f"\n{RED}✘ กรุณาตั้งค่า Place ID, Bot Token, Channel ID ก่อน!{RESET}")
+        time.sleep(2)
+        return
+    if not cfg['allowed_users']:
+        print(f"\n{RED}✘ ยังไม่ได้ตั้งค่า Discord User ID (เมนู 2){RESET}")
+        time.sleep(3)
         return
 
-    if "--run-service" in args:
-        run_bot_foreground(service_mode=True)
-        return
+    subprocess.run(["termux-wake-lock"], stdin=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    STATE["dev_name"] = run_root_text("getprop ro.product.model") or "Android Device"
+    load_history()
+    add_history("Bot Start", "เริ่มระบบเฝ้าจอ")
 
-    if "--foreground" in args:
-        info("รันแบบ foreground (Ctrl+C เพื่อหยุด)")
-        run_bot_foreground(service_mode=False)
-        return
+    now = time.time()
+    STATE.update({
+        "paused": False, "last_screenshot": now, "last_ram_clear": now,
+        "game_start_time": now, "fail_count": 0, "loop_restarts": 0,
+        "net_dropped": False, "last_rejoin_attempt": 0.0, "lock": None,
+        "last_frame_sig": None, "frozen_count": 0, "bg_count": 0,
+        "check_count": 0, "discord_offline_since": 0.0, "rejoin_per_user": {},
+        "last_heartbeat": now, "bot_unresponsive": False,
+        "last_successful_rejoin": 0.0, "last_auto_rejoin": now,
+    })
+    _NET_CACHE_UNTIL[0] = 0.0
 
-    if "--status" in args:
-        show_status()
-        return
+    LAST_RESULT_TEXT = f"{YELLOW}⏳ กำลังเชื่อมต่อ Discord...{RESET}"
+    DASHBOARD_ACTIVE = True
+    print_bot_dashboard()
 
-    if "--stop" in args:
-        stop_service()
-        ok("หยุด service แล้ว")
-        return
+    intents = discord.Intents.default()
+    bot = commands.Bot(command_prefix="!", intents=intents)
+    ready_once = {"done": False}
 
-    if "--restart" in args:
-        if restart_service():
-            ok("restart สำเร็จ")
+    @tasks.loop(seconds=max(5, int(cfg['check_interval'])))
+    async def game_monitor_loop():
+        try:
+            STATE["last_heartbeat"] = time.time()
+            STATE["bot_unresponsive"] = False
+
+            if STATE["paused"] or (STATE["lock"] and STATE["lock"].locked()):
+                return
+
+            channel = bot.get_channel(int(cfg['channel_id']))
+
+            await check_discord_health(bot, channel)   # ✅ FIX: pass bot
+
+            if not await check_internet():
+                if not STATE["net_dropped"]:
+                    add_history("Net Drop", "ตรวจพบเน็ตหลุด")
+                STATE["net_dropped"] = True
+                log("⚠️ เน็ตหลุด! รอสัญญาณ...", RED, force_redraw=True)
+                return
+
+            if STATE.get("net_dropped"):
+                STATE["net_dropped"] = False
+                add_history("Net Restore", "เน็ตกลับมาเชื่อมต่อ")
+                log("🌐 เน็ตกลับมา! Rejoin...", YELLOW, force_redraw=True)
+                if channel:
+                    await send_bot_report(channel, "🌐 **เน็ตกลับมาแล้ว!** Rejoin...", True)
+                await do_rejoin(channel, "✅ Rejoin หลังเน็ตหลุดสำเร็จ", "เน็ตกลับมาเชื่อมต่อ")
+                return
+
+            STATE["check_count"] = STATE.get("check_count", 0) + 1
+            cycle = STATE["check_count"]
+            ui_n = max(1, int(cfg.get("ui_check_every_n", 3)))
+            screen_n = max(1, int(cfg.get("screen_check_every_n", 2)))
+            want_ui = (cycle % ui_n == 0)
+            want_screen = (cycle % screen_n == 0)
+
+            probe = await abatch_root(_build_health_commands(cfg, want_ui), timeout=20)
+
+            healthy, reason = analyze_probe(cfg, probe)
+            if healthy:
+                healthy, reason = analyze_stall(cfg, probe)
+
+            if healthy and want_screen:
+                dialog, sig = await asyncio.to_thread(inspect_screen)
+                if dialog:
+                    healthy, reason = False, "ตรวจพบกล่อง Disconnected บนหน้าจอ"
+                elif sig:
+                    if sig == STATE.get("last_frame_sig"):
+                        STATE["frozen_count"] = STATE.get("frozen_count", 0) + 1
+                    else:
+                        STATE["frozen_count"] = 0
+                        STATE["last_frame_sig"] = sig
+
+            now = time.time()
+
+            if not healthy:
+                log(f"⚠️ {reason}", RED, force_redraw=True)
+
+                if "อัปเดต" in reason or "Upgrade" in reason or "Play Store" in reason:
+                    STATE["paused"] = True
+                    await aroot(f"am force-stop {PACKAGE_NAME}")
+                    add_history("Auto Pause", f"ต้องอัปเดต: {reason}")
+                    if channel:
+                        await send_bot_report(channel, f"🚨 **หยุดอัตโนมัติ:** {reason}\n👉 *อัปเดตแอปแล้วกด ▶️ Resume*", True)
+                    return
+
+                STATE["fail_count"] += 1
+                fails = STATE["fail_count"]
+                delay = min(30 * (fails - 1), 300)
+                msg = f"⚠️ **ปัญหา:** {reason}\n🔄 Rejoin ครั้งที่ {fails}"
+                if delay:
+                    msg += f" (รอ {delay}s)"
+                if fails >= MAX_FAILS_ALERT:
+                    msg += "\n🚨 **Rejoin หลายครั้งติด!** ตรวจสอบเครื่อง/ไอดี"
+                if channel:
+                    await send_bot_report(channel, msg, True)
+                if delay:
+                    await asyncio.sleep(delay)
+                    if STATE["paused"]:
+                        return
+                await do_rejoin(channel, "✅ **Rejoin สำเร็จ**", f"ตรวจพบปัญหา: {reason}")
+                return
+
+            auto_rejoin_hrs = float(cfg.get('auto_rejoin_hours', 0.0))
+            if auto_rejoin_hrs > 0 and now - STATE.get("last_auto_rejoin", 0) >= auto_rejoin_hrs * 3600:
+                log(f"⏰ ถึงเวลาบังคับรีจอยอัตโนมัติ (รอบละ {auto_rejoin_hrs} ชม.)", YELLOW, force_redraw=True)
+                add_history("Auto Rejoin", f"รอบ {auto_rejoin_hrs} ชม.")
+                if channel:
+                    await send_bot_report(channel, f"⏰ **ถึงเวลาบังคับรีจอยอัตโนมัติ** (รอบละ {auto_rejoin_hrs} ชม.)", True)
+                await do_rejoin(channel, "✅ บังคับรีจอยอัตโนมัติสำเร็จ", f"ถึงเวลาบังคับรีจอยอัตโนมัติ ({auto_rejoin_hrs} ชม.)")
+                return
+
+            if STATE["fail_count"] and now - STATE["game_start_time"] > 180:
+                STATE["fail_count"] = 0
+
+            if now - STATE["last_ram_clear"] >= max(0.1, float(cfg.get('clear_ram_hours', 1))) * 3600:
+                await abatch_root({
+                    "ram": "sync && echo 3 > /proc/sys/vm/drop_caches",
+                })
+                await asyncio.to_thread(clear_termux_junk)
+                log("เคลียร์ RAM & Termux สำเร็จ", GREEN)
+                STATE["last_ram_clear"] = now
+
+            if now - STATE["last_screenshot"] >= max(1, int(cfg['screenshot_minutes'])) * 60:
+                log("แคปหน้าจอประจำรอบ", CYAN)
+                if channel:
+                    await send_bot_report(channel, "รายงานสถานะหน้าจอประจำรอบ", True)
+                STATE["last_screenshot"] = now
+
+            STATE["loop_restarts"] = 0
+
+        except Exception as e:
+            log(f"🔥 ข้อผิดพลาด: {e}", RED, force_redraw=True)
+            raise
+
+    @tasks.loop(seconds=WATCHDOG_INTERVAL)
+    async def bot_watchdog():
+        if STATE.get("paused") or STATE.get("last_heartbeat", 0) == 0:
+            return
+        elapsed = time.time() - STATE["last_heartbeat"]
+        limit = max(WATCHDOG_TIMEOUT, int(cfg['check_interval']) * 4)
+        if elapsed > limit and not STATE.get("bot_unresponsive"):
+            STATE["bot_unresponsive"] = True
+            log(f"🚨 บอทไม่ตอบสนองมานาน {int(elapsed)} วินาที!", RED, force_redraw=True)
+            channel = bot.get_channel(int(cfg['channel_id']))
+            if channel:
+                await send_bot_report(channel, f"🚨 **บอทไม่ตอบสนอง** (ลูปค้างนาน {int(elapsed)} วินาที)", force_new=True)
+
+    @game_monitor_loop.before_loop
+    async def before_game_monitor():
+        await bot.wait_until_ready()
+
+    @bot_watchdog.before_loop
+    async def before_watchdog():
+        await bot.wait_until_ready()
+
+    @game_monitor_loop.error
+    async def game_monitor_error(error):
+        STATE["loop_restarts"] += 1
+        log(f"🚨 ลูปพัง ({STATE['loop_restarts']}/{MAX_LOOP_RESTARTS})", RED, force_redraw=True)
+        if STATE["loop_restarts"] > MAX_LOOP_RESTARTS:
+            log("❌ หยุดรีสตาร์ทลูป", RED, force_redraw=True)
+            return
+        await asyncio.sleep(5)
+        game_monitor_loop.restart()
+
+    @bot.event
+    async def on_disconnect():
+        if STATE.get("discord_offline_since", 0) == 0:
+            STATE["discord_offline_since"] = time.time()
+            log("🔌 Discord หลุด (event)", RED, force_redraw=True)
+
+    @bot.event
+    async def on_ready():
+        log(f"✅ เชื่อมต่อ {bot.user.name} สำเร็จ!", GREEN, force_redraw=True)
+        if ready_once["done"]:
+            since = STATE.get("discord_offline_since", 0)
+            if since > 0:
+                STATE["discord_offline_since"] = 0
+                dur = time.time() - since
+                if dur >= DISCORD_OFFLINE_THRESHOLD:
+                    channel = bot.get_channel(int(cfg['channel_id']))
+                    if channel:
+                        await send_reconnect_alert(channel, dur)
+            return
+        ready_once["done"] = True
+
+        if STATE["lock"] is None:
+            STATE["lock"] = asyncio.Lock()
+        bot.add_view(ControlView(sync_buttons=False))
+
+        channel = bot.get_channel(int(cfg['channel_id']))
+        if channel:
+            await send_bot_report(channel, "🟢 เริ่มเดินระบบเฝ้าจอ Auto Rejoin แล้ว!")
         else:
-            error("restart ไม่สำเร็จ — ดู: sv status " + SERVICE_NAME)
+            log("⚠️ หา Channel ไม่เจอ", RED)
+
+        if not await aroot(f"pidof {PACKAGE_NAME}"):
+            log("เปิดเกมเข้าแมพครั้งแรก...", CYAN, force_redraw=True)
+            await do_rejoin(channel, "✅ เข้าแมพครั้งแรกเรียบร้อย", "เริ่มระบบครั้งแรก")
+
+        if not game_monitor_loop.is_running():
+            game_monitor_loop.start()
+        if not bot_watchdog.is_running():
+            bot_watchdog.start()
+
+    try:
+        bot.run(cfg['bot_token'], log_handler=None)
+    except discord.LoginFailure:
+        DASHBOARD_ACTIVE = False
+        fix_tty()
+        print(f"\n{RED}❌ Bot Token ไม่ถูกต้อง!{RESET}")
+        time.sleep(2)
         return
+    except KeyboardInterrupt:
+        pass
 
-    if "--uninstall" in args:
-        uninstall_service()
-        return
+    DASHBOARD_ACTIVE = False
+    fix_tty()
+    subprocess.run(["termux-wake-unlock"], stdin=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    add_history("Bot Stop", "ปิดระบบ")
+    print(f"\n\n{YELLOW}🛑 ปิดบอท (Offline){RESET}")
+    ans = safe_input("บังคับปิด Roblox ด้วยไหม? (y/n): ").lower()
+    if ans == 'y':
+        run_root_text(f"am force-stop {PACKAGE_NAME}")
+    time.sleep(1)
 
-    # ─── default: install + start ───
-    print(f"{BRIGHT_CYAN}╔══════════════════════════════════════════════════╗{RESET}")
-    print(f"{BRIGHT_CYAN}║   Discord Bot — Termux Installer                 ║{RESET}")
-    print(f"{BRIGHT_CYAN}╚══════════════════════════════════════════════════╝{RESET}")
-    print()
-
-    if not IS_TERMUX:
-        warn("ไม่ได้รันบน Termux → เข้าโหมด foreground")
-        run_bot_foreground(service_mode=False)
-        return
-
-    # ตรวจ token ก่อน
-    token = load_token(interactive=True)
-    if not token:
-        error("ไม่มี token — ยกเลิกการติดตั้ง")
-        sys.exit(1)
-
-    # ติดตั้ง service (ถ้ายังไม่มี)
-    if not is_installed():
-        if not install_service():
-            error("ติดตั้ง service ล้มเหลว")
-            sys.exit(1)
-    else:
-        ok("service ติดตั้งอยู่แล้ว")
-
-    # เริ่ม/restart
-    info("เริ่ม service...")
-    if is_running():
-        restart_service()
-    else:
-        start_service()
-
-    print()
-    if is_running():
-        print(f"{BRIGHT_GREEN}╔══════════════════════════════════════════════════╗{RESET}")
-        print(f"{BRIGHT_GREEN}║   🎉 บอทกำลังทำงานเบื้องหลัง!                    ║{RESET}")
-        print(f"{BRIGHT_GREEN}╚══════════════════════════════════════════════════╝{RESET}")
-        print()
-        print(f"   {CYAN}ดูสถานะ:{RESET}   python {SCRIPT_PATH.name} --status")
-        print(f"   {CYAN}ดู log :{RESET}   tail -f {LOG_DIR / 'current'}")
-        print(f"   {CYAN}หยุด  :{RESET}   python {SCRIPT_PATH.name} --stop")
-        print(f"   {CYAN}ลบ     :{RESET}   python {SCRIPT_PATH.name} --uninstall")
-    else:
-        error("service ไม่ทำงาน — ดู log:")
-        print(f"   tail -n 30 {LOG_DIR / 'current'}")
-
+# ================= Main =================
+def main():
+    CFG.update(load_config())
+    while True:
+        print_ui(CFG)
+        choice = safe_input(f"  {BOLD_WHITE}เลือกเมนู: {RESET}")
+        if choice == "1":
+            menu_1_set_map(CFG)
+        elif choice == "2":
+            menu_2_set_bot(CFG)
+        elif choice == "3":
+            menu_3_start_bot(CFG)
+        elif choice == "4":
+            menu_4_ram(CFG)
+        elif choice == "0":
+            sys.exit(0)
 
 if __name__ == "__main__":
     main()
