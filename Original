@@ -1,20 +1,3 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-Roblox Smart Bot (Termux • Rooted • Discord Edition) — เวอร์ชันปรับปรุง
-
-สรุปสิ่งที่ปรับปรุงจากเวอร์ชันเดิม:
-  • ป้องกัน false-positive: ถ้า su ไม่ตอบสนอง/timeout จะไม่ถือว่า "เกมปิด" แล้วสั่ง Rejoin
-  • Watchdog ไม่เตือนผิดระหว่าง Rejoin / รอ backoff อีกต่อไป
-  • ปุ่มที่ใช้ root ทำ defer() ก่อน (กัน Discord "interaction failed" เมื่อเกิน 3 วิ)
-  • รายงานไม่ลบภาพหน้าจอเก่าทิ้งเมื่อไม่ได้แคปใหม่ (ตรงกับข้อความ "ภาพล่าสุดเมื่อ ...")
-  • Force Rejoin / เปลี่ยนแมพ ไม่ถูก cooldown ของระบบอัตโนมัติบล็อกเงียบ ๆ
-  • อ่าน CPU ผ่าน root อัตโนมัติเมื่อ /proc/stat ถูกบล็อก (Android 8+)
-  • เขียนไฟล์ config/history แบบ atomic + สิทธิ์ 600, ตรวจชนิดข้อมูล config ตอนโหลด
-  • จำกัด path ที่เขียนไฟล์ได้ให้แคบลง, ตรวจผลการเขียนสคริปต์จริง
-  • ลูปหลักจับ exception เองและ backoff (ไม่หยุดทำงานถาวร), รองรับ on_resumed
-  • แก้ race ของ asyncio.Lock เมื่อเริ่มบอทซ้ำหลายครั้งจากเมนู
-"""
 import os
 import sys
 import time
@@ -34,6 +17,8 @@ import getpass
 import tempfile
 import traceback
 import unicodedata
+import signal
+from concurrent.futures import ThreadPoolExecutor
 from logging.handlers import RotatingFileHandler
 from datetime import datetime
 
@@ -76,6 +61,11 @@ REJOIN_USER_COOLDOWN = 30
 MAX_HISTORY_RECORDS = 50
 PROBE_FAIL_ALERT = 4          # root/probe ล้มเหลวติดกันกี่รอบถึงแจ้งเตือน
 DISCORD_MSG_LIMIT = 1990
+MONITOR_CYCLE_TIMEOUT = 900     # ลูปเฝ้าจอ 1 รอบ (รวม backoff + Rejoin) ห้ามเกินกี่วินาที
+REPORT_TIMEOUT = 30             # ส่งรายงาน Discord ห้ามเกินกี่วินาที (กันบล็อก Rejoin)
+REJOIN_HARD_TIMEOUT_EXTRA = 150 # เวลาเผื่อของ Rejoin นอกเหนือจาก join_wait_seconds
+FATAL_CONFIRM = 3               # ต้องเจออาการ "ต้องอัปเดต" ซ้ำกี่ครั้งถึงหยุดอัตโนมัติ
+FATAL_RETRY_SECONDS = 1800      # หยุดอัตโนมัติแล้ว ลองกลับมาทำงานเองหลังกี่วินาที
 
 # --- PERFORMANCE TUNABLES ---
 NET_CACHE_SECONDS = 30
@@ -103,6 +93,8 @@ DEFAULT_CONFIG = {
     "frozen_screen_checks": 6,
     "ui_check_every_n": 3,
     "screen_check_every_n": 2,
+    "frozen_hard_checks": 30,   # จอนิ่งกี่ครั้ง (ไม่สนว่า Log ขยับ) ถึง Rejoin; 0 = ปิด
+    "device_tweaks": True,      # ตั้งค่าเครื่องกัน Android ฆ่า Termux/ปิดจอ ตอนเริ่มบอท
 }
 
 CFG = {}
@@ -129,6 +121,9 @@ STATE = {
     "last_heartbeat": 0.0,
     "bot_unresponsive": False,
     "probe_fail": 0,
+    "auto_paused": False,
+    "auto_paused_at": 0.0,
+    "rejoin_started": 0.0,
 }
 BG_TASKS = set()
 REJOIN_HISTORY = []
@@ -406,6 +401,55 @@ def save_config(cfg):
     atomic_write_json(CONFIG_FILE, cfg, indent=4)
 
 # ================= Core Root =================
+# pool แยกสำหรับงาน root (ไม่ไปแย่ง default executor ของ discord.py/asyncio)
+ROOT_POOL = ThreadPoolExecutor(max_workers=16, thread_name_prefix="root")
+TIMEOUT_BIN = [False]   # เครื่องมีคำสั่ง `timeout` ฝั่ง root ไหม (ตรวจตอนเริ่มบอท)
+
+def _t(seconds, cmd):
+    """ครอบคำสั่งที่เสี่ยงค้าง (dumpsys/uiautomator/screencap) ด้วย timeout ฝั่ง root
+    ไม่ให้มีโพรเซสค้างสะสมในเครื่องเวลารันนาน ๆ"""
+    return f"timeout {int(seconds)} {cmd}" if TIMEOUT_BIN[0] else cmd
+
+def _kill_group(proc):
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except Exception:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+
+def _su_exec(cmd, timeout, want_stderr=False):
+    """รัน `su -c cmd` และ "ฆ่าทั้ง process group" เมื่อ timeout
+    (subprocess.run ธรรมดาอาจค้างถาวรถ้ามีลูกหลานถือ pipe อยู่)
+    คืน (returncode, stdout_bytes, stderr_bytes) / raise TimeoutExpired เมื่อเกินเวลา"""
+    proc = subprocess.Popen(
+        ["su", "-c", cmd],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE if want_stderr else subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    try:
+        out, err = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        _kill_group(proc)
+        try:
+            proc.communicate(timeout=3)
+        except Exception:
+            for p in (proc.stdout, proc.stderr):
+                try:
+                    if p:
+                        p.close()
+                except Exception:
+                    pass
+            try:
+                proc.wait(timeout=1)
+            except Exception:
+                pass
+        raise
+    return proc.returncode, out or b"", err or b""
+
 def batch_root(commands_map: dict, timeout=ROOT_TIMEOUT_DEFAULT) -> dict:
     if not commands_map:
         return {}
@@ -416,16 +460,8 @@ def batch_root(commands_map: dict, timeout=ROOT_TIMEOUT_DEFAULT) -> dict:
         parts.append(f'echo "<<E:{key}>>"')
     script = " ; ".join(parts)
     try:
-        res = subprocess.run(
-            ["su", "-c", script],
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            text=True,
-            timeout=timeout,
-            errors="replace"
-        )
-        output = res.stdout or ""
+        _, out, _ = _su_exec(script, timeout)
+        output = out.decode("utf-8", errors="replace")
     except Exception as e:
         logger.warning(f"batch_root ผิดพลาด: {e}")
         return {k: "" for k in commands_map}
@@ -442,27 +478,33 @@ def batch_root(commands_map: dict, timeout=ROOT_TIMEOUT_DEFAULT) -> dict:
             results[key] = ""
     return results
 
+async def _run_pool(fn, *args, hard_timeout):
+    """รันงานบล็อกใน ROOT_POOL พร้อมเพดานเวลาฝั่ง asyncio (กัน await ค้างตลอดไป)"""
+    loop = asyncio.get_running_loop()
+    return await asyncio.wait_for(
+        loop.run_in_executor(ROOT_POOL, lambda: fn(*args)), timeout=hard_timeout)
+
 async def abatch_root(commands_map: dict, timeout=ROOT_TIMEOUT_DEFAULT) -> dict:
-    return await asyncio.to_thread(batch_root, commands_map, timeout)
+    try:
+        return await _run_pool(batch_root, commands_map, timeout, hard_timeout=timeout + 10)
+    except Exception as e:
+        logger.warning(f"abatch_root เกินเวลา/ผิดพลาด: {e!r}")
+        return {k: "" for k in commands_map}
 
 def run_root_text(cmd, timeout=ROOT_TIMEOUT_DEFAULT):
     try:
-        res = subprocess.run(
-            ["su", "-c", cmd],
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            timeout=timeout,
-            errors="replace"
-        )
-        return res.stdout.strip()
+        _, out, _ = _su_exec(cmd, timeout)
+        return out.decode("utf-8", errors="replace").strip()
     except Exception as e:
         logger.warning(f"run_root_text ผิดพลาด: {e}")
         return ""
 
 async def aroot(cmd, timeout=ROOT_TIMEOUT_DEFAULT):
-    return await asyncio.to_thread(run_root_text, cmd, timeout)
+    try:
+        return await _run_pool(run_root_text, cmd, timeout, hard_timeout=timeout + 10)
+    except Exception as e:
+        logger.warning(f"aroot เกินเวลา/ผิดพลาด: {e!r}")
+        return ""
 
 def has_root():
     return run_root_text("id -u", timeout=10) == "0"
@@ -492,24 +534,16 @@ def clear_termux_junk():
 
 def capture_screenshot_bytes():
     try:
-        res = subprocess.run(
-            ["su", "-c", "screencap -p"],
-            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE, timeout=20
-        )
-        if res.returncode == 0 and res.stdout.startswith(PNG_MAGIC):
-            return res.stdout
+        rc, out, _ = _su_exec(_t(15, "screencap -p"), 20)
+        if rc == 0 and out.startswith(PNG_MAGIC):
+            return out
     except Exception:
         pass
     try:
-        cmd = f"screencap -p {SCREEN_TMP} && cat {SCREEN_TMP}; rm -f {SCREEN_TMP}"
-        res = subprocess.run(
-            ["su", "-c", cmd],
-            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE, timeout=20
-        )
-        if res.stdout.startswith(PNG_MAGIC):
-            return res.stdout
+        cmd = f"{_t(15, 'screencap -p ' + SCREEN_TMP)} && cat {SCREEN_TMP}; rm -f {SCREEN_TMP}"
+        _, out, _ = _su_exec(cmd, 20)
+        if out.startswith(PNG_MAGIC):
+            return out
     except Exception:
         pass
     return None
@@ -517,12 +551,7 @@ def capture_screenshot_bytes():
 # ================= Screen Capture =================
 def grab_raw_frame():
     try:
-        res = subprocess.run(
-            ["su", "-c", "screencap"],
-            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE, timeout=15
-        )
-        buf = res.stdout
+        _, buf, _ = _su_exec(_t(12, "screencap"), 15)
     except Exception:
         return None
     if not buf or len(buf) < 100000:
@@ -707,6 +736,8 @@ def get_status_text():
     if STATE.get("bot_unresponsive", False):
         return "⚠️ สถานะบอทไม่ตอบสนอง (ระบบค้าง)"
     if STATE.get("paused", False):
+        if STATE.get("auto_paused", False):
+            return "⏸️ หยุดอัตโนมัติ (ต้องอัปเดตเกม — จะลองใหม่เอง)"
         return "⏸️ ตอนนี้อยู่ในเกมส์ (ปิดการรีจอย)"
     if STATE.get("net_dropped", False):
         return "🌐 เน็ตหลุด (กำลังรอสัญญาณ...)"
@@ -841,12 +872,13 @@ def _build_health_commands(cfg, want_ui):
     cmds = {
         "alive": "echo 1",  # ใช้ยืนยันว่า su ทำงานจริง (แยกจากกรณี pidof ว่าง = เกมปิด)
         "pidof": f"pidof {PACKAGE_NAME} || true",
-        "focus": "dumpsys window windows | grep -E 'mCurrentFocus|mFocusedApp' || true",
+        "focus": _t(5, "dumpsys window windows") + " | grep -E 'mCurrentFocus|mFocusedApp' || true",
+        "wake": _t(3, "dumpsys power") + " | grep -m1 mWakefulness= || true",
         "log_tail": f'{log_expr}; if [ -n "$LATEST" ]; then tail -n {tail_n} "$LATEST"; fi',
         "log_age": f'{log_expr}; if [ -n "$LATEST" ]; then NOW=$(date +%s); MT=$(stat -c %Y "$LATEST" 2>/dev/null); if [ -n "$MT" ]; then echo $((NOW-MT)); fi; fi',
     }
     if want_ui:
-        cmds["ui_xml"] = f"uiautomator dump {UI_TMP} >/dev/null 2>&1; cat {UI_TMP} 2>/dev/null; rm -f {UI_TMP}"
+        cmds["ui_xml"] = f"{_t(8, 'uiautomator dump ' + UI_TMP)} >/dev/null 2>&1; cat {UI_TMP} 2>/dev/null; rm -f {UI_TMP}"
     return cmds
 
 def probe_ok(probe):
@@ -859,7 +891,7 @@ def analyze_probe(cfg, probe):
         return False, "แอป Roblox ปิดตัวลง (App Crashed)"
 
     focus = probe.get("focus", "")
-    if "com.android.vending" in focus or "Google Play" in focus:
+    if "com.android.vending" in focus:
         return False, REASON_PLAY_STORE
     if "Application Not Responding" in focus:
         return False, "ตัวเกมค้างไม่ตอบสนอง (System ANR)"
@@ -929,7 +961,8 @@ def analyze_stall(cfg, probe):
 
     focus = probe.get("focus", "")
     focus_known = bool(focus.strip())
-    roblox_focused = PACKAGE_NAME in focus
+    # ถ้าอ่านโฟกัสไม่ได้ ให้ถือว่า Roblox อยู่หน้าจอ (เดิมจะข้ามการเช็ก Log ค้างไปเลย)
+    roblox_focused = (PACKAGE_NAME in focus) or not focus_known
 
     if focus_known and not roblox_focused:
         STATE["bg_count"] = STATE.get("bg_count", 0) + 1
@@ -948,6 +981,11 @@ def analyze_stall(cfg, probe):
     frozen_need = max(3, int(cfg.get("frozen_screen_checks", 6)))
     if STATE.get("frozen_count", 0) >= frozen_need and (log_age is None or log_age >= 60):
         return False, "หน้าจอนิ่งสนิทและไม่มี Log ใหม่ (น่าจะหลุด/ค้าง)"
+
+    # จอนิ่งนานมาก ๆ ให้ Rejoin แม้ Log ยังขยับ (เช่นค้างหน้า Disconnected แต่ Roblox ยังเขียน Log)
+    hard_need = int(cfg.get("frozen_hard_checks", 30))
+    if hard_need > 0 and STATE.get("frozen_count", 0) >= max(hard_need, frozen_need):
+        return False, "หน้าจอนิ่งสนิทนานเกินไป (Log ยังขยับแต่ภาพไม่เปลี่ยน)"
 
     return True, "ปกติ"
 
@@ -1134,7 +1172,7 @@ def _format_auto_rejoin_text():
         return f"อีก {mins} นาที {secs} วินาที"
     return f"อีก {secs} วินาที"
 
-async def send_bot_report(channel, message="", include_screenshot=False, force_new=False):
+async def _send_bot_report_impl(channel, message="", include_screenshot=False, force_new=False):
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     pause_tag = " ⏸️ `[PAUSED]`" if STATE["paused"] else ""
 
@@ -1200,6 +1238,17 @@ async def send_bot_report(channel, message="", include_screenshot=False, force_n
     except Exception as e:
         log(f"ส่งรายงานพลาด: {e}", RED)
 
+async def send_bot_report(channel, message="", include_screenshot=False, force_new=False):
+    """ครอบด้วย timeout: Discord ช้า/ล่ม/โดน rate limit ต้องไม่ทำให้ลูปเฝ้าจอหรือ Rejoin ค้างตาม"""
+    try:
+        await asyncio.wait_for(
+            _send_bot_report_impl(channel, message, include_screenshot, force_new),
+            timeout=REPORT_TIMEOUT)
+    except asyncio.TimeoutError:
+        log("⚠️ ส่งรายงาน Discord เกินเวลา ข้ามไปก่อน", YELLOW)
+    except Exception as e:
+        log(f"ส่งรายงานพลาด: {e}", RED)
+
 def touch_heartbeat():
     STATE["last_heartbeat"] = time.time()
     STATE["bot_unresponsive"] = False
@@ -1217,10 +1266,16 @@ async def do_rejoin(channel, done_message, reason="ไม่ระบุสา�
             log(f"ข้าม Rejoin (cooldown {cooldown - since:.0f}s)", YELLOW)
             return False
         STATE["last_rejoin_attempt"] = time.time()
+        STATE["rejoin_started"] = time.time()
 
         add_history("Rejoin", reason)
 
-        ok = await join_roblox_async(CFG)
+        hard = max(5, int(CFG.get("join_wait_seconds", 35))) + REJOIN_HARD_TIMEOUT_EXTRA
+        try:
+            ok = await asyncio.wait_for(join_roblox_async(CFG), timeout=hard)
+        except asyncio.TimeoutError:
+            log("❌ Rejoin ค้างเกินเวลา ยกเลิกรอบนี้ (จะลองใหม่)", RED, force_redraw=True)
+            ok = False
         if ok:
             now = time.time()
             STATE["game_start_time"] = now
@@ -1236,7 +1291,13 @@ async def do_rejoin(channel, done_message, reason="ไม่ระบุสา�
     touch_heartbeat()
 
     if ok:
-        healthy, health_reason = await asyncio.to_thread(analyze_game_health, CFG)
+        try:
+            healthy, health_reason = await asyncio.wait_for(
+                asyncio.get_running_loop().run_in_executor(ROOT_POOL, analyze_game_health, CFG),
+                timeout=90)
+        except Exception as e:
+            logger.warning(f"ตรวจสุขภาพหลัง Rejoin เกินเวลา/ผิดพลาด: {e!r}")
+            healthy, health_reason = True, "ข้ามการตรวจหลังเข้าเกม"
         touch_heartbeat()
         if not healthy:
             log(f"พบปัญหาหลังเข้าเกม: {health_reason}", RED)
@@ -1482,6 +1543,7 @@ class ControlView(discord.ui.View):
                 pass
             return await interaction.response.send_message("⚠️ Paused อยู่แล้ว", ephemeral=True)
         STATE["paused"] = True
+        STATE["auto_paused"] = False      # หยุดโดยคน = ไม่ resume เอง
         add_history("Pause", f"โดย {interaction.user.name}")
         log("หยุดพักระบบ", YELLOW, force_redraw=True)
         await interaction.response.send_message("⏸️ Pause แล้ว!", delete_after=30)
@@ -1501,6 +1563,7 @@ class ControlView(discord.ui.View):
                 pass
             return await interaction.response.send_message("⚠️ ทำงานอยู่แล้ว", ephemeral=True)
         STATE["paused"] = False
+        STATE["auto_paused"] = False
         STATE["fail_count"] = 0
         STATE["probe_fail"] = 0
         now = time.time()
@@ -1662,6 +1725,15 @@ def menu_3_start_bot(cfg):
 
     channel_id = int(cfg['channel_id'])
 
+    TIMEOUT_BIN[0] = bool(run_root_text("command -v timeout", timeout=10))
+    if cfg.get("device_tweaks", True):
+        # กัน Android ฆ่า Termux เบื้องหลัง/หน่วงงานตอนรันนาน ๆ (ไม่ถาวรทั้งหมด หายเมื่อรีบูตบางตัว)
+        run_root_text(
+            "dumpsys deviceidle whitelist +com.termux >/dev/null 2>&1; "
+            "settings put global settings_enable_monitor_phantom_procs false >/dev/null 2>&1; "
+            "device_config put activity_manager max_phantom_processes 2147483647 >/dev/null 2>&1; "
+            "svc power stayon true >/dev/null 2>&1; true", timeout=20)
+
     try:
         subprocess.run(["termux-wake-lock"], stdin=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except OSError:
@@ -1679,6 +1751,7 @@ def menu_3_start_bot(cfg):
         "check_count": 0, "discord_offline_since": 0.0, "rejoin_per_user": {},
         "last_heartbeat": now, "bot_unresponsive": False, "probe_fail": 0,
         "last_successful_rejoin": 0.0, "last_auto_rejoin": now,
+        "auto_paused": False, "auto_paused_at": 0.0, "rejoin_started": 0.0,
     })
     reset_dash_state()
     _NET_CACHE_UNTIL[0] = 0.0
@@ -1704,7 +1777,15 @@ def menu_3_start_bot(cfg):
             await asyncio.sleep(min(5, max(0.1, end - time.time())))
 
     async def monitor_cycle():
-        if STATE["paused"] or _rejoin_in_progress():
+        if STATE["paused"]:
+            # หยุดอัตโนมัติ (เช่น เกมต้องอัปเดต) ไม่ควรหยุดถาวร: ลองกลับมาทำงานเองเป็นระยะ
+            if STATE.get("auto_paused") and time.time() - STATE.get("auto_paused_at", 0) >= FATAL_RETRY_SECONDS:
+                STATE.update({"paused": False, "auto_paused": False, "fail_count": 0})
+                add_history("Auto Resume", "ลองใหม่หลังหยุดอัตโนมัติ (เผื่ออัปเดตแล้ว)")
+                log("▶️ ลองเดินระบบต่ออัตโนมัติ", YELLOW, force_redraw=True)
+            else:
+                return
+        if _rejoin_in_progress():
             return
 
         channel = get_channel()
@@ -1722,7 +1803,7 @@ def menu_3_start_bot(cfg):
             log("🌐 เน็ตกลับมา! Rejoin...", YELLOW, force_redraw=True)
             if channel:
                 await send_bot_report(channel, "🌐 **เน็ตกลับมาแล้ว!** Rejoin...", True)
-            await do_rejoin(channel, "✅ Rejoin หลังเน็ตหลุดสำเร็จ", "เน็ตกลับมาเชื่อมต่อ")
+            await do_rejoin(channel, "✅ Rejoin หลังเน็ตหลุดสำเร็จ", "เน็ตกลับมาเชื่อมต่อ", force=True)
             return
 
         STATE["check_count"] = STATE.get("check_count", 0) + 1
@@ -1744,6 +1825,11 @@ def menu_3_start_bot(cfg):
             return
         STATE["probe_fail"] = 0
 
+        wake = probe.get("wake", "")
+        if "Asleep" in wake or "Dozing" in wake:
+            log("📴 จอดับ/เครื่องหลับ → ปลุกเครื่อง", YELLOW)
+            await aroot("input keyevent KEYCODE_WAKEUP; wm dismiss-keyguard 2>/dev/null; true")
+
         healthy, reason = analyze_probe(cfg, probe)
         if healthy:
             healthy, reason = analyze_stall(cfg, probe)
@@ -1762,11 +1848,24 @@ def menu_3_start_bot(cfg):
             log(f"⚠️ {reason}", RED, force_redraw=True)
 
             if reason in FATAL_REASONS:
+                # ยืนยันซ้ำก่อน: ป๊อปอัปชั่วคราวไม่ควรทำให้บอทหยุดทำงาน
+                for _ in range(FATAL_CONFIRM - 1):
+                    await hb_sleep(20)
+                    p2 = await abatch_root(_build_health_commands(cfg, True), timeout=20)
+                    r2 = analyze_probe(cfg, p2)[1] if probe_ok(p2) else None
+                    if r2 != reason:
+                        log("ไม่ยืนยันอาการ 'ต้องอัปเดต' (น่าจะเป็นป๊อปอัปชั่วคราว) ข้ามรอบนี้", YELLOW)
+                        return
                 STATE["paused"] = True
+                STATE["auto_paused"] = True
+                STATE["auto_paused_at"] = time.time()
                 await aroot(f"am force-stop {PACKAGE_NAME}")
                 add_history("Auto Pause", f"ต้องอัปเดต: {reason}")
                 if channel:
-                    await send_bot_report(channel, f"🚨 **หยุดอัตโนมัติ:** {reason}\n👉 *อัปเดตแอปแล้วกด ▶️ Resume*", True)
+                    await send_bot_report(
+                        channel,
+                        f"🚨 **หยุดอัตโนมัติ:** {reason}\n👉 *อัปเดตแอปแล้วกด ▶️ Resume "
+                        f"(หรือรอ — บอทจะลองใหม่เองใน {FATAL_RETRY_SECONDS // 60} นาที)*", True)
                 return
 
             STATE["fail_count"] += 1
@@ -1816,17 +1915,17 @@ def menu_3_start_bot(cfg):
         touch_heartbeat()
         try:
             await check_discord_health(bot, get_channel())
-            await monitor_cycle()
+            await asyncio.wait_for(monitor_cycle(), timeout=MONITOR_CYCLE_TIMEOUT)
             STATE["loop_restarts"] = 0
         except Exception as e:
             STATE["loop_restarts"] += 1
             n = STATE["loop_restarts"]
             logger.error("monitor loop error:\n%s", traceback.format_exc())
-            log(f"🔥 ข้อผิดพลาดในลูป ({n}/{MAX_LOOP_RESTARTS}): {e}", RED, force_redraw=True)
+            log(f"🔥 ข้อผิดพลาดในลูป ({n}/{MAX_LOOP_RESTARTS}): {e!r}", RED, force_redraw=True)
             if n == MAX_LOOP_RESTARTS:
                 channel = get_channel()
                 if channel:
-                    await send_bot_report(channel, f"🚨 **ลูปเฝ้าจอผิดพลาดติดกัน {n} ครั้ง:** `{e}`", force_new=True)
+                    await send_bot_report(channel, f"🚨 **ลูปเฝ้าจอผิดพลาดติดกัน {n} ครั้ง:** `{e!r}`", force_new=True)
             await hb_sleep(min(60, 5 * n))   # backoff แล้วทำงานต่อ (ไม่หยุดถาวร)
         touch_heartbeat()
 
@@ -1835,8 +1934,10 @@ def menu_3_start_bot(cfg):
         flush_dashboard()
         if STATE.get("paused") or STATE.get("last_heartbeat", 0) == 0:
             return
-        if _rejoin_in_progress():      # ระหว่าง Rejoin ลูปหลักช้าเป็นเรื่องปกติ
-            return
+        if _rejoin_in_progress():
+            # Rejoin ปกติไม่กี่นาที — ถ้าล็อกค้างเกิน 10 นาทีถือว่าผิดปกติ ต้องไม่เงียบ
+            if time.time() - STATE.get("rejoin_started", 0) < 600:
+                return
         elapsed = time.time() - STATE["last_heartbeat"]
         limit = max(WATCHDOG_TIMEOUT, int(cfg['check_interval']) * 4)
         if elapsed > limit and not STATE.get("bot_unresponsive"):
@@ -1844,7 +1945,11 @@ def menu_3_start_bot(cfg):
             log(f"🚨 บอทไม่ตอบสนองมานาน {int(elapsed)} วินาที!", RED, force_redraw=True)
             channel = get_channel()
             if channel:
-                await send_bot_report(channel, f"🚨 **บอทไม่ตอบสนอง** (ลูปค้างนาน {int(elapsed)} วินาที)", force_new=True)
+                await send_bot_report(channel, f"🚨 **บอทไม่ตอบสนอง** (ลูปค้างนาน {int(elapsed)} วินาที) — กำลังรีสตาร์ทลูป", force_new=True)
+            try:
+                game_monitor_loop.restart()   # กู้เอง ไม่ต้องรอคนมากดแก้
+            except Exception as e:
+                logger.warning(f"restart loop ไม่สำเร็จ: {e!r}")
 
     @game_monitor_loop.before_loop
     async def before_game_monitor():
