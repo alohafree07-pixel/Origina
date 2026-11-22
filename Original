@@ -18,6 +18,8 @@ import tempfile
 import traceback
 import unicodedata
 import signal
+import hmac
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from logging.handlers import RotatingFileHandler
 from datetime import datetime
@@ -152,6 +154,8 @@ DEFAULT_CONFIG = {
     "device_tweaks": True,      # ตั้งค่าเครื่องกัน Android ฆ่า Termux/ปิดจอ ตอนเริ่มบอท
     "key_alert_enabled": True,  # ตรวจหน้าต่าง Delta ขอ Key (Welcome Back!) แล้วแท็ก Discord
     "key_alert_seconds": 60,    # แท็กซ้ำทุกกี่วินาทีตราบที่หน้าต่างยังอยู่ (ขั้นต่ำ 15)
+    "key_alert_delete": True,   # ลบข้อความแท็กเก่าอัตโนมัติ (ลบอันเก่าเมื่อแท็กใหม่ / ลบทั้งหมดเมื่อหน้าต่างหาย)
+    "use_discord": True,        # False = ไม่ใช้ Discord Bot (ตั้งแค่ Place ID ก็เฝ้า/Rejoin ได้)
 }
 
 CFG = {}
@@ -185,6 +189,7 @@ STATE = {
     "key_active": False,
     "key_since": 0.0,
     "last_key_alert": 0.0,
+    "key_msgs": [],
 }
 BG_TASKS = set()
 REJOIN_HISTORY = []
@@ -198,13 +203,166 @@ REASON_UPGRADE_UI = "หน้าจอแจ้งให้อัปเดต�
 FATAL_REASONS = {REASON_PLAY_STORE, REASON_UPGRADE_UI}
 REASON_PROBE_FAIL = "ข้ามการตรวจ (root ไม่ตอบสนอง)"
 
+# ================= เข้ารหัสไฟล์ข้อมูล (config / log / history / dash) =================
+# ใช้ไลบรารีมาตรฐานล้วน (ไม่ต้องติดตั้งเพิ่ม): คีย์ผูกกับ "เครื่องนี้" (Android ID + serial + รุ่น ผ่าน root)
+# → PBKDF2 ; เข้ารหัสด้วย keystream SHAKE-256 + ตรวจความถูกต้องด้วย HMAC-SHA256 (Encrypt-then-MAC)
+# ผลลัพธ์: คัดลอกโฟลเดอร์ RobloxBotData ไปเครื่องอื่นแล้วอ่าน/ใช้ token ไม่ได้ และไฟล์ที่ถูกแก้จะถูกตรวจพบ
+SEAL_MAGIC = b"RBE1"
+_APP_PEPPER = b"rbbot|seal|v1|9f3c1d7ab25e48f0"
+_KEY_CACHE = {}
+_KEY_LOCK = threading.Lock()
+_D_RETRY_AT = [0.0]          # ถ้าอ่านรหัสเครื่องไม่ได้ จะไม่ลองซ้ำถี่ ๆ (กัน su หน่วงทุกครั้งที่เขียน log)
+SECURE_WARNINGS = []         # ข้อความเตือนไว้แสดงตอนเปิดโปรแกรม
+
+class SealError(Exception):
+    pass
+
+def _device_fingerprint():
+    """รวมค่าประจำเครื่องผ่าน root; คืน None ถ้าอ่านไม่ได้"""
+    try:
+        _, out, _ = _su_exec(
+            "settings get secure android_id; getprop ro.serialno; getprop ro.boot.serialno; "
+            "getprop ro.product.brand; getprop ro.product.model; getprop ro.product.device", 10)
+        lines = [ln.strip() for ln in out.decode("utf-8", errors="replace").splitlines()]
+    except Exception:
+        return None
+    if not lines or not re.fullmatch(r"[0-9a-fA-F]{8,}", lines[0]):
+        return None
+    return "\n".join(lines)
+
+def _master_key(mode):
+    with _KEY_LOCK:
+        if mode in _KEY_CACHE:
+            return _KEY_CACHE[mode]
+        if mode == b"D":
+            if time.time() < _D_RETRY_AT[0]:
+                return None
+            fp = _device_fingerprint()
+            if fp is None:
+                _D_RETRY_AT[0] = time.time() + 60
+                return None
+            secret = fp.encode("utf-8")
+        elif mode == b"F":
+            # โหมดสำรองเมื่อไม่มี root: ผูกกับ user/โฟลเดอร์ Termux เท่านั้น (อ่อนกว่า)
+            secret = f"{os.getuid()}|{os.path.expanduser('~')}".encode("utf-8")
+        else:
+            return None
+        key = hashlib.pbkdf2_hmac("sha256", secret, _APP_PEPPER, 60000, 32)
+        _KEY_CACHE[mode] = key
+        return key
+
+def seal_mode_now():
+    return b"D" if _master_key(b"D") else b"F"
+
+def _subkeys(master):
+    return (hmac.new(master, b"enc", hashlib.sha256).digest(),
+            hmac.new(master, b"mac", hashlib.sha256).digest())
+
+def _xor(data, ks):
+    return (int.from_bytes(data, "big") ^ int.from_bytes(ks, "big")).to_bytes(len(data), "big")
+
+def seal(data):
+    mode = seal_mode_now()
+    enc_key, mac_key = _subkeys(_master_key(mode))
+    nonce = os.urandom(16)
+    ct = _xor(data, hashlib.shake_256(enc_key + nonce).digest(len(data)))
+    body = SEAL_MAGIC + mode + nonce + ct
+    return body + hmac.new(mac_key, body, hashlib.sha256).digest()
+
+def unseal(blob):
+    if len(blob) < 4 + 1 + 16 + 32 or not blob.startswith(SEAL_MAGIC):
+        raise SealError("รูปแบบไฟล์ไม่ถูกต้อง")
+    mode = blob[4:5]
+    master = _master_key(mode)
+    if master is None:
+        raise SealError("ต้องใช้ root เพื่ออ่านรหัสเครื่องก่อนถอดรหัส")
+    enc_key, mac_key = _subkeys(master)
+    body, tag = blob[:-32], blob[-32:]
+    if not hmac.compare_digest(tag, hmac.new(mac_key, body, hashlib.sha256).digest()):
+        raise SealError("ถอดรหัสไม่ได้ (คนละเครื่อง หรือไฟล์ถูกแก้ไข)")
+    nonce, ct = body[5:21], body[21:]
+    return _xor(ct, hashlib.shake_256(enc_key + nonce).digest(len(ct)))
+
+def is_sealed_file(path):
+    try:
+        with open(path, "rb") as f:
+            return f.read(4) == SEAL_MAGIC
+    except OSError:
+        return False
+
+def _quarantine(path, reason):
+    """ไฟล์ถอดรหัสไม่ได้ → เปลี่ยนชื่อเก็บไว้ (ไม่ลบ/ไม่ทับ) แล้วเตือนผู้ใช้"""
+    dst = f"{path}.unreadable-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+    try:
+        os.replace(path, dst)
+        SECURE_WARNINGS.append(f"{os.path.basename(path)}: {reason} → เก็บไว้ที่ {os.path.basename(dst)}")
+    except OSError:
+        SECURE_WARNINGS.append(f"{os.path.basename(path)}: {reason}")
+
+def read_secure_json(path):
+    """อ่านไฟล์ JSON ที่เข้ารหัส (รองรับไฟล์ JSON ธรรมดาของเวอร์ชันเก่าด้วย)"""
+    with open(path, "rb") as f:
+        raw = f.read()
+    if raw.startswith(SEAL_MAGIC):
+        try:
+            raw = unseal(raw)
+        except SealError as e:
+            _quarantine(path, str(e))
+            raise
+    return json.loads(raw.decode("utf-8"))
+
+def seal_plain_files():
+    """เข้ารหัสไฟล์เก่าที่ยังเป็น JSON ธรรมดาให้เรียบร้อย"""
+    for p in (CONFIG_FILE, HISTORY_FILE, DASH_FILE):
+        try:
+            if os.path.isfile(p) and not is_sealed_file(p):
+                atomic_write_json(p, read_secure_json(p))
+        except Exception as e:
+            logger.warning(f"เข้ารหัสไฟล์ {os.path.basename(p)} ไม่สำเร็จ: {e!r}")
+
+class SealedFormatter(logging.Formatter):
+    """แต่ละบรรทัดใน bot.log ถูกเข้ารหัส (base64) อ่านผ่านเมนู 5 หรือ python roblox_bot.py --log"""
+    def format(self, record):
+        try:
+            text = super().format(record)
+            return base64.b64encode(seal(text.encode("utf-8"))).decode("ascii")
+        except Exception:
+            return "[log-seal-error]"   # ห้ามหลุดเป็นข้อความธรรมดา
+
+def decode_log_line(line):
+    line = line.strip()
+    if not line:
+        return ""
+    try:
+        return unseal(base64.b64decode(line, validate=True)).decode("utf-8", errors="replace")
+    except Exception:
+        return line   # บรรทัดเก่าที่ยังไม่เข้ารหัส / ถอดไม่ได้ แสดงตามเดิม
+
+def show_log(n=40):
+    try:
+        size = os.path.getsize(LOG_FILE)
+        with open(LOG_FILE, "rb") as f:
+            f.seek(max(0, size - 256 * 1024))
+            lines = f.read().decode("utf-8", errors="replace").splitlines()[-n:]
+    except OSError:
+        print(f"{YELLOW}ยังไม่มีไฟล์ log{RESET}")
+        return
+    for ln in lines:
+        out = decode_log_line(ln)
+        if out:
+            print(out)
+
 # ================= Logging =================
 logger = logging.getLogger("rbbot")
 logger.setLevel(logging.INFO)
 try:
     _fh = RotatingFileHandler(LOG_FILE, maxBytes=512 * 1024, backupCount=2, encoding="utf-8")
-    _fh.setFormatter(logging.Formatter("%(asctime)s %(message)s"))
+    _fh.setFormatter(SealedFormatter("%(asctime)s %(message)s"))
     logger.addHandler(_fh)
+    try:
+        os.chmod(LOG_FILE, 0o600)
+    except OSError:
+        pass
 except OSError:
     pass
 
@@ -263,13 +421,14 @@ def is_authorized(user_id):
 
 # ================= ไฟล์ JSON แบบ atomic =================
 def atomic_write_json(path, data, **dump_kwargs):
-    """เขียนไฟล์ผ่าน temp แล้ว os.replace (กันไฟล์พังเมื่อโปรแกรมถูกปิดกลางคัน)
+    """เข้ารหัสแล้วเขียนผ่าน temp + os.replace (กันไฟล์พังเมื่อโปรแกรมถูกปิดกลางคัน)
     mkstemp สร้างไฟล์สิทธิ์ 600 ให้อยู่แล้ว เหมาะกับ config ที่มี token"""
     directory = os.path.dirname(os.path.abspath(path)) or "."
+    payload = seal(json.dumps(data, ensure_ascii=False, **dump_kwargs).encode("utf-8"))
     fd, tmp = tempfile.mkstemp(prefix=".tmp_", dir=directory)
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, **dump_kwargs)
+        with os.fdopen(fd, "wb") as f:
+            f.write(payload)
         os.replace(tmp, path)
     except Exception:
         try:
@@ -282,8 +441,7 @@ def atomic_write_json(path, data, **dump_kwargs):
 def load_history():
     try:
         if os.path.exists(HISTORY_FILE):
-            with open(HISTORY_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
+            data = read_secure_json(HISTORY_FILE)
             if isinstance(data, list):
                 REJOIN_HISTORY.clear()
                 REJOIN_HISTORY.extend(x for x in data[-MAX_HISTORY_RECORDS:] if isinstance(x, dict))
@@ -437,8 +595,7 @@ def load_config():
     cfg = json.loads(json.dumps(DEFAULT_CONFIG))
     if os.path.exists(CONFIG_FILE):
         try:
-            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
+            data = read_secure_json(CONFIG_FILE)
             if isinstance(data, dict):
                 cfg.update({k: v for k, v in data.items() if k in DEFAULT_CONFIG})
         except Exception as e:
@@ -456,6 +613,7 @@ def load_config():
         elif isinstance(default, str):
             cfg[key] = "" if cfg[key] is None else str(cfg[key]).strip()
     cfg["allowed_users"] = _clean_user_ids(cfg.get("allowed_users"))
+    cfg["use_discord"] = bool(cfg.get("use_discord", True))
     return cfg
 
 def save_config(cfg):
@@ -1139,8 +1297,14 @@ def print_ui(cfg):
         f"  {BRIGHT_CYAN}╩╚═└─┘╚═╝└─┘┴┘└┘{RESET}",
         f"  {BRIGHT_CYAN}──────────────────────────────────────────────{RESET}",
         f"  {CYAN}• Place ID       :{RESET} {BOLD_WHITE}{cfg['place_id'] or 'ยังไม่ได้ตั้งค่า'}{RESET}",
-        f"  {CYAN}• Bot Token      :{RESET} {GREEN if cfg['bot_token'] else RED}{'✅ ติดตั้งแล้ว' if cfg['bot_token'] else '❌ ยังไม่มี'}{RESET}",
-        f"  {CYAN}• ผู้มีสิทธิ์สั่งงาน :{RESET} {GREEN if cfg['allowed_users'] else RED}{len(cfg['allowed_users'])} คน{RESET}",
+        f"  {CYAN}• โหมดการทำงาน  :{RESET} {GREEN if cfg.get('use_discord', True) else YELLOW}"
+        f"{'ใช้ Discord Bot' if cfg.get('use_discord', True) else 'ไม่ใช้ Discord (เฝ้าจอ/Rejoin อย่างเดียว)'}{RESET}",
+        f"  {CYAN}• Bot Token      :{RESET} "
+        + (f"{GREEN if cfg['bot_token'] else RED}{'✅ ติดตั้งแล้ว' if cfg['bot_token'] else '❌ ยังไม่มี'}{RESET}"
+           if cfg.get('use_discord', True) else f"{YELLOW}— (ไม่ใช้){RESET}"),
+        f"  {CYAN}• ผู้มีสิทธิ์สั่งงาน :{RESET} "
+        + (f"{GREEN if cfg['allowed_users'] else RED}{len(cfg['allowed_users'])} คน{RESET}"
+           if cfg.get('use_discord', True) else f"{YELLOW}— (ไม่ใช้){RESET}"),
         f"  {CYAN}• Auto RAM       :{RESET} {GREEN}ทุกๆ {cfg.get('clear_ram_hours', 1)} ชั่วโมง{RESET}",
         f"  {CYAN}• แจ้งเตือน Key   :{RESET} {GREEN if cfg.get('key_alert_enabled', True) else RED}"
         f"{('เปิด (แท็กทุก ' + str(max(15, int(cfg.get('key_alert_seconds', 60)))) + ' วิ)') if cfg.get('key_alert_enabled', True) else 'ปิด'}{RESET}",
@@ -1150,6 +1314,7 @@ def print_ui(cfg):
         f"  2) ตั้งค่า Discord Bot & ผู้มีสิทธิ์สั่งงาน",
         f"  3) เริ่มเดินระบบบอทเฝ้าจอ",
         f"  4) ตั้งค่าเวลา Auto Clear RAM",
+        f"  5) อ่านบันทึก (Log) ที่ถูกเข้ารหัส",
         f"  0) ออกจากโปรแกรม{RESET}",
         ""
     ]
@@ -1197,6 +1362,11 @@ def menu_2_set_bot(cfg):
         cfg['screenshot_minutes'] = int(mins)
     save_config(cfg)
     print(f"{GREEN}✔ บันทึกเรียบร้อย{RESET}")
+    safe_input("\nกด Enter...")
+
+def menu_5_log():
+    print(f"\n{BRIGHT_CYAN}--- [5] Log ล่าสุด (ถอดรหัสให้เฉพาะเครื่องนี้) ---{RESET}")
+    show_log(40)
     safe_input("\nกด Enter...")
 
 def menu_4_ram(cfg):
@@ -1247,8 +1417,7 @@ def reset_dash_state():
 
 def _load_dash_id():
     try:
-        with open(DASH_FILE, "r", encoding="utf-8") as f:
-            return int(json.load(f).get("message_id", 0)) or None
+        return int(read_secure_json(DASH_FILE).get("message_id", 0)) or None
     except Exception:
         return None
 
@@ -1364,6 +1533,22 @@ async def send_bot_report(channel, message="", include_screenshot=False, force_n
         log(f"ส่งรายงานพลาด: {e}", RED)
 
 # ================= แจ้งเตือนหน้าต่าง Delta ขอ Key =================
+async def delete_key_messages(keep_last=False):
+    """ลบข้อความแท็กเรื่อง Key ที่บอทเคยส่ง (บอทลบข้อความตัวเองได้ ไม่ต้องมีสิทธิ์ Manage Messages)
+    keep_last=True = เก็บอันล่าสุดไว้ ลบเฉพาะอันเก่า"""
+    msgs = list(STATE.get("key_msgs", []))
+    if keep_last:
+        targets, STATE["key_msgs"] = msgs[:-1], msgs[-1:]
+    else:
+        targets, STATE["key_msgs"] = msgs, []
+    for m in targets:
+        try:
+            await m.delete()
+        except discord.NotFound:
+            pass
+        except Exception as e:
+            logger.warning(f"ลบข้อความแจ้งเตือน Key ไม่สำเร็จ: {e!r}")
+
 async def send_key_alert(channel, interval):
     """แท็กผู้มีสิทธิ์ทุกคนใน Discord พร้อมภาพหน้าจอ (ข้อความใหม่ทุกครั้ง เพื่อให้มีแจ้งเตือนเด้งจริง)"""
     mentions = " ".join(f"<@{uid}>" for uid in CFG.get("allowed_users", []))
@@ -1378,8 +1563,12 @@ async def send_key_alert(channel, interval):
         kwargs = dict(content=content, allowed_mentions=discord.AllowedMentions(users=True))
         if img_bytes:
             kwargs["file"] = discord.File(io.BytesIO(img_bytes), filename="key_panel.png")
-        await asyncio.wait_for(_safe_send(channel, **kwargs), timeout=REPORT_TIMEOUT)
+        sent = await asyncio.wait_for(_safe_send(channel, **kwargs), timeout=REPORT_TIMEOUT)
         log("🔑 แท็ก Discord: พบหน้าต่าง Key", YELLOW, force_redraw=True)
+        if sent is not None and CFG.get("key_alert_delete", True):
+            STATE.setdefault("key_msgs", []).append(sent)
+            # ส่งอันใหม่ก่อนค่อยลบอันเก่า เพื่อให้แจ้งเตือนยังเด้งตามปกติ
+            await delete_key_messages(keep_last=True)
     except asyncio.TimeoutError:
         log("⚠️ ส่งแจ้งเตือน Key เกินเวลา", YELLOW)
     except Exception as e:
@@ -1413,8 +1602,10 @@ async def handle_key_panel(channel, seen, can_clear):
         if was_active:
             add_history("Key Panel Cleared", f"หน้าต่าง Key หายไปแล้ว (ค้าง {waited} วินาที)")
             log("✅ หน้าต่าง Key หายไปแล้ว", GREEN, force_redraw=True)
+            await delete_key_messages()
             if channel:
-                await _safe_send(channel, content=f"✅ **หน้าต่าง Delta ขอ Key หายไปแล้ว** (ค้างอยู่ {waited // 60} นาที {waited % 60} วินาที)")
+                extra = {"delete_after": 30} if CFG.get("key_alert_delete", True) else {}
+                await _safe_send(channel, content=f"✅ **หน้าต่าง Delta ขอ Key หายไปแล้ว** (ค้างอยู่ {waited // 60} นาที {waited % 60} วินาที)", **extra)
 
 def touch_heartbeat():
     STATE["last_heartbeat"] = time.time()
@@ -1458,6 +1649,7 @@ async def do_rejoin(channel, done_message, reason="ไม่ระบุสา�
             STATE["key_hits"] = 0
             STATE["key_active"] = False
             STATE["last_key_alert"] = 0.0
+            await delete_key_messages()
 
     touch_heartbeat()
 
@@ -1877,24 +2069,42 @@ class ControlView(discord.ui.View):
 def menu_3_start_bot(cfg):
     global DASHBOARD_ACTIVE, LAST_RESULT_TEXT
 
-    if not cfg['place_id'] or not cfg['bot_token'] or not cfg['channel_id']:
-        print(f"\n{RED}✘ กรุณาตั้งค่า Place ID, Bot Token, Channel ID ก่อน!{RESET}")
+    if not cfg['place_id']:
+        print(f"\n{RED}✘ กรุณาตั้งค่า Place ID ก่อน (เมนู 1)!{RESET}")
         time.sleep(2)
         return
-    if not str(cfg['channel_id']).isdigit():
-        print(f"\n{RED}✘ Channel ID ต้องเป็นตัวเลข (เมนู 2){RESET}")
-        time.sleep(2)
-        return
-    if not cfg['allowed_users']:
-        print(f"\n{RED}✘ ยังไม่ได้ตั้งค่า Discord User ID (เมนู 2){RESET}")
-        time.sleep(3)
-        return
+
+    # เลือกก่อนเริ่มว่าจะใช้ Discord Bot ไหม (Enter = ใช้ตามที่ตั้งไว้ล่าสุด)
+    cur = bool(cfg.get('use_discord', True))
+    print(f"\n{BRIGHT_CYAN}--- [3] เริ่มระบบเฝ้าจอ ---{RESET}")
+    print(f"{CYAN}• y = ใช้ Discord Bot (รายงาน/ปุ่มควบคุม/แท็กแจ้งเตือน ต้องตั้ง Token, Channel, User ID){RESET}")
+    print(f"{CYAN}• n = ไม่ใช้ Discord (ใช้แค่ Place ID — เฝ้าจอและ Rejoin อัตโนมัติอย่างเดียว){RESET}")
+    ans = safe_input(f"ใช้ Discord Bot ไหม? (y/n, Enter = {'y' if cur else 'n'}): ").lower()
+    use_discord = cur if ans == "" else (ans in ("y", "yes", "ใช่"))
+    if use_discord != cur:
+        cfg['use_discord'] = use_discord
+        save_config(cfg)
+
+    if use_discord:
+        if not cfg['bot_token'] or not cfg['channel_id']:
+            print(f"\n{RED}✘ โหมด Discord ต้องตั้งค่า Bot Token, Channel ID ก่อน (เมนู 2){RESET}")
+            print(f"{YELLOW}  (หรือเลือก n เพื่อรันโดยไม่ใช้ Discord){RESET}")
+            time.sleep(3)
+            return
+        if not str(cfg['channel_id']).isdigit():
+            print(f"\n{RED}✘ Channel ID ต้องเป็นตัวเลข (เมนู 2){RESET}")
+            time.sleep(2)
+            return
+        if not cfg['allowed_users']:
+            print(f"\n{RED}✘ ยังไม่ได้ตั้งค่า Discord User ID (เมนู 2){RESET}")
+            time.sleep(3)
+            return
     if not has_root():
         print(f"\n{RED}✘ ใช้ root (su) ไม่ได้ — ตรวจสอบสิทธิ์ root ของ Termux ก่อน{RESET}")
         time.sleep(3)
         return
 
-    channel_id = int(cfg['channel_id'])
+    channel_id = int(cfg['channel_id']) if use_discord else 0
 
     TIMEOUT_BIN[0] = bool(run_root_text("command -v timeout", timeout=10))
     if cfg.get("device_tweaks", True):
@@ -1924,20 +2134,25 @@ def menu_3_start_bot(cfg):
         "last_successful_rejoin": 0.0, "last_auto_rejoin": now,
         "auto_paused": False, "auto_paused_at": 0.0, "rejoin_started": 0.0,
         "key_hits": 0, "key_active": False, "key_since": 0.0, "last_key_alert": 0.0,
+        "key_msgs": [],
     })
     reset_dash_state()
     _NET_CACHE_UNTIL[0] = 0.0
 
-    LAST_RESULT_TEXT = f"{YELLOW}⏳ กำลังเชื่อมต่อ Discord...{RESET}"
+    LAST_RESULT_TEXT = (f"{YELLOW}⏳ กำลังเชื่อมต่อ Discord...{RESET}" if use_discord
+                        else f"{YELLOW}⏳ เริ่มโหมดไม่ใช้ Discord...{RESET}")
     DASHBOARD_ACTIVE = True
     print_bot_dashboard()
 
-    intents = discord.Intents.default()
-    bot = commands.Bot(command_prefix="!", intents=intents)
+    bot = None
+    if use_discord:
+        intents = discord.Intents.default()
+        bot = commands.Bot(command_prefix="!", intents=intents)
     ready_once = {"done": False}
 
     def get_channel():
-        return bot.get_channel(channel_id)
+        # โหมดไม่ใช้ Discord: ไม่มี channel → ทุกจุดที่ส่งรายงานจะถูกข้ามเอง (โค้ดเดิมเช็ก `if channel` อยู่แล้ว)
+        return bot.get_channel(channel_id) if bot else None
 
     async def hb_sleep(seconds):
         """หน่วงเวลาแบบอัปเดต heartbeat เป็นช่วง ๆ (กัน Watchdog เตือนผิดระหว่าง backoff)"""
@@ -2097,7 +2312,8 @@ def menu_3_start_bot(cfg):
     async def game_monitor_loop():
         touch_heartbeat()
         try:
-            await check_discord_health(bot, get_channel())
+            if bot:
+                await check_discord_health(bot, get_channel())
             await asyncio.wait_for(monitor_cycle(), timeout=MONITOR_CYCLE_TIMEOUT)
             STATE["loop_restarts"] = 0
         except Exception as e:
@@ -2134,44 +2350,20 @@ def menu_3_start_bot(cfg):
             except Exception as e:
                 logger.warning(f"restart loop ไม่สำเร็จ: {e!r}")
 
+    async def wait_ready():
+        if bot:
+            await bot.wait_until_ready()
+
     @game_monitor_loop.before_loop
     async def before_game_monitor():
-        await bot.wait_until_ready()
+        await wait_ready()
 
     @bot_watchdog.before_loop
     async def before_watchdog():
-        await bot.wait_until_ready()
+        await wait_ready()
 
-    @bot.event
-    async def on_disconnect():
-        if STATE.get("discord_offline_since", 0) == 0:
-            STATE["discord_offline_since"] = time.time()
-            log("🔌 Discord หลุด (event)", RED, force_redraw=True)
-
-    @bot.event
-    async def on_resumed():
-        # resume session ไม่ยิง on_ready ซ้ำ จึงต้องเคลียร์สถานะ offline ที่นี่
-        log("🔌 Discord resume สำเร็จ", GREEN)
-        await handle_discord_back(get_channel())
-
-    @bot.event
-    async def on_ready():
-        log(f"✅ เชื่อมต่อ {bot.user.name} สำเร็จ!", GREEN, force_redraw=True)
-        if ready_once["done"]:
-            await handle_discord_back(get_channel())
-            return
-        ready_once["done"] = True
-
-        if STATE["lock"] is None:
-            STATE["lock"] = asyncio.Lock()
-        bot.add_view(ControlView(sync_buttons=False))
-
-        channel = get_channel()
-        if channel:
-            await send_bot_report(channel, "🟢 เริ่มเดินระบบเฝ้าจอ Auto Rejoin แล้ว!")
-        else:
-            log("⚠️ หา Channel ไม่เจอ", RED)
-
+    async def start_services(channel):
+        """เริ่มลูปเฝ้าจอ + Watchdog และเข้าแมพครั้งแรกถ้าเกมยังไม่เปิด (ใช้ร่วมกันทั้งสองโหมด)"""
         touch_heartbeat()
         if not game_monitor_loop.is_running():
             game_monitor_loop.start()
@@ -2180,19 +2372,64 @@ def menu_3_start_bot(cfg):
 
         if not await aroot(f"pidof {PACKAGE_NAME}"):
             log("เปิดเกมเข้าแมพครั้งแรก...", CYAN, force_redraw=True)
-            # ใช้ spawn เพื่อไม่บล็อก on_ready (lock ถูกจับทันที ลูปหลักจึงข้ามรอบเอง)
+            # ใช้ spawn เพื่อไม่บล็อก (lock ถูกจับทันที ลูปหลักจึงข้ามรอบเอง)
             spawn(do_rejoin(channel, "✅ เข้าแมพครั้งแรกเรียบร้อย", "เริ่มระบบครั้งแรก", force=True))
 
-    try:
-        bot.run(cfg['bot_token'], log_handler=None)
-    except discord.LoginFailure:
-        DASHBOARD_ACTIVE = False
-        fix_tty()
-        print(f"\n{RED}❌ Bot Token ไม่ถูกต้อง!{RESET}")
-        time.sleep(2)
-        return
-    except KeyboardInterrupt:
-        pass
+    if bot:
+        @bot.event
+        async def on_disconnect():
+            if STATE.get("discord_offline_since", 0) == 0:
+                STATE["discord_offline_since"] = time.time()
+                log("🔌 Discord หลุด (event)", RED, force_redraw=True)
+
+        @bot.event
+        async def on_resumed():
+            # resume session ไม่ยิง on_ready ซ้ำ จึงต้องเคลียร์สถานะ offline ที่นี่
+            log("🔌 Discord resume สำเร็จ", GREEN)
+            await handle_discord_back(get_channel())
+
+        @bot.event
+        async def on_ready():
+            log(f"✅ เชื่อมต่อ {bot.user.name} สำเร็จ!", GREEN, force_redraw=True)
+            if ready_once["done"]:
+                await handle_discord_back(get_channel())
+                return
+            ready_once["done"] = True
+
+            if STATE["lock"] is None:
+                STATE["lock"] = asyncio.Lock()
+            bot.add_view(ControlView(sync_buttons=False))
+
+            channel = get_channel()
+            if channel:
+                await send_bot_report(channel, "🟢 เริ่มเดินระบบเฝ้าจอ Auto Rejoin แล้ว!")
+            else:
+                log("⚠️ หา Channel ไม่เจอ", RED)
+
+            await start_services(channel)
+
+        try:
+            bot.run(cfg['bot_token'], log_handler=None)
+        except discord.LoginFailure:
+            DASHBOARD_ACTIVE = False
+            fix_tty()
+            print(f"\n{RED}❌ Bot Token ไม่ถูกต้อง!{RESET}")
+            time.sleep(2)
+            return
+        except KeyboardInterrupt:
+            pass
+    else:
+        async def standalone_main():
+            if STATE["lock"] is None:
+                STATE["lock"] = asyncio.Lock()
+            log("✅ เริ่มโหมดไม่ใช้ Discord (เฝ้าจอ/Rejoin อย่างเดียว)", GREEN, force_redraw=True)
+            await start_services(None)
+            await asyncio.Event().wait()   # รันไปเรื่อย ๆ จนกด Ctrl+C
+
+        try:
+            asyncio.run(standalone_main())
+        except KeyboardInterrupt:
+            pass
 
     DASHBOARD_ACTIVE = False
     fix_tty()
@@ -2209,12 +2446,35 @@ def menu_3_start_bot(cfg):
 
 # ================= Main =================
 def main():
+    if "--log" in sys.argv:
+        show_log(80)
+        return
+    print(f"{CYAN}🔐 กำลังเตรียมระบบเข้ารหัสไฟล์ข้อมูล...{RESET}")
+    if seal_mode_now() == b"F":
+        print(f"{YELLOW}⚠️ อ่านรหัสเครื่องผ่าน root ไม่ได้ ใช้โหมดสำรอง (ผูกกับ Termux เท่านั้น) — "
+              f"เปิดโปรแกรมใหม่เมื่อ root พร้อม ไฟล์จะอัปเกรดเป็นโหมดผูกเครื่องอัตโนมัติ{RESET}")
+        time.sleep(1.5)
     if MIGRATED_FILES:
         logger.info(f"ย้ายไฟล์เวอร์ชันเก่าเข้า {DATA_DIR}: {', '.join(MIGRATED_FILES)}")
         print(f"{GREEN}📁 ย้ายไฟล์ตั้งค่าเดิมเข้าโฟลเดอร์ {DATA_DIR} แล้ว: {', '.join(MIGRATED_FILES)}{RESET}")
         time.sleep(1.5)
     CFG.update(load_config())
     load_history()
+    seal_plain_files()
+    if seal_mode_now() == b"D":
+        # ไฟล์ที่เคยเข้ารหัสด้วยโหมดสำรอง → อัปเกรดเป็นโหมดผูกเครื่อง
+        for p in (CONFIG_FILE, HISTORY_FILE, DASH_FILE):
+            try:
+                with open(p, "rb") as f:
+                    if f.read(5) == SEAL_MAGIC + b"F":
+                        atomic_write_json(p, read_secure_json(p))
+            except Exception:
+                pass
+    if SECURE_WARNINGS:
+        for w in SECURE_WARNINGS:
+            print(f"{RED}🔒 {w}{RESET}")
+        print(f"{YELLOW}   (ไฟล์เดิมไม่ถูกลบ — ถ้าเป็นแค่ root ไม่ตอบสนองชั่วคราว ให้เปลี่ยนชื่อกลับแล้วเปิดใหม่){RESET}")
+        time.sleep(4)
     try:
         while True:
             print_ui(CFG)
@@ -2227,6 +2487,8 @@ def main():
                 menu_3_start_bot(CFG)
             elif choice == "4":
                 menu_4_ram(CFG)
+            elif choice == "5":
+                menu_5_log()
             elif choice == "0":
                 sys.exit(0)
             elif choice:
