@@ -44,10 +44,64 @@ ORANGE = "\033[38;5;208m"
 RED = "\033[91m"
 RESET = "\033[0m"
 
-CONFIG_FILE = "original_config.json"
-LOG_FILE = "original_bot.log"
-HISTORY_FILE = "rejoin_history.json"
-DASH_FILE = "original_dash.json"
+# ================= โฟลเดอร์เก็บข้อมูลของโปรแกรม =================
+# สร้างอัตโนมัติตอนรัน: <โฟลเดอร์ที่วางสคริปต์>/RobloxBotData
+# เก็บ config / log / ประวัติ / dashboard ไว้ที่เดียว หาเจอง่าย
+APP_DIR_NAME = "RobloxBotData"
+
+def _script_dir():
+    try:
+        return os.path.dirname(os.path.abspath(__file__))
+    except NameError:
+        return os.getcwd()
+
+def _pick_data_dir():
+    """เลือกที่สร้างโฟลเดอร์ข้อมูล: ข้างสคริปต์ → ~ (home) → โฟลเดอร์ปัจจุบัน"""
+    for root in (_script_dir(), os.path.expanduser("~"), os.getcwd()):
+        d = os.path.join(root, APP_DIR_NAME)
+        try:
+            os.makedirs(d, mode=0o700, exist_ok=True)
+            if os.access(d, os.W_OK):
+                return d
+        except OSError:
+            continue
+    return os.getcwd()
+
+DATA_DIR = _pick_data_dir()
+
+# ชื่อไฟล์เดิม (เวอร์ชันเก่าวางไว้ข้างสคริปต์) → ชื่อใหม่ในโฟลเดอร์ข้อมูล
+LEGACY_FILES = {
+    "original_config.json": "config.json",
+    "original_bot.log": "bot.log",
+    "rejoin_history.json": "rejoin_history.json",
+    "original_dash.json": "dash.json",
+}
+
+def migrate_legacy_files():
+    """ย้ายไฟล์ตั้งค่า/ประวัติของเวอร์ชันเก่าเข้าโฟลเดอร์ข้อมูล (ไม่ทับไฟล์ใหม่ที่มีอยู่แล้ว)"""
+    moved = []
+    for old, new in LEGACY_FILES.items():
+        dst = os.path.join(DATA_DIR, new)
+        if os.path.exists(dst):
+            continue
+        for src_dir in dict.fromkeys((_script_dir(), os.getcwd())):
+            src = os.path.join(src_dir, old)
+            if os.path.isfile(src):
+                try:
+                    shutil.move(src, dst)
+                    moved.append(old)
+                    break
+                except OSError:
+                    continue
+    return moved
+
+# ต้องย้ายก่อนสร้าง logger (กันไฟล์ log เก่าถูกเปิดค้าง)
+MIGRATED_FILES = migrate_legacy_files()
+
+CONFIG_FILE = os.path.join(DATA_DIR, "config.json")
+LOG_FILE = os.path.join(DATA_DIR, "bot.log")
+HISTORY_FILE = os.path.join(DATA_DIR, "rejoin_history.json")
+DASH_FILE = os.path.join(DATA_DIR, "dash.json")
 PACKAGE_NAME = "com.roblox.client"
 GAME_LOG_DIR = f"/data/data/{PACKAGE_NAME}/files/appData/logs"
 EXT_LOG_DIR = f"/sdcard/Android/data/{PACKAGE_NAME}/files/appData/logs"
@@ -66,6 +120,7 @@ REPORT_TIMEOUT = 30             # ส่งรายงาน Discord ห้า�
 REJOIN_HARD_TIMEOUT_EXTRA = 150 # เวลาเผื่อของ Rejoin นอกเหนือจาก join_wait_seconds
 FATAL_CONFIRM = 3               # ต้องเจออาการ "ต้องอัปเดต" ซ้ำกี่ครั้งถึงหยุดอัตโนมัติ
 FATAL_RETRY_SECONDS = 1800      # หยุดอัตโนมัติแล้ว ลองกลับมาทำงานเองหลังกี่วินาที
+KEY_PANEL_CONFIRM = 2           # ต้องเจอหน้าต่าง Key ติดกันกี่รอบถึงแจ้งเตือน (กันภาพกระพริบ/แจ้งผิด)
 
 # --- PERFORMANCE TUNABLES ---
 NET_CACHE_SECONDS = 30
@@ -95,6 +150,8 @@ DEFAULT_CONFIG = {
     "screen_check_every_n": 2,
     "frozen_hard_checks": 30,   # จอนิ่งกี่ครั้ง (ไม่สนว่า Log ขยับ) ถึง Rejoin; 0 = ปิด
     "device_tweaks": True,      # ตั้งค่าเครื่องกัน Android ฆ่า Termux/ปิดจอ ตอนเริ่มบอท
+    "key_alert_enabled": True,  # ตรวจหน้าต่าง Delta ขอ Key (Welcome Back!) แล้วแท็ก Discord
+    "key_alert_seconds": 60,    # แท็กซ้ำทุกกี่วินาทีตราบที่หน้าต่างยังอยู่ (ขั้นต่ำ 15)
 }
 
 CFG = {}
@@ -124,6 +181,10 @@ STATE = {
     "auto_paused": False,
     "auto_paused_at": 0.0,
     "rejoin_started": 0.0,
+    "key_hits": 0,
+    "key_active": False,
+    "key_since": 0.0,
+    "last_key_alert": 0.0,
 }
 BG_TASKS = set()
 REJOIN_HISTORY = []
@@ -597,14 +658,62 @@ def frame_signature(frame):
         idx += 3
     return hashlib.md5(bytes(sig)).hexdigest()
 
+# ---------- ตรวจหน้าต่าง Delta ขอ Key ("Welcome Back!" แผงด้านขวา) ----------
+# วัดจากภาพจริง: พื้นแผงสีเทาน้ำเงินเข้มเรียบ ~ (26,28,36) และตัวหนังสือปุ่ม Continue สีฟ้า ~ (140,206,255)
+def _is_key_panel_bg(r, g, b):
+    return (14 <= r <= 42 and 16 <= g <= 48 and 24 <= b <= 60
+            and b - r >= 6 and b >= g)
+
+def _is_key_button_blue(r, g, b):
+    return b >= 225 and g >= 170 and r <= 175 and (b - r) >= 70
+
+def detect_key_panel(buf, w, h, hdr):
+    """True ถ้าแถบด้านขวาของจอเป็นแผง Delta ขอ Key
+    เงื่อนไข 1) พื้นที่ฝั่งขวาส่วนใหญ่เป็นสีพื้นแผงเรียบ  2) มีพิกเซลสีฟ้าของปุ่ม Continue"""
+    try:
+        def px(x, y):
+            i = hdr + (y * w + x) * 4
+            return buf[i], buf[i + 1], buf[i + 2]
+
+        xs = [min(w - 1, int(w * (0.72 + 0.26 * i / 15))) for i in range(16)]
+        ys = [min(h - 1, int(h * (0.06 + 0.88 * j / 19))) for j in range(20)]
+        hit = 0
+        for y in ys:
+            for x in xs:
+                if _is_key_panel_bg(*px(x, y)):
+                    hit += 1
+        if hit < 0.45 * len(xs) * len(ys):
+            return False
+
+        step = max(2, w // 400)
+        blue = 0
+        for y in range(int(h * 0.42), int(h * 0.62), step):
+            for x in range(int(w * 0.74), int(w * 0.95), step):
+                if _is_key_button_blue(*px(x, y)):
+                    blue += 1
+        return blue >= 12
+    except Exception as e:
+        logger.warning(f"detect_key_panel ผิดพลาด: {e}")
+        return False
+
+def key_panel_in_ui(ui_xml):
+    """ตรวจจากข้อความใน uiautomator dump (เสริมการตรวจด้วยภาพ ถ้า Delta เปิดเผยข้อความให้อ่านได้)"""
+    if not ui_xml:
+        return False
+    ul = ui_xml.lower()
+    if "access delta by completing" in ul:
+        return True
+    return "enter key" in ul and "receive key" in ul
+
 def inspect_screen():
-    """คืน (พบกล่อง Disconnected?, signature ของเฟรม)"""
+    """คืน (พบกล่อง Disconnected?, signature ของเฟรม, พบหน้าต่าง Delta ขอ Key?)"""
     try:
         frame = grab_raw_frame()
         if not frame:
-            return False, None
+            return False, None, False
         buf, w, h, hdr = frame
         sig = frame_signature(frame)
+        key_panel = detect_key_panel(buf, w, h, hdr)
 
         def get_rgb(px, py):
             i = hdr + (py * w + px) * 4
@@ -628,7 +737,7 @@ def inspect_screen():
                 else:
                     prev = None
         if flat_pairs < 40:
-            return False, sig
+            return False, sig, key_panel
 
         btn_xs = [int(w * (0.36 + 0.28 * i / 29)) for i in range(30)]
         btn_ys = [int(h * (0.48 + 0.26 * j / 19)) for j in range(20)]
@@ -642,7 +751,7 @@ def inspect_screen():
                     white_rows += 1
                     break
         if white_rows < 1:
-            return False, sig
+            return False, sig, key_panel
 
         edge_gray = 0
         for j in range(10):
@@ -651,10 +760,10 @@ def inspect_screen():
                 edge_gray += 1
             if is_modal_gray(*get_rgb(int(w * 0.92), py)):
                 edge_gray += 1
-        return edge_gray <= 6, sig
+        return edge_gray <= 6, sig, key_panel
     except Exception as e:
         logger.warning(f"inspect_screen ผิดพลาด: {e}")
-        return False, None
+        return False, None, False
 
 # ================= Internet + Discord =================
 _NET_CACHE_UNTIL = [0.0]
@@ -745,6 +854,8 @@ def get_status_text():
         return "🔒 ติดต่อ root ไม่ได้ (ข้ามการตรวจสอบ)"
     if STATE.get("loop_restarts", 0) > 0:
         return f"⚠️ ลูปมีปัญหา (เกิดข้อผิดพลาด {STATE['loop_restarts']} ครั้งติด)"
+    if STATE.get("key_active", False):
+        return "🔑 พบหน้าต่าง Delta ขอ Key (รอใส่ Key)"
     if STATE.get("fail_count", 0) > 0:
         return f"🔄 กำลังพยายาม Rejoin (ล้มเหลว {STATE['fail_count']} ครั้ง)"
     return "🟢 บอททำงานปกติ (กำลังเฝ้าดูในเกม)"
@@ -1012,7 +1123,7 @@ def analyze_game_health(cfg):
     healthy, reason = analyze_stall(cfg, probe)
     if not healthy:
         return False, reason
-    dialog, sig = inspect_screen()
+    dialog, sig, _key_panel = inspect_screen()
     if dialog:
         return False, "ตรวจพบกล่องแจ้งเตือน Disconnected บนหน้าจอเกม"
     update_frozen_state(sig)
@@ -1031,6 +1142,9 @@ def print_ui(cfg):
         f"  {CYAN}• Bot Token      :{RESET} {GREEN if cfg['bot_token'] else RED}{'✅ ติดตั้งแล้ว' if cfg['bot_token'] else '❌ ยังไม่มี'}{RESET}",
         f"  {CYAN}• ผู้มีสิทธิ์สั่งงาน :{RESET} {GREEN if cfg['allowed_users'] else RED}{len(cfg['allowed_users'])} คน{RESET}",
         f"  {CYAN}• Auto RAM       :{RESET} {GREEN}ทุกๆ {cfg.get('clear_ram_hours', 1)} ชั่วโมง{RESET}",
+        f"  {CYAN}• แจ้งเตือน Key   :{RESET} {GREEN if cfg.get('key_alert_enabled', True) else RED}"
+        f"{('เปิด (แท็กทุก ' + str(max(15, int(cfg.get('key_alert_seconds', 60)))) + ' วิ)') if cfg.get('key_alert_enabled', True) else 'ปิด'}{RESET}",
+        f"  {CYAN}• โฟลเดอร์ข้อมูล :{RESET} {BOLD_WHITE}{DATA_DIR}{RESET}",
         f"  {BRIGHT_CYAN}──────────────────────────────────────────────{RESET}",
         f"  {BOLD_WHITE}1) ตั้งค่าแมพที่จะ Rejoin (Place ID / VIP)",
         f"  2) ตั้งค่า Discord Bot & ผู้มีสิทธิ์สั่งงาน",
@@ -1249,6 +1363,59 @@ async def send_bot_report(channel, message="", include_screenshot=False, force_n
     except Exception as e:
         log(f"ส่งรายงานพลาด: {e}", RED)
 
+# ================= แจ้งเตือนหน้าต่าง Delta ขอ Key =================
+async def send_key_alert(channel, interval):
+    """แท็กผู้มีสิทธิ์ทุกคนใน Discord พร้อมภาพหน้าจอ (ข้อความใหม่ทุกครั้ง เพื่อให้มีแจ้งเตือนเด้งจริง)"""
+    mentions = " ".join(f"<@{uid}>" for uid in CFG.get("allowed_users", []))
+    since = STATE.get("key_since", 0.0)
+    waited = int(time.time() - since) if since > 0 else 0
+    content = (f"🔑 **พบหน้าต่าง Delta ขอ Key (Welcome Back!)**\n"
+               f"⚠️ สคริปต์จะยังไม่ทำงานจนกว่าจะใส่ Key\n"
+               f"⏱️ รอมาแล้ว **{waited // 60} นาที {waited % 60} วินาที** • แท็กซ้ำทุก {interval} วินาที\n"
+               f"{mentions}")[:DISCORD_MSG_LIMIT]
+    try:
+        img_bytes = await asyncio.to_thread(capture_screenshot_bytes)
+        kwargs = dict(content=content, allowed_mentions=discord.AllowedMentions(users=True))
+        if img_bytes:
+            kwargs["file"] = discord.File(io.BytesIO(img_bytes), filename="key_panel.png")
+        await asyncio.wait_for(_safe_send(channel, **kwargs), timeout=REPORT_TIMEOUT)
+        log("🔑 แท็ก Discord: พบหน้าต่าง Key", YELLOW, force_redraw=True)
+    except asyncio.TimeoutError:
+        log("⚠️ ส่งแจ้งเตือน Key เกินเวลา", YELLOW)
+    except Exception as e:
+        log(f"ส่งแจ้งเตือน Key ไม่สำเร็จ: {e}", RED)
+
+async def handle_key_panel(channel, seen, can_clear):
+    """seen = รอบนี้เจอหน้าต่าง Key; can_clear = รอบนี้ตรวจภาพหน้าจอจริง (ถึงจะสรุปได้ว่า 'หายแล้ว')"""
+    if seen:
+        STATE["key_hits"] = STATE.get("key_hits", 0) + 1
+        if STATE["key_hits"] < KEY_PANEL_CONFIRM:
+            return
+        now = time.time()
+        interval = max(15, int(CFG.get("key_alert_seconds", 60)))
+        if not STATE.get("key_active"):
+            STATE["key_active"] = True
+            STATE["key_since"] = now
+            add_history("Key Panel", "พบหน้าต่าง Delta ขอ Key")
+            log("🔑 พบหน้าต่าง Delta ขอ Key!", YELLOW, force_redraw=True)
+        if now - STATE.get("last_key_alert", 0.0) >= interval:
+            STATE["last_key_alert"] = now
+            if channel:
+                await send_key_alert(channel, interval)
+        return
+
+    if can_clear and (STATE.get("key_hits", 0) or STATE.get("key_active")):
+        was_active = STATE.get("key_active")
+        waited = int(time.time() - STATE.get("key_since", 0.0)) if was_active else 0
+        STATE["key_hits"] = 0
+        STATE["key_active"] = False
+        STATE["last_key_alert"] = 0.0
+        if was_active:
+            add_history("Key Panel Cleared", f"หน้าต่าง Key หายไปแล้ว (ค้าง {waited} วินาที)")
+            log("✅ หน้าต่าง Key หายไปแล้ว", GREEN, force_redraw=True)
+            if channel:
+                await _safe_send(channel, content=f"✅ **หน้าต่าง Delta ขอ Key หายไปแล้ว** (ค้างอยู่ {waited // 60} นาที {waited % 60} วินาที)")
+
 def touch_heartbeat():
     STATE["last_heartbeat"] = time.time()
     STATE["bot_unresponsive"] = False
@@ -1287,6 +1454,10 @@ async def do_rejoin(channel, done_message, reason="ไม่ระบุสา�
             STATE["frozen_count"] = 0
             STATE["last_frame_sig"] = None
             STATE["bg_count"] = 0
+            # เซสชันใหม่: ถ้าหน้าต่าง Key โผล่อีก ให้แจ้งเตือนใหม่ตั้งแต่ต้น
+            STATE["key_hits"] = 0
+            STATE["key_active"] = False
+            STATE["last_key_alert"] = 0.0
 
     touch_heartbeat()
 
@@ -1752,6 +1923,7 @@ def menu_3_start_bot(cfg):
         "last_heartbeat": now, "bot_unresponsive": False, "probe_fail": 0,
         "last_successful_rejoin": 0.0, "last_auto_rejoin": now,
         "auto_paused": False, "auto_paused_at": 0.0, "rejoin_started": 0.0,
+        "key_hits": 0, "key_active": False, "key_since": 0.0, "last_key_alert": 0.0,
     })
     reset_dash_state()
     _NET_CACHE_UNTIL[0] = 0.0
@@ -1810,8 +1982,10 @@ def menu_3_start_bot(cfg):
         cycle = STATE["check_count"]
         ui_n = max(1, int(cfg.get("ui_check_every_n", 3)))
         screen_n = max(1, int(cfg.get("screen_check_every_n", 2)))
+        key_on = bool(cfg.get("key_alert_enabled", True))
         want_ui = (cycle % ui_n == 0)
-        want_screen = (cycle % screen_n == 0)
+        # เจอหน้าต่าง Key แล้ว → ตรวจภาพทุกรอบ จะได้ยืนยัน/รู้ทันทีเมื่อหน้าต่างหาย
+        want_screen = (cycle % screen_n == 0) or (key_on and STATE.get("key_hits", 0) > 0)
 
         probe = await abatch_root(_build_health_commands(cfg, want_ui), timeout=20)
         touch_heartbeat()
@@ -1834,12 +2008,21 @@ def menu_3_start_bot(cfg):
         if healthy:
             healthy, reason = analyze_stall(cfg, probe)
 
+        screen_checked = False
+        key_screen = False
         if healthy and want_screen:
-            dialog, sig = await asyncio.to_thread(inspect_screen)
+            dialog, sig, key_screen = await asyncio.to_thread(inspect_screen)
+            screen_checked = True
             if dialog:
                 healthy, reason = False, "ตรวจพบกล่อง Disconnected บนหน้าจอ"
             else:
                 update_frozen_state(sig)
+            touch_heartbeat()
+
+        # หน้าต่าง Delta ขอ Key: เจอจากภาพหรือข้อความใน UI อย่างใดอย่างหนึ่ง → แท็ก Discord ทุก key_alert_seconds
+        if key_on:
+            key_seen = key_screen or key_panel_in_ui(probe.get("ui_xml", ""))
+            await handle_key_panel(channel, key_seen, can_clear=screen_checked)
             touch_heartbeat()
 
         now = time.time()
@@ -2026,6 +2209,10 @@ def menu_3_start_bot(cfg):
 
 # ================= Main =================
 def main():
+    if MIGRATED_FILES:
+        logger.info(f"ย้ายไฟล์เวอร์ชันเก่าเข้า {DATA_DIR}: {', '.join(MIGRATED_FILES)}")
+        print(f"{GREEN}📁 ย้ายไฟล์ตั้งค่าเดิมเข้าโฟลเดอร์ {DATA_DIR} แล้ว: {', '.join(MIGRATED_FILES)}{RESET}")
+        time.sleep(1.5)
     CFG.update(load_config())
     load_history()
     try:
