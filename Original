@@ -147,15 +147,18 @@ DEFAULT_CONFIG = {
     "startup_grace_seconds": 90,
     "log_stale_seconds": 180,
     "rejoin_cooldown_seconds": 45,
-    "frozen_screen_checks": 6,
-    "ui_check_every_n": 3,
+    "frozen_screen_checks": 4,
+    "ui_check_every_n": 2,
     "screen_check_every_n": 2,
-    "frozen_hard_checks": 30,   # จอนิ่งกี่ครั้ง (ไม่สนว่า Log ขยับ) ถึง Rejoin; 0 = ปิด
+    "frozen_hard_checks": 12,   # จอนิ่งกี่ครั้ง (ไม่สนว่า Log ขยับ) ถึง Rejoin; 0 = ปิด
     "device_tweaks": True,      # ตั้งค่าเครื่องกัน Android ฆ่า Termux/ปิดจอ ตอนเริ่มบอท
     "key_alert_enabled": True,  # ตรวจหน้าต่าง Delta ขอ Key (Welcome Back!) แล้วแท็ก Discord
     "key_alert_seconds": 60,    # แท็กซ้ำทุกกี่วินาทีตราบที่หน้าต่างยังอยู่ (ขั้นต่ำ 15)
     "key_alert_delete": True,   # ลบข้อความแท็กเก่าอัตโนมัติ (ลบอันเก่าเมื่อแท็กใหม่ / ลบทั้งหมดเมื่อหน้าต่างหาย)
-    "use_discord": True,        # False = ไม่ใช้ Discord Bot (ตั้งแค่ Place ID ก็เฝ้า/Rejoin ได้)
+    "use_discord": True,        # ระบบตั้งให้เองตอนกดเริ่มบอท: ตั้งค่า Discord ครบ = True / ไม่ครบ = False
+    "cfg_version": 0,           # ใช้ปรับค่าเริ่มต้นใหม่ให้ config เก่าครั้งเดียว
+    "lobby_min_nodes": 25,      # จำนวน UI node ของ Roblox ที่ถือว่าเป็นหน้าเมนู; 0 = ปิด
+    "hang_cpu_checks": 5,       # CPU นิ่งกี่รอบถึงถือว่าค้าง; 0 = ปิด
 }
 
 CFG = {}
@@ -190,6 +193,8 @@ STATE = {
     "key_since": 0.0,
     "last_key_alert": 0.0,
     "key_msgs": [],
+    "hang_count": 0,
+    "cpu_last": None,
 }
 BG_TASKS = set()
 REJOIN_HISTORY = []
@@ -202,6 +207,9 @@ REASON_PLAY_STORE = "เด้งไป Play Store (เกมบังคับ�
 REASON_UPGRADE_UI = "หน้าจอแจ้งให้อัปเดตเวอร์ชัน (Upgrade Required)"
 FATAL_REASONS = {REASON_PLAY_STORE, REASON_UPGRADE_UI}
 REASON_PROBE_FAIL = "ข้ามการตรวจ (root ไม่ตอบสนอง)"
+REASON_LOBBY = "เด้งออกกลับมาหน้าเมนูหลัก Roblox"
+REASON_HANG = "Roblox ค้าง (โปรเซสแทบไม่ทำงาน)"
+HANG_CPU_RATE = 1.0   # ticks/วินาที ต่ำกว่านี้ = โปรเซสแทบนิ่ง (100 = 1 คอร์เต็ม)
 
 # ================= เข้ารหัสไฟล์ข้อมูล (config / log / history / dash) =================
 # ใช้ไลบรารีมาตรฐานล้วน (ไม่ต้องติดตั้งเพิ่ม): คีย์ผูกกับ "เครื่องนี้" (Android ID + serial + รุ่น ผ่าน root)
@@ -612,6 +620,12 @@ def load_config():
                 cfg[key] = default
         elif isinstance(default, str):
             cfg[key] = "" if cfg[key] is None else str(cfg[key]).strip()
+
+    # config เก่า: ปรับค่าตรวจจับให้ไวขึ้นครั้งเดียว (ผู้ใช้แก้เองต่อได้หลังจากนี้)
+    if int(cfg.get("cfg_version", 0)) < 2:
+        cfg.update({"ui_check_every_n": 2, "frozen_screen_checks": 4,
+                    "frozen_hard_checks": 12, "cfg_version": 2})
+
     cfg["allowed_users"] = _clean_user_ids(cfg.get("allowed_users"))
     cfg["use_discord"] = bool(cfg.get("use_discord", True))
     return cfg
@@ -730,6 +744,10 @@ def has_root():
 
 def clear_system_ram():
     run_root_text("sync && echo 3 > /proc/sys/vm/drop_caches")
+
+def reboot_phone():
+    """สั่งรีสตาร์ตเครื่อง (ลองหลายวิธี เพราะแต่ละรอมรองรับไม่เหมือนกัน)"""
+    run_root_text("sync; svc power reboot 2>/dev/null || reboot 2>/dev/null || /system/bin/reboot", timeout=10)
 
 def clear_termux_junk():
     home = os.path.expanduser("~")
@@ -1145,6 +1163,8 @@ def _build_health_commands(cfg, want_ui):
         "wake": _t(3, "dumpsys power") + " | grep -m1 mWakefulness= || true",
         "log_tail": f'{log_expr}; if [ -n "$LATEST" ]; then tail -n {tail_n} "$LATEST"; fi',
         "log_age": f'{log_expr}; if [ -n "$LATEST" ]; then NOW=$(date +%s); MT=$(stat -c %Y "$LATEST" 2>/dev/null); if [ -n "$MT" ]; then echo $((NOW-MT)); fi; fi',
+        # utime+stime (ticks) ของโปรเซส Roblox จาก /proc/<pid>/stat ฟิลด์ 14,15 ใช้ตรวจอาการค้าง
+        "cpu": f"P=$(pidof {PACKAGE_NAME} | cut -d' ' -f1); [ -n \"$P\" ] && cut -d' ' -f14,15 /proc/$P/stat || true",
     }
     if want_ui:
         cmds["ui_xml"] = f"{_t(8, 'uiautomator dump ' + UI_TMP)} >/dev/null 2>&1; cat {UI_TMP} 2>/dev/null; rm -f {UI_TMP}"
@@ -1153,11 +1173,23 @@ def _build_health_commands(cfg, want_ui):
 def probe_ok(probe):
     return probe.get("alive", "").strip() == "1"
 
+RE_ROBLOX_NODE = re.compile(r'package="com\.roblox\.client"')
+
+def roblox_menu_in_ui(cfg, ui_xml):
+    """หน้าเมนูแอปมี node เยอะ ส่วนในเกมมีแค่ไม่กี่ตัว (ไม่ขึ้นกับภาษาของแอป)
+    คืน (เป็นหน้าเมนูไหม, จำนวน node)"""
+    need = int(cfg.get("lobby_min_nodes", 25))
+    n = len(RE_ROBLOX_NODE.findall(ui_xml))
+    return (need > 0 and n >= need), n
+
 def analyze_probe(cfg, probe):
     if not probe_ok(probe):
         return True, REASON_PROBE_FAIL
     if not probe.get("pidof", "").strip():
         return False, "แอป Roblox ปิดตัวลง (App Crashed)"
+
+    grace = max(60, int(cfg.get("startup_grace_seconds", 90)))
+    in_grace = time.time() - STATE.get("game_start_time", 0) < grace
 
     focus = probe.get("focus", "")
     if "com.android.vending" in focus:
@@ -1205,9 +1237,24 @@ def analyze_probe(cfg, probe):
         if "disconnected" in ul and ("error code" in ul or "leave" in ul or "reconnect" in ul):
             return False, "หน้าจอแจ้งเตือนหลุดออกจากเกม (Disconnected)"
         if ("log in" in ul and "sign up" in ul) or ("discover" in ul and "avatar" in ul and "connect" in ul):
-            return False, "เด้งออกกลับมาหน้าเมนูหลัก Roblox"
+            return False, REASON_LOBBY
+        # หน้าเมนูหลัก: นับจำนวน UI node ของ Roblox (ในเกมมีน้อย ในเมนูมีเยอะ)
+        # ข้ามเมื่ออยู่ในช่วงโหลดเกม หรือเจอหน้าต่าง Key ของ Delta (อยู่แอปเดียวกัน ทำให้ node เพิ่ม)
+        if not in_grace and not STATE.get("key_active") and not key_panel_in_ui(ui):
+            is_menu, n = roblox_menu_in_ui(cfg, ui)
+            logger.info(f"[UI] roblox_nodes={n}")
+            if is_menu:
+                return False, REASON_LOBBY
 
     return True, "ปกติ"
+
+def _cpu_ticks(probe):
+    """utime+stime ของโปรเซส Roblox (ticks) หรือ None ถ้าอ่านไม่ได้"""
+    try:
+        u, s = probe.get("cpu", "").split()[:2]
+        return int(u) + int(s)
+    except (ValueError, TypeError):
+        return None
 
 def analyze_stall(cfg, probe):
     if not probe_ok(probe):
@@ -1219,6 +1266,8 @@ def analyze_stall(cfg, probe):
     grace = max(60, int(cfg.get("startup_grace_seconds", 90)))
     if now - STATE.get("game_start_time", 0) < grace:
         STATE["bg_count"] = 0
+        STATE["hang_count"] = 0
+        STATE["cpu_last"] = None
         return True, "กำลังอยู่ในช่วงโหลดเกม"
 
     stale_limit = max(90, int(cfg.get("log_stale_seconds", 180)))
@@ -1237,6 +1286,22 @@ def analyze_stall(cfg, probe):
         STATE["bg_count"] = STATE.get("bg_count", 0) + 1
     else:
         STATE["bg_count"] = 0
+
+    # ตรวจโปรเซสค้าง: CPU เกือบไม่ขยับต่อเนื่องหลายรอบ (Log/จออาจยังดูปกติแต่เกมนิ่งสนิท)
+    hang_need = int(cfg.get("hang_cpu_checks", 5))
+    ticks = _cpu_ticks(probe)
+    if hang_need > 0 and ticks is not None and roblox_focused:
+        last = STATE.get("cpu_last")
+        if last is None or ticks < last[1]:
+            # ตัวอ่านแรก หรือโปรเซสถูกเปิดใหม่ (ค่า tick ลดลง)
+            STATE["cpu_last"] = (now, ticks)
+            STATE["hang_count"] = 0
+        elif now - last[0] >= 5:
+            rate = (ticks - last[1]) / (now - last[0])
+            STATE["cpu_last"] = (now, ticks)
+            STATE["hang_count"] = STATE.get("hang_count", 0) + 1 if rate < HANG_CPU_RATE else 0
+        if STATE.get("hang_count", 0) >= hang_need:
+            return False, REASON_HANG
 
     if roblox_focused and log_age is not None and log_age >= stale_limit:
         return False, f"Roblox เงียบ/ค้างนาน {log_age}s (Watchdog)"
@@ -1287,9 +1352,30 @@ def analyze_game_health(cfg):
     update_frozen_state(sig)
     return True, "ปกติ"
 
+# ================= ตรวจการตั้งค่า Discord =================
+def discord_missing_items(cfg):
+    """รายการที่ยังไม่ได้ตั้งค่าสำหรับโหมด Discord"""
+    miss = []
+    if not cfg.get('bot_token'):
+        miss.append("Bot Token")
+    if not str(cfg.get('channel_id', '')).isdigit():
+        miss.append("Channel ID")
+    if not cfg.get('allowed_users'):
+        miss.append("User ID")
+    return miss
+
+def discord_configured(cfg):
+    return not discord_missing_items(cfg)
+
 # ================= UI เมนู =================
 def print_ui(cfg):
     fix_tty()
+    dc = discord_configured(cfg)
+    missing = discord_missing_items(cfg)
+    if dc:
+        mode_text = f"{GREEN}ใช้ Discord Bot (ตั้งค่าครบ){RESET}"
+    else:
+        mode_text = f"{YELLOW}ไม่ใช้ Discord (เฝ้าจอ/Rejoin อย่างเดียว){RESET}"
     lines = [
         "\033[2J\033[H",
         f"  {BRIGHT_CYAN}╦═╗┌─┐  ╦┌─┐┬┌┐┌{RESET}   {BOLD_WHITE}R O B L O X   S M A R T   B O T{RESET}",
@@ -1297,14 +1383,12 @@ def print_ui(cfg):
         f"  {BRIGHT_CYAN}╩╚═└─┘╚═╝└─┘┴┘└┘{RESET}",
         f"  {BRIGHT_CYAN}──────────────────────────────────────────────{RESET}",
         f"  {CYAN}• Place ID       :{RESET} {BOLD_WHITE}{cfg['place_id'] or 'ยังไม่ได้ตั้งค่า'}{RESET}",
-        f"  {CYAN}• โหมดการทำงาน  :{RESET} {GREEN if cfg.get('use_discord', True) else YELLOW}"
-        f"{'ใช้ Discord Bot' if cfg.get('use_discord', True) else 'ไม่ใช้ Discord (เฝ้าจอ/Rejoin อย่างเดียว)'}{RESET}",
+        f"  {CYAN}• โหมดการทำงาน  :{RESET} {mode_text}",
         f"  {CYAN}• Bot Token      :{RESET} "
-        + (f"{GREEN if cfg['bot_token'] else RED}{'✅ ติดตั้งแล้ว' if cfg['bot_token'] else '❌ ยังไม่มี'}{RESET}"
-           if cfg.get('use_discord', True) else f"{YELLOW}— (ไม่ใช้){RESET}"),
+        f"{GREEN if cfg['bot_token'] else RED}{'✅ ติดตั้งแล้ว' if cfg['bot_token'] else '❌ ยังไม่มี'}{RESET}",
         f"  {CYAN}• ผู้มีสิทธิ์สั่งงาน :{RESET} "
-        + (f"{GREEN if cfg['allowed_users'] else RED}{len(cfg['allowed_users'])} คน{RESET}"
-           if cfg.get('use_discord', True) else f"{YELLOW}— (ไม่ใช้){RESET}"),
+        f"{GREEN if cfg['allowed_users'] else RED}{len(cfg['allowed_users'])} คน{RESET}"
+        + ("" if dc or len(missing) == 3 else f"  {YELLOW}(ขาด: {', '.join(missing)}){RESET}"),
         f"  {CYAN}• Auto RAM       :{RESET} {GREEN}ทุกๆ {cfg.get('clear_ram_hours', 1)} ชั่วโมง{RESET}",
         f"  {CYAN}• แจ้งเตือน Key   :{RESET} {GREEN if cfg.get('key_alert_enabled', True) else RED}"
         f"{('เปิด (แท็กทุก ' + str(max(15, int(cfg.get('key_alert_seconds', 60)))) + ' วิ)') if cfg.get('key_alert_enabled', True) else 'ปิด'}{RESET}",
@@ -1315,6 +1399,7 @@ def print_ui(cfg):
         f"  3) เริ่มเดินระบบบอทเฝ้าจอ",
         f"  4) ตั้งค่าเวลา Auto Clear RAM",
         f"  5) อ่านบันทึก (Log) ที่ถูกเข้ารหัส",
+        f"  6) รีสตาร์ตมือถือ (Reboot)",
         f"  0) ออกจากโปรแกรม{RESET}",
         ""
     ]
@@ -1368,6 +1453,20 @@ def menu_5_log():
     print(f"\n{BRIGHT_CYAN}--- [5] Log ล่าสุด (ถอดรหัสให้เฉพาะเครื่องนี้) ---{RESET}")
     show_log(40)
     safe_input("\nกด Enter...")
+
+def menu_6_reboot():
+    print(f"\n{BRIGHT_CYAN}--- [6] รีสตาร์ตมือถือ ---{RESET}")
+    if safe_input(f"{RED}เครื่องจะรีบูตทันที! พิมพ์ yes เพื่อยืนยัน: {RESET}").lower() != "yes":
+        print(f"{YELLOW}ยกเลิกแล้ว{RESET}")
+        time.sleep(1)
+        return
+    if not has_root():
+        print(f"{RED}✘ ใช้ root ไม่ได้{RESET}")
+        time.sleep(2)
+        return
+    add_history("Reboot Phone", "สั่งจากเมนูในเครื่อง")
+    print(f"{YELLOW}🔌 กำลังรีสตาร์ต...{RESET}")
+    reboot_phone()
 
 def menu_4_ram(cfg):
     print(f"\n{BRIGHT_CYAN}--- [4] ตั้งค่า Auto Clear RAM ---{RESET}")
@@ -1645,6 +1744,8 @@ async def do_rejoin(channel, done_message, reason="ไม่ระบุสา�
             STATE["frozen_count"] = 0
             STATE["last_frame_sig"] = None
             STATE["bg_count"] = 0
+            STATE["cpu_last"] = None
+            STATE["hang_count"] = 0
             # เซสชันใหม่: ถ้าหน้าต่าง Key โผล่อีก ให้แจ้งเตือนใหม่ตั้งแต่ต้น
             STATE["key_hits"] = 0
             STATE["key_active"] = False
@@ -1824,6 +1925,31 @@ class SettingsModal(discord.ui.Modal, title='⚙️ แก้ไขการต�
 # ================= Control Buttons =================
 def _rejoin_in_progress():
     return bool(STATE["lock"] and STATE["lock"].locked())
+
+class RebootConfirmView(discord.ui.View):
+    """ขั้นยืนยันก่อนรีสตาร์ตมือถือ (กันกดพลาด) หมดเวลาใน 30 วินาที"""
+    def __init__(self):
+        super().__init__(timeout=30)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if is_authorized(interaction.user.id):
+            return True
+        await interaction.response.send_message("⛔ ไม่มีสิทธิ์", ephemeral=True)
+        return False
+
+    @discord.ui.button(label="✅ ยืนยันรีสตาร์ต", style=discord.ButtonStyle.danger)
+    async def confirm(self, interaction, button):
+        audit(interaction, "reboot_phone")
+        add_history("Reboot Phone", f"โดย {interaction.user.name}")
+        log("🔌 รีสตาร์ตมือถือ", RED, force_redraw=True)
+        await interaction.response.edit_message(
+            content="🔌 กำลังรีสตาร์ตมือถือ... บอทจะออฟไลน์จนกว่าจะเปิดบอทใหม่", view=None)
+        await asyncio.sleep(1)
+        await asyncio.to_thread(reboot_phone)
+
+    @discord.ui.button(label="❌ ยกเลิก", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction, button):
+        await interaction.response.edit_message(content="ยกเลิกแล้ว", view=None)
 
 class ControlView(discord.ui.View):
     def __init__(self, sync_buttons: bool = True):
@@ -2065,6 +2191,11 @@ class ControlView(discord.ui.View):
         add_history("History Cleared", f"โดย {interaction.user.name} ({count} รายการ)")
         await interaction.response.send_message(f"🗑️ ล้างประวัติ {count} รายการแล้ว", delete_after=30)
 
+    @discord.ui.button(label="🔌 Reboot Phone", style=discord.ButtonStyle.danger, row=4, custom_id="btn_reboot")
+    async def btn_reboot(self, interaction, button):
+        await interaction.response.send_message(
+            "⚠️ ต้องการรีสตาร์ตมือถือจริงหรือไม่?", view=RebootConfirmView(), ephemeral=True)
+
 # ================= Start Bot Loop =================
 def menu_3_start_bot(cfg):
     global DASHBOARD_ACTIVE, LAST_RESULT_TEXT
@@ -2074,31 +2205,21 @@ def menu_3_start_bot(cfg):
         time.sleep(2)
         return
 
-    # เลือกก่อนเริ่มว่าจะใช้ Discord Bot ไหม (Enter = ใช้ตามที่ตั้งไว้ล่าสุด)
-    cur = bool(cfg.get('use_discord', True))
+    # ตรวจการตั้งค่า Discord อัตโนมัติ: ครบ = ใช้ Discord / ไม่ครบ = ไม่ใช้ (ไม่ถามผู้ใช้)
+    use_discord = discord_configured(cfg)
+    missing = discord_missing_items(cfg)
     print(f"\n{BRIGHT_CYAN}--- [3] เริ่มระบบเฝ้าจอ ---{RESET}")
-    print(f"{CYAN}• y = ใช้ Discord Bot (รายงาน/ปุ่มควบคุม/แท็กแจ้งเตือน ต้องตั้ง Token, Channel, User ID){RESET}")
-    print(f"{CYAN}• n = ไม่ใช้ Discord (ใช้แค่ Place ID — เฝ้าจอและ Rejoin อัตโนมัติอย่างเดียว){RESET}")
-    ans = safe_input(f"ใช้ Discord Bot ไหม? (y/n, Enter = {'y' if cur else 'n'}): ").lower()
-    use_discord = cur if ans == "" else (ans in ("y", "yes", "ใช่"))
-    if use_discord != cur:
+    if use_discord:
+        print(f"{GREEN}✔ ตั้งค่า Discord ครบ → ใช้ Discord Bot อัตโนมัติ{RESET}")
+    elif len(missing) < 3:
+        print(f"{YELLOW}⚠ ตั้งค่า Discord ไม่ครบ (ขาด: {', '.join(missing)}) → รันแบบไม่ใช้ Discord{RESET}")
+    else:
+        print(f"{YELLOW}ℹ ยังไม่ได้ตั้งค่า Discord → รันแบบไม่ใช้ Discord{RESET}")
+    if use_discord != bool(cfg.get('use_discord', True)):
         cfg['use_discord'] = use_discord
         save_config(cfg)
+    time.sleep(1.5)
 
-    if use_discord:
-        if not cfg['bot_token'] or not cfg['channel_id']:
-            print(f"\n{RED}✘ โหมด Discord ต้องตั้งค่า Bot Token, Channel ID ก่อน (เมนู 2){RESET}")
-            print(f"{YELLOW}  (หรือเลือก n เพื่อรันโดยไม่ใช้ Discord){RESET}")
-            time.sleep(3)
-            return
-        if not str(cfg['channel_id']).isdigit():
-            print(f"\n{RED}✘ Channel ID ต้องเป็นตัวเลข (เมนู 2){RESET}")
-            time.sleep(2)
-            return
-        if not cfg['allowed_users']:
-            print(f"\n{RED}✘ ยังไม่ได้ตั้งค่า Discord User ID (เมนู 2){RESET}")
-            time.sleep(3)
-            return
     if not has_root():
         print(f"\n{RED}✘ ใช้ root (su) ไม่ได้ — ตรวจสอบสิทธิ์ root ของ Termux ก่อน{RESET}")
         time.sleep(3)
@@ -2134,7 +2255,7 @@ def menu_3_start_bot(cfg):
         "last_successful_rejoin": 0.0, "last_auto_rejoin": now,
         "auto_paused": False, "auto_paused_at": 0.0, "rejoin_started": 0.0,
         "key_hits": 0, "key_active": False, "key_since": 0.0, "last_key_alert": 0.0,
-        "key_msgs": [],
+        "key_msgs": [], "hang_count": 0, "cpu_last": None,
     })
     reset_dash_state()
     _NET_CACHE_UNTIL[0] = 0.0
@@ -2244,6 +2365,14 @@ def menu_3_start_bot(cfg):
 
         if not healthy:
             log(f"⚠️ {reason}", RED, force_redraw=True)
+
+            if reason == REASON_LOBBY:
+                # ยืนยันซ้ำก่อน: กันหน้าจอเปลี่ยนชั่วคราว/อ่าน UI พลาดแล้ว Rejoin มั่ว
+                await hb_sleep(8)
+                p2 = await abatch_root(_build_health_commands(cfg, True), timeout=20)
+                if not probe_ok(p2) or analyze_probe(cfg, p2)[1] != REASON_LOBBY:
+                    log("ไม่ยืนยันอาการหลุดมาหน้าเมนู ข้ามรอบนี้", YELLOW)
+                    return
 
             if reason in FATAL_REASONS:
                 # ยืนยันซ้ำก่อน: ป๊อปอัปชั่วคราวไม่ควรทำให้บอทหยุดทำงาน
@@ -2444,10 +2573,48 @@ def menu_3_start_bot(cfg):
         run_root_text(f"am force-stop {PACKAGE_NAME}")
     time.sleep(1)
 
+# ================= โหมดเริ่มเองหลังบูต (--autostart) =================
+def wait_device_ready(timeout=180):
+    """หลังบูตใหม่ root/รหัสเครื่องอาจยังไม่พร้อม: ต้องรอก่อนแตะไฟล์ที่เข้ารหัส
+    (ไม่งั้นถอดรหัสไม่ได้แล้วไฟล์ตั้งค่าจะถูกย้ายไปเก็บเป็น .unreadable)"""
+    print(f"{CYAN}⏳ รอ root และรหัสเครื่องพร้อม (สูงสุด {timeout} วินาที)...{RESET}")
+    end = time.time() + timeout
+    while time.time() < end:
+        if run_root_text("id -u", timeout=10) == "0":
+            _D_RETRY_AT[0] = 0.0
+            if _master_key(b"D"):
+                return True
+        time.sleep(5)
+    for p in (CONFIG_FILE, HISTORY_FILE, DASH_FILE):
+        try:
+            with open(p, "rb") as f:
+                if f.read(5) == SEAL_MAGIC + b"D":
+                    print(f"{RED}✘ root ยังไม่พร้อม และไฟล์ตั้งค่าผูกกับเครื่อง จึงไม่เปิดบอท (ไม่แตะไฟล์ใด ๆ){RESET}")
+                    return False
+        except OSError:
+            pass
+    return True
+
+def run_autostart():
+    """เริ่มเฝ้าจอทันทีตามค่าที่ตั้งไว้ (ไม่ผ่านเมนู) ถ้าเกิดข้อผิดพลาดจะลองใหม่เอง"""
+    print(f"{GREEN}🚀 โหมดเริ่มอัตโนมัติ (--autostart){RESET}")
+    logger.info("autostart: เริ่มระบบ")
+    for attempt in range(1, 6):
+        try:
+            menu_3_start_bot(CFG)
+            return
+        except Exception as e:
+            logger.error("autostart error:\n%s", traceback.format_exc())
+            print(f"{RED}🔥 autostart ผิดพลาด ({attempt}/5): {e!r} — ลองใหม่ใน 30 วินาที{RESET}")
+            time.sleep(30)
+
 # ================= Main =================
 def main():
     if "--log" in sys.argv:
         show_log(80)
+        return
+    autostart = "--autostart" in sys.argv
+    if autostart and not wait_device_ready():
         return
     print(f"{CYAN}🔐 กำลังเตรียมระบบเข้ารหัสไฟล์ข้อมูล...{RESET}")
     if seal_mode_now() == b"F":
@@ -2475,6 +2642,9 @@ def main():
             print(f"{RED}🔒 {w}{RESET}")
         print(f"{YELLOW}   (ไฟล์เดิมไม่ถูกลบ — ถ้าเป็นแค่ root ไม่ตอบสนองชั่วคราว ให้เปลี่ยนชื่อกลับแล้วเปิดใหม่){RESET}")
         time.sleep(4)
+    if autostart:
+        run_autostart()
+        return
     try:
         while True:
             print_ui(CFG)
@@ -2489,6 +2659,8 @@ def main():
                 menu_4_ram(CFG)
             elif choice == "5":
                 menu_5_log()
+            elif choice == "6":
+                menu_6_reboot()
             elif choice == "0":
                 sys.exit(0)
             elif choice:
