@@ -20,6 +20,7 @@ import unicodedata
 import signal
 import hmac
 import threading
+import fcntl
 from concurrent.futures import ThreadPoolExecutor
 from logging.handlers import RotatingFileHandler
 from datetime import datetime
@@ -508,6 +509,7 @@ C_ACC = "\033[1;38;5;51m"
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 RECENT_LOGS = deque(maxlen=60)
 _DASH_FIRST = [True]
+HEADLESS = [False]
 
 def vlen(s):
     return sum(_char_width(ch) for ch in ANSI_RE.sub("", str(s)))
@@ -646,6 +648,8 @@ def _dash_status():
     return C_OK, "เฝ้าดูในเกมตามปกติ"
 
 def print_bot_dashboard():
+    if HEADLESS[0]:
+        return
     fix_tty()
     bw = _bw()
     inner = bw - 4
@@ -1120,24 +1124,17 @@ async def check_internet():
     return ok
 
 async def send_reconnect_alert(channel, duration_sec):
-    mentions = " ".join(f"<@{uid}>" for uid in CFG.get("allowed_users", []))
     if duration_sec < 60:
         dur_text = f"{int(duration_sec)} วินาที"
     elif duration_sec < 3600:
         dur_text = f"{int(duration_sec / 60)} นาที"
     else:
         dur_text = f"{duration_sec / 3600:.1f} ชั่วโมง"
-    try:
-        await channel.send(
-            f"🔌 **บอทกลับมาเชื่อมต่อ Discord แล้ว!**\n"
-            f"⏱️ ขาดการเชื่อมต่อนานประมาณ **{dur_text}**\n"
-            f"🔄 ระบบเฝ้าจออาจไม่ได้แจ้งเตือนในช่วงเวลาดังกล่าว\n"
-            f"{mentions}",
-            allowed_mentions=discord.AllowedMentions(users=True)
-        )
-        log(f"แจ้งเตือน Discord reconnect (ขาด {dur_text})", YELLOW, force_redraw=True)
-    except Exception as e:
-        log(f"ส่งแจ้งเตือน reconnect ไม่สำเร็จ: {e}", RED)
+    add_history("Discord Reconnect", f"ขาดการเชื่อมต่อประมาณ {dur_text}")
+    log(f"Discord กลับมาเชื่อมต่อ (ขาด {dur_text})", YELLOW, force_redraw=True)
+    await send_bot_report(
+        channel,
+        f"🔌 **กลับมาเชื่อมต่อ Discord แล้ว** (ขาดไปประมาณ {dur_text}) — ระบบเฝ้าจออาจไม่ได้แจ้งเตือนในช่วงนั้น")
 
 async def handle_discord_back(channel):
     since = STATE.get("discord_offline_since", 0)
@@ -1575,6 +1572,7 @@ def print_ui(cfg):
     else:
         key_v = f"{dot('err')} {C_DIM}ปิด{RESET}"
 
+    svc_v = service_state_text()
     L = [
         "\033[2J\033[H",
         b_top(),
@@ -1588,6 +1586,7 @@ def print_ui(cfg):
     ] + ([b_row(kv("ขาด", f"{C_WARN}{', '.join(missing)}{RESET}"))] if (not dc and len(missing) < 3) else []) + [
         b_row(kv("Auto RAM", f"{C_VAL}{cfg.get('clear_ram_hours', 1)}{RESET} ชม./รอบ")),
         b_row(kv("แจ้ง Key", key_v)),
+        b_row(kv("บริการ", svc_v)),
         b_row(kv("ข้อมูล", f"{C_DIM}{short_path(DATA_DIR, max(8, inner - 12))}{RESET}")),
         b_sep("เมนู"),
         _menu_item("1", "ตั้งค่าแมพ (Place ID / VIP)"),
@@ -1596,6 +1595,7 @@ def print_ui(cfg):
         _menu_item("4", "ตั้งเวลา Auto Clear RAM"),
         _menu_item("5", "อ่าน Log (เข้ารหัส)"),
         _menu_item("6", "รีสตาร์ตมือถือ", C_ERR),
+        _menu_item("7", "บริการเบื้องหลัง (Auto-restart)"),
         _menu_item("0", "ออกจากโปรแกรม", C_DIM),
         b_bot(),
         "",
@@ -1728,15 +1728,18 @@ def _save_dash_id(mid):
 
 async def _get_dash_msg(channel):
     if DASH["msg"]:
-        return DASH["msg"]
+        return DASH["msg"], False
     mid = _load_dash_id()
-    if mid:
-        try:
-            DASH["msg"] = await channel.fetch_message(mid)
-            return DASH["msg"]
-        except Exception:
-            pass
-    return None
+    if not mid:
+        return None, True
+    try:
+        DASH["msg"] = await channel.fetch_message(mid)
+        return DASH["msg"], False
+    except (discord.NotFound, discord.Forbidden):
+        return None, True
+    except Exception as e:
+        logger.warning(f"ดึงข้อความรายงานเดิมไม่สำเร็จ: {e!r}")
+        return None, False
 
 def _format_auto_rejoin_text():
     auto_rejoin_hrs = float(CFG.get('auto_rejoin_hours', 0.0))
@@ -1754,7 +1757,7 @@ def _format_auto_rejoin_text():
         return f"อีก {mins} นาที {secs} วินาที"
     return f"อีก {secs} วินาที"
 
-async def _send_bot_report_impl(channel, message="", include_screenshot=False, force_new=False):
+async def _send_bot_report_impl(channel, message="", include_screenshot=False):
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     pause_tag = " ⏸️ `[PAUSED]`" if STATE["paused"] else ""
 
@@ -1783,17 +1786,10 @@ async def _send_bot_report_impl(channel, message="", include_screenshot=False, f
             content += f"\n🖼️ ภาพหน้าจอล่าสุดเมื่อ `{DASH['shot_time']}`"
         content = content[:DISCORD_MSG_LIMIT]
 
-        if force_new:
-            if img_bytes:
-                await _safe_send(channel, content=content, embed=embed, file=make_file(), view=view)
-            else:
-                await _safe_send(channel, content=content, embed=embed, view=view)
-            return
-
         if DASH["lock"] is None:
             DASH["lock"] = asyncio.Lock()
         async with DASH["lock"]:
-            msg = await _get_dash_msg(channel)
+            msg, gone = await _get_dash_msg(channel)
             if msg:
                 try:
                     kwargs = dict(content=content, embed=embed, view=view)
@@ -1803,9 +1799,13 @@ async def _send_bot_report_impl(channel, message="", include_screenshot=False, f
                     return
                 except discord.NotFound:
                     DASH["msg"] = None
-                except discord.HTTPException as e:
-                    log(f"แก้ไขข้อความรายงานไม่สำเร็จ ({e})", YELLOW)
-                    DASH["msg"] = None
+                    gone = True
+                except Exception as e:
+                    log(f"แก้ไขข้อความรายงานไม่สำเร็จ ({e}) — ข้ามรอบนี้", YELLOW)
+                    return
+            if not gone:
+                log("เชื่อมต่อ Discord ไม่เสถียร — ข้ามการส่งรายงานรอบนี้", YELLOW)
+                return
 
             if img_bytes:
                 new_msg = await _safe_send(channel, content=content, embed=embed, file=make_file(), view=view)
@@ -1817,10 +1817,10 @@ async def _send_bot_report_impl(channel, message="", include_screenshot=False, f
     except Exception as e:
         log(f"ส่งรายงานพลาด: {e}", RED)
 
-async def send_bot_report(channel, message="", include_screenshot=False, force_new=False):
+async def send_bot_report(channel, message="", include_screenshot=False):
     try:
         await asyncio.wait_for(
-            _send_bot_report_impl(channel, message, include_screenshot, force_new),
+            _send_bot_report_impl(channel, message, include_screenshot),
             timeout=REPORT_TIMEOUT)
     except asyncio.TimeoutError:
         log("⚠️ ส่งรายงาน Discord เกินเวลา ข้ามไปก่อน", YELLOW)
@@ -2381,7 +2381,204 @@ class ControlView(discord.ui.View):
         await interaction.response.send_message(
             "⚠️ ต้องการรีสตาร์ตมือถือจริงหรือไม่?", view=RebootConfirmView(), ephemeral=True)
 
+SERVICE_NAME = "rbbot"
+_LOCK_FH = [None]
+
+def acquire_instance_lock():
+    try:
+        fh = open(os.path.join(DATA_DIR, "bot.lock"), "a+")
+    except OSError:
+        return True
+    try:
+        fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        fh.close()
+        return False
+    try:
+        fh.seek(0)
+        fh.truncate()
+        fh.write(str(os.getpid()))
+        fh.flush()
+    except OSError:
+        pass
+    _LOCK_FH[0] = fh
+    return True
+
+def release_instance_lock():
+    fh = _LOCK_FH[0]
+    _LOCK_FH[0] = None
+    if fh is None:
+        return
+    try:
+        fcntl.flock(fh, fcntl.LOCK_UN)
+    except OSError:
+        pass
+    try:
+        fh.close()
+    except OSError:
+        pass
+
+def _prefix():
+    return os.environ.get("PREFIX", "")
+
+def service_dir():
+    return os.path.join(_prefix(), "var", "service", SERVICE_NAME)
+
+def service_installed():
+    return bool(_prefix()) and os.path.isfile(os.path.join(service_dir(), "run"))
+
+def _sv_env():
+    env = dict(os.environ)
+    env["SVDIR"] = os.path.join(_prefix(), "var", "service")
+    return env
+
+def _sv(*args, timeout=15):
+    exe = shutil.which(args[0])
+    if not exe:
+        return 127, ""
+    try:
+        r = subprocess.run([exe] + list(args[1:]), stdin=subprocess.DEVNULL, capture_output=True,
+                           text=True, timeout=timeout, env=_sv_env())
+        return r.returncode, ((r.stdout or "") + (r.stderr or "")).strip()
+    except Exception as e:
+        return 1, repr(e)
+
+def service_state():
+    if not service_installed():
+        return "none"
+    if not shutil.which("sv"):
+        return "nosv"
+    _, out = _sv("sv", "status", SERVICE_NAME, timeout=5)
+    if out.startswith("run:"):
+        return "run"
+    if out.startswith("down:"):
+        return "down"
+    if "runsv not running" in out or "unable to change to service directory" in out:
+        return "nodaemon"
+    return "unknown"
+
+def service_state_text(st=None):
+    st = st or service_state()
+    return {
+        "run": f"{dot('ok')} {C_OK}ทำงานอยู่{RESET}",
+        "down": f"{dot('warn')} {C_WARN}หยุดอยู่{RESET}",
+        "nodaemon": f"{dot('warn')} {C_WARN}ตัวจัดการยังไม่ทำงาน{RESET}",
+        "nosv": f"{dot('err')} {C_ERR}ไม่พบคำสั่ง sv{RESET}",
+        "unknown": f"{dot('warn')} {C_WARN}ไม่ทราบสถานะ{RESET}",
+        "none": f"{C_DIM}○ ยังไม่ได้ติดตั้ง{RESET}",
+    }.get(st, "-")
+
+def _service_run_script():
+    script = os.path.abspath(__file__)
+    return ("#!" + _prefix() + "/bin/sh\n"
+            "exec 2>&1\n"
+            "sleep 10\n"
+            "cd " + shlex.quote(os.path.dirname(script)) + "\n"
+            "exec " + shlex.quote(sys.executable) + " " + shlex.quote(script) + " --service\n")
+
+def service_install():
+    if not _prefix():
+        return False, "ไม่พบ $PREFIX (ต้องรันภายใน Termux)"
+    if not shutil.which("sv-enable"):
+        ui_info("กำลังติดตั้ง termux-services ...")
+        try:
+            subprocess.run(["pkg", "install", "-y", "termux-services"], timeout=600)
+        except Exception as e:
+            return False, f"ติดตั้ง termux-services ไม่สำเร็จ: {e!r}"
+        if not shutil.which("sv-enable"):
+            return False, "ติดตั้ง termux-services ไม่สำเร็จ (ลองรัน: pkg install termux-services)"
+    d = service_dir()
+    try:
+        os.makedirs(d, exist_ok=True)
+        run_path = os.path.join(d, "run")
+        with open(run_path, "w", encoding="utf-8") as f:
+            f.write(_service_run_script())
+        os.chmod(run_path, 0o755)
+        down = os.path.join(d, "down")
+        if os.path.exists(down):
+            os.remove(down)
+    except OSError as e:
+        return False, f"สร้างไฟล์บริการไม่สำเร็จ: {e!r}"
+    if shutil.which("service-daemon"):
+        _sv("service-daemon", "start", timeout=20)
+    _sv("sv-enable", SERVICE_NAME, timeout=20)
+    time.sleep(6)
+    _sv("sv", "up", SERVICE_NAME, timeout=10)
+    st = service_state()
+    if st == "run":
+        return True, "ติดตั้งและเริ่มบริการแล้ว"
+    if st == "nodaemon":
+        return True, "ติดตั้งแล้ว แต่ตัวจัดการยังไม่ทำงาน — ปิด Termux แล้วเปิดใหม่ 1 ครั้ง"
+    return True, f"ติดตั้งแล้ว (สถานะ: {st})"
+
+def service_control(action):
+    if not service_installed():
+        return False, "ยังไม่ได้ติดตั้งบริการ"
+    rc, out = _sv("sv", action, SERVICE_NAME, timeout=15)
+    if rc != 0:
+        return False, out or "สั่งไม่สำเร็จ"
+    return True, "สั่งเริ่มบริการแล้ว" if action == "up" else "สั่งหยุดบริการแล้ว"
+
+def service_uninstall():
+    if not service_installed():
+        return True, "ยังไม่ได้ติดตั้ง"
+    _sv("sv", "down", SERVICE_NAME, timeout=15)
+    _sv("sv-disable", SERVICE_NAME, timeout=15)
+    shutil.rmtree(service_dir(), ignore_errors=True)
+    return True, "ถอนการติดตั้งบริการแล้ว"
+
+def menu_7_service():
+    while True:
+        st = service_state()
+        ui_screen("บริการเบื้องหลัง", "เปิดบอทใหม่เองเมื่อโปรแกรมพัง (termux-services)")
+        _out(
+            b_top(),
+            b_row(kv("สถานะ", service_state_text(st))),
+            b_sep("เมนู"),
+            _menu_item("1", "ติดตั้ง / เปิดใช้งาน", C_OK),
+            _menu_item("2", "เริ่มบริการ"),
+            _menu_item("3", "หยุดบริการ"),
+            _menu_item("4", "ถอนการติดตั้ง", C_ERR),
+            _menu_item("0", "กลับ", C_DIM),
+            b_bot(),
+            "",
+        )
+        c = ask("เลือก", " [0-4]")
+        if c in ("", "0"):
+            return
+        if c == "1":
+            ok, msg = service_install()
+        elif c == "2":
+            ok, msg = service_control("up")
+        elif c == "3":
+            ok, msg = service_control("down")
+        elif c == "4":
+            if ask(f"{C_ERR}พิมพ์ yes เพื่อยืนยันการถอน{RESET}").lower() != "yes":
+                continue
+            ok, msg = service_uninstall()
+        else:
+            ui_err(f"ไม่มีเมนู '{c}'")
+            time.sleep(1)
+            continue
+        (ui_ok if ok else ui_err)(msg)
+        pause_enter()
+
 def menu_3_start_bot(cfg):
+    if not acquire_instance_lock():
+        ui_screen("เริ่มระบบเฝ้าจอ")
+        ui_err("มีบอทกำลังทำงานอยู่แล้ว (อาจรันเป็นบริการเบื้องหลังหรือในหน้าต่าง Termux อื่น)")
+        ui_info("ถ้าต้องการเปิดแบบเห็นหน้าจอ ให้หยุดบริการที่เมนู 7 ก่อน")
+        time.sleep(4)
+        return
+    try:
+        _menu_3_start_bot_impl(cfg)
+    finally:
+        release_instance_lock()
+
+def _sigterm_handler(signum, frame):
+    raise KeyboardInterrupt()
+
+def _menu_3_start_bot_impl(cfg):
     global DASHBOARD_ACTIVE, LAST_RESULT_TEXT
 
     ui_screen("เริ่มระบบเฝ้าจอ", "ตรวจความพร้อมก่อนเริ่มทำงาน")
@@ -2512,7 +2709,7 @@ def menu_3_start_bot(cfg):
             STATE["probe_fail"] += 1
             log(f"⚠️ ติดต่อ root ไม่ได้ ({STATE['probe_fail']}) ข้ามรอบตรวจ", YELLOW)
             if STATE["probe_fail"] == PROBE_FAIL_ALERT and channel:
-                await send_bot_report(channel, "🔒 **ติดต่อ root (su) ไม่ได้ต่อเนื่อง** ระบบจึงข้ามการตรวจ/Rejoin", force_new=True)
+                await send_bot_report(channel, "🔒 **ติดต่อ root (su) ไม่ได้ต่อเนื่อง** ระบบจึงข้ามการตรวจ/Rejoin")
             return
         STATE["probe_fail"] = 0
 
@@ -2631,7 +2828,7 @@ def menu_3_start_bot(cfg):
             if n == MAX_LOOP_RESTARTS:
                 channel = get_channel()
                 if channel:
-                    await send_bot_report(channel, f"🚨 **ลูปเฝ้าจอผิดพลาดติดกัน {n} ครั้ง:** `{e!r}`", force_new=True)
+                    await send_bot_report(channel, f"🚨 **ลูปเฝ้าจอผิดพลาดติดกัน {n} ครั้ง:** `{e!r}`")
             await hb_sleep(min(60, 5 * n))
         touch_heartbeat()
 
@@ -2650,7 +2847,7 @@ def menu_3_start_bot(cfg):
             log(f"🚨 บอทไม่ตอบสนองมานาน {int(elapsed)} วินาที!", RED, force_redraw=True)
             channel = get_channel()
             if channel:
-                await send_bot_report(channel, f"🚨 **บอทไม่ตอบสนอง** (ลูปค้างนาน {int(elapsed)} วินาที) — กำลังรีสตาร์ทลูป", force_new=True)
+                await send_bot_report(channel, f"🚨 **บอทไม่ตอบสนอง** (ลูปค้างนาน {int(elapsed)} วินาที) — กำลังรีสตาร์ทลูป")
             try:
                 game_monitor_loop.restart()
             except Exception as e:
@@ -2791,7 +2988,14 @@ def main():
     if "--log" in sys.argv:
         show_log(80)
         return
-    autostart = "--autostart" in sys.argv
+    service = "--service" in sys.argv
+    if service:
+        HEADLESS[0] = True
+        devnull = open(os.devnull, "w", encoding="utf-8")
+        sys.stdout = devnull
+        sys.stderr = devnull
+        signal.signal(signal.SIGTERM, _sigterm_handler)
+    autostart = service or "--autostart" in sys.argv
     if autostart and not wait_device_ready():
         return
     ui_info("กำลังเตรียมระบบเข้ารหัสไฟล์ข้อมูล...")
@@ -2825,7 +3029,7 @@ def main():
     try:
         while True:
             print_ui(CFG)
-            choice = ask("เลือกเมนู", " [0-6]")
+            choice = ask("เลือกเมนู", " [0-7]")
             if choice == "1":
                 menu_1_set_map(CFG)
             elif choice == "2":
@@ -2838,6 +3042,8 @@ def main():
                 menu_5_log()
             elif choice == "6":
                 menu_6_reboot()
+            elif choice == "7":
+                menu_7_service()
             elif choice == "0":
                 sys.exit(0)
             elif choice:
@@ -2848,4 +3054,14 @@ def main():
         _out("", f"  {C_ACC}👋 ออกจากโปรแกรม{RESET}")
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        pass
+    except SystemExit:
+        raise
+    except Exception:
+        logger.error("fatal error:\n%s", traceback.format_exc())
+        if "--service" in sys.argv:
+            sys.exit(1)
+        raise
