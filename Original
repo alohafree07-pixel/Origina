@@ -23,6 +23,7 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 from logging.handlers import RotatingFileHandler
 from datetime import datetime
+from collections import deque
 
 try:
     import discord
@@ -195,6 +196,8 @@ STATE = {
     "key_msgs": [],
     "hang_count": 0,
     "cpu_last": None,
+    "mode_discord": False,
+    "session_start": 0.0,
 }
 BG_TASKS = set()
 REJOIN_HISTORY = []
@@ -346,6 +349,22 @@ def decode_log_line(line):
     except Exception:
         return line   # บรรทัดเก่าที่ยังไม่เข้ารหัส / ถอดไม่ได้ แสดงตามเดิม
 
+def style_log_line(line):
+    """ใส่สีให้บรรทัด log (เวลา = เทาจาง, ผิดพลาด = แดง, เตือน = เหลือง, สำเร็จ = เขียว)"""
+    ts, msg = (line[:23], line[23:]) if len(line) > 23 and line[4:5] == "-" else ("", line)
+    low = msg.lower()
+    if "[audit]" in low:
+        c = "\033[38;5;244m"
+    elif any(k in msg for k in ("❌", "🔥", "🚨", "ผิดพลาด")) or "error" in low or "traceback" in low:
+        c = "\033[38;5;203m"
+    elif any(k in msg for k in ("⚠", "🔌", "🔑", "📴")):
+        c = "\033[38;5;221m"
+    elif any(k in msg for k in ("✅", "สำเร็จ", "🟢", "🌐")):
+        c = "\033[38;5;84m"
+    else:
+        c = "\033[38;5;252m"
+    return f"\033[38;5;244m{ts}{RESET}{c}{msg}{RESET}"
+
 def show_log(n=40):
     try:
         size = os.path.getsize(LOG_FILE)
@@ -353,12 +372,12 @@ def show_log(n=40):
             f.seek(max(0, size - 256 * 1024))
             lines = f.read().decode("utf-8", errors="replace").splitlines()[-n:]
     except OSError:
-        print(f"{YELLOW}ยังไม่มีไฟล์ log{RESET}")
+        print(f"\033[38;5;221mยังไม่มีไฟล์ log{RESET}")
         return
     for ln in lines:
         out = decode_log_line(ln)
         if out:
-            print(out)
+            print(style_log_line(out))
 
 # ================= Logging =================
 logger = logging.getLogger("rbbot")
@@ -507,37 +526,227 @@ def trim_visible(text, max_vis=26):
         out.append(ch)
     return "".join(out)
 
+# ================= UI Toolkit: ธีมสี / กล่อง / แถบ =================
+# เส้นขอบขวาของทุกกล่องใช้ "ตำแหน่งคอลัมน์สัมบูรณ์" (ESC[nG) จึงไม่เพี้ยนแม้ emoji/ภาษาไทยกว้างไม่เท่ากัน
+C_BD = "\033[38;5;38m"       # เส้นขอบ
+C_DIM = "\033[38;5;244m"     # ข้อความรอง
+C_LBL = "\033[38;5;109m"     # ป้ายชื่อ
+C_VAL = "\033[1;97m"         # ค่า
+C_OK = "\033[38;5;84m"       # สำเร็จ / ปกติ
+C_WARN = "\033[38;5;221m"    # เตือน
+C_ERR = "\033[38;5;203m"     # ผิดพลาด
+C_ACC = "\033[1;38;5;51m"    # สีเน้น
+
+ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+RECENT_LOGS = deque(maxlen=60)   # (เวลา, สี, ข้อความ) ไว้โชว์ในหน้า Dashboard
+_DASH_FIRST = [True]
+
+def vlen(s):
+    """ความกว้างที่มองเห็นจริง (ตัด ANSI ทิ้ง, สระ/วรรณยุกต์ไทยกว้าง 0)"""
+    return sum(_char_width(ch) for ch in ANSI_RE.sub("", str(s)))
+
+def fit(s, width):
+    """ตัดข้อความที่มีสี ANSI ให้ไม่เกิน width โดยไม่ทำสีพัง"""
+    s = str(s)
+    if vlen(s) <= width:
+        return s
+    limit = max(1, width - 2)
+    out, used, pos = [], 0, 0
+
+    def take(seg):
+        nonlocal used
+        buf = []
+        for ch in seg:
+            w = _char_width(ch)
+            if used + w > limit:
+                return "".join(buf), True
+            used += w
+            buf.append(ch)
+        return "".join(buf), False
+
+    for m in ANSI_RE.finditer(s):
+        txt, stop = take(s[pos:m.start()])
+        out.append(txt)
+        if stop:
+            return "".join(out) + ".." + RESET
+        out.append(m.group())
+        pos = m.end()
+    txt, _ = take(s[pos:])
+    out.append(txt)
+    return "".join(out) + ".." + RESET
+
+def _term_size():
+    try:
+        sz = shutil.get_terminal_size((46, 24))
+        return sz.columns, sz.lines
+    except Exception:
+        return 46, 24
+
+def _bw():
+    """ความกว้างกล่อง (ปรับตามจอ: 32-56)"""
+    cols, _ = _term_size()
+    return max(32, min(cols - 2, 56))
+
+def b_top(title=""):
+    bw = _bw()
+    if title:
+        lab = f" {title} "
+        fill = max(0, bw - 3 - vlen(lab))
+        return f" {C_BD}╭─{C_LBL}{lab}{C_BD}{'─' * fill}\033[{bw + 1}G╮{RESET}"
+    return f" {C_BD}╭{'─' * (bw - 2)}\033[{bw + 1}G╮{RESET}"
+
+def b_sep(title=""):
+    bw = _bw()
+    if title:
+        lab = f" {title} "
+        fill = max(0, bw - 3 - vlen(lab))
+        return f" {C_BD}├─{C_LBL}{lab}{C_BD}{'─' * fill}\033[{bw + 1}G┤{RESET}"
+    return f" {C_BD}├{'─' * (bw - 2)}\033[{bw + 1}G┤{RESET}"
+
+def b_bot():
+    bw = _bw()
+    return f" {C_BD}╰{'─' * (bw - 2)}\033[{bw + 1}G╯{RESET}"
+
+def b_row(content=""):
+    bw = _bw()
+    return f" {C_BD}│{RESET} {fit(content, bw - 4)}{RESET}\033[{bw + 1}G{C_BD}│{RESET}"
+
+def kv(label, value, lw=11):
+    return f"{C_LBL}{label}{RESET}" + " " * max(1, lw - vlen(label)) + str(value)
+
+def dot(kind="ok"):
+    c = {"ok": C_OK, "warn": C_WARN, "err": C_ERR}.get(kind, C_DIM)
+    return f"{c}●{RESET}"
+
+def bar(val, need, width=10):
+    need = max(1, int(need))
+    val = max(0, int(val))
+    ratio = min(1.0, val / need)
+    filled = int(round(ratio * width))
+    color = C_OK if ratio < 0.5 else (C_WARN if ratio < 0.85 else C_ERR)
+    return (f"{color}{'█' * filled}{C_DIM}{'░' * (width - filled)}{RESET} "
+            f"{C_DIM}{min(val, need)}/{need}{RESET}")
+
+def gradient(text, colors=(51, 45, 39, 33, 27)):
+    """ไล่สีตัวอักษร (ใช้กับข้อความ ASCII เท่านั้น)"""
+    n = max(1, len(text))
+    out = []
+    for i, ch in enumerate(text):
+        c = colors[min(len(colors) - 1, i * len(colors) // n)]
+        out.append(f"\033[1;38;5;{c}m{ch}")
+    return "".join(out) + RESET
+
+def fmt_dur(sec):
+    sec = max(0, int(sec))
+    return f"{sec // 3600:02d}:{(sec % 3600) // 60:02d}:{sec % 60:02d}"
+
+def fmt_ago(ts):
+    if not ts or ts <= 0:
+        return "ยังไม่เคย"
+    s = int(time.time() - ts)
+    if s < 60:
+        return f"{s} วิที่แล้ว"
+    if s < 3600:
+        return f"{s // 60} นาทีที่แล้ว"
+    return f"{s // 3600} ชม. {(s % 3600) // 60} นาทีที่แล้ว"
+
+def short_path(p, maxlen):
+    p = str(p)
+    return p if len(p) <= maxlen else "…" + p[-(maxlen - 1):]
+
+# ================= หน้า Dashboard ตอนบอททำงาน =================
 _LAST_DASH_RENDER = [0.0]
 _DASH_DIRTY = [False]
 
+def _dash_status():
+    s = STATE
+    if s.get("bot_unresponsive"):
+        return C_ERR, "บอทไม่ตอบสนอง (ลูปค้าง)"
+    if s.get("paused"):
+        return C_WARN, ("หยุดอัตโนมัติ (ต้องอัปเดตเกม)" if s.get("auto_paused")
+                        else "หยุดพักชั่วคราว (Paused)")
+    if s.get("net_dropped"):
+        return C_ERR, "เน็ตหลุด รอสัญญาณ..."
+    if s.get("probe_fail", 0) >= PROBE_FAIL_ALERT:
+        return C_ERR, "ติดต่อ root ไม่ได้ (ข้ามการตรวจ)"
+    if s.get("loop_restarts", 0) > 0:
+        return C_ERR, f"ลูปมีปัญหา (ผิดพลาด {s['loop_restarts']} ครั้งติด)"
+    try:
+        if _rejoin_in_progress():
+            return C_WARN, "กำลัง Rejoin เข้าแมพ..."
+    except Exception:
+        pass
+    if s.get("key_active"):
+        return C_WARN, "พบหน้าต่าง Delta ขอ Key (รอใส่)"
+    if s.get("fail_count", 0) > 0:
+        return C_WARN, f"กำลังพยายาม Rejoin (พลาด {s['fail_count']} ครั้ง)"
+    return C_OK, "เฝ้าดูในเกมตามปกติ"
+
 def print_bot_dashboard():
     fix_tty()
-    if STATE.get("paused", False):
-        status_text = f"{YELLOW}⏸️ หยุดพักชั่วคราว (Paused){RESET}"
+    bw = _bw()
+    inner = bw - 4
+    _, rows = _term_size()
+
+    started = STATE.get("session_start", 0.0)
+    up = fmt_dur(time.time() - started) if started else "00:00:00"
+    col, status = _dash_status()
+
+    left = f"{C_ACC}◆{RESET} {gradient('ROBLOX AUTO BOT')}"
+    right = f"{C_DIM}รัน {up}{RESET}"
+    gap = max(2, inner - vlen(left) - vlen(right))
+
+    frozen_need = max(3, int(CFG.get("frozen_screen_checks", 6)))
+    frozen = min(int(STATE.get("frozen_count", 0)), frozen_need)
+    hang_need = int(CFG.get("hang_cpu_checks", 5))
+    hang = min(int(STATE.get("hang_count", 0)), hang_need) if hang_need > 0 else 0
+
+    use_dc = bool(STATE.get("mode_discord"))
+    net_dot = dot("err" if STATE.get("net_dropped") else "ok")
+    if use_dc:
+        dc_dot = dot("err" if STATE.get("discord_offline_since", 0) > 0 else "ok")
+        dc_txt = "Discord"
     else:
-        status_text = f"{GREEN}🟢 บอทกำลังทำงาน (Running){RESET}"
+        dc_dot = dot("dim")
+        dc_txt = f"{C_DIM}Discord{RESET}"
+    key_dot = dot("warn" if STATE.get("key_active") else "ok")
 
-    place_str = trim_visible(CFG.get("place_id") or "-", 15)
-    rejoins = STATE.get("rejoin_total", 0)
+    mode_v = (f"{C_OK}Discord Bot{RESET}" if use_dc
+              else f"{C_WARN}Local {C_DIM}(ไม่ใช้ Discord){RESET}")
+    place_v = trim_visible(CFG.get("place_id") or "-", 18)
 
-    lines = [
-        "\033[2J\033[H",
-        f"  {BRIGHT_CYAN}╦═╗┌─┐  ╦┌─┐┬┌┐┌{RESET}   {BOLD_WHITE}[ ROBLOX AUTO BOT ]{RESET}",
-        f"  {BRIGHT_CYAN}╠╦╝├┤   ║│ │││││{RESET}   {CYAN}Map: {BOLD_WHITE}{place_str}{CYAN} | Rejoin: {GREEN}{rejoins}{RESET}",
-        f"  {BRIGHT_CYAN}╩╚═└─┘╚═╝└─┘┴┘└┘{RESET}",
-        f"  {CYAN}╔════════════════════════════════════════╗{RESET}",
-        f"  {CYAN}║{RESET} 📌 {BOLD_WHITE}สถานะโปรแกรม{RESET}\033[44G{CYAN}║{RESET}",
-        f"  {CYAN}╠════════════════════════════════════════╣{RESET}",
-        f"  {CYAN}║{RESET} {status_text}\033[44G{CYAN}║{RESET}",
-        f"  {CYAN}╚════════════════════════════════════════╝{RESET}",
-        f"  {ORANGE}╔════════════════════════════════════════╗{RESET}",
-        f"  {ORANGE}║{RESET} 📝 {BOLD_WHITE}RESULT{RESET}\033[44G{ORANGE}║{RESET}",
-        f"  {ORANGE}╠════════════════════════════════════════╣{RESET}",
-        f"  {ORANGE}║{RESET} {LAST_RESULT_TEXT}\033[44G{ORANGE}║{RESET}",
-        f"  {ORANGE}╚════════════════════════════════════════╝{RESET}",
-        f"    {YELLOW}( กดปุ่ม CTRL + C เพื่อกลับสู่เมนูหลัก ){RESET}",
+    n_log = max(3, min(10, rows - 16))
+    recent = list(RECENT_LOGS)[-n_log:]
+
+    L = [
+        b_top(),
+        b_row(left + " " * gap + right),
+        b_sep(),
+        b_row(f"{col}●{RESET} {C_VAL}{status}{RESET}"),
+        b_row(kv("แมพ", f"{C_VAL}{place_v}{RESET}")),
+        b_row(kv("Rejoin", f"{C_VAL}{STATE.get('rejoin_total', 0)}{RESET} ครั้ง "
+                           f"{C_DIM}· {fmt_ago(STATE.get('last_successful_rejoin', 0.0))}{RESET}")),
+        b_row(kv("บังคับรีจอย", _format_auto_rejoin_text())),
+        b_row(kv("โหมด", mode_v)),
+        b_sep("ตรวจสอบ"),
+        b_row(kv("จอนิ่ง", bar(frozen, frozen_need))),
+        b_row(kv("CPU นิ่ง", bar(hang, hang_need) if hang_need > 0 else f"{C_DIM}ปิดใช้งาน{RESET}")),
+        b_row(f"{net_dot} เน็ต   {dc_dot} {dc_txt}   {key_dot} Key"),
+        b_sep("กิจกรรมล่าสุด"),
     ]
-    sys.stdout.write("\r\n".join(lines) + "\r\n")
+    if recent:
+        for hms, c, msg in recent:
+            L.append(b_row(f"{C_DIM}{hms}{RESET} {c}{msg}{RESET}"))
+    else:
+        L.append(b_row(f"{C_DIM}(รอเหตุการณ์...){RESET}"))
+    for _ in range(n_log - max(1, len(recent))):
+        L.append(b_row(""))
+    L.append(b_bot())
+    L.append(f"  {C_DIM}Ctrl+C = หยุดบอทและกลับเมนูหลัก{RESET}")
+
+    head = "\033[2J\033[H" if _DASH_FIRST[0] else "\033[H"
+    _DASH_FIRST[0] = False
+    sys.stdout.write(head + "".join(ln + "\033[K\r\n" for ln in L) + "\033[J")
     sys.stdout.flush()
 
 def flush_dashboard():
@@ -552,9 +761,9 @@ def log(msg, color=CYAN, force_redraw=False):
     now = datetime.now().strftime("%H:%M:%S")
     clean_msg = " ".join(str(msg).splitlines()).strip()
     logger.info(clean_msg)
+    RECENT_LOGS.append((now, color, clean_msg))
 
-    short_msg = trim_visible(clean_msg, 25)
-    LAST_RESULT_TEXT = f"{color}[{now}] {short_msg}{RESET}"
+    LAST_RESULT_TEXT = f"{color}[{now}] {trim_visible(clean_msg, 25)}{RESET}"
     _DASH_DIRTY[0] = True
 
     if DASHBOARD_ACTIVE:
@@ -565,7 +774,7 @@ def log(msg, color=CYAN, force_redraw=False):
             print_bot_dashboard()
     else:
         fix_tty()
-        sys.stdout.write(f"{color}[{now}] {clean_msg}{RESET}\r\n")
+        sys.stdout.write(f"{C_DIM}{now}{RESET} {color}{clean_msg}{RESET}\r\n")
         sys.stdout.flush()
 
 def audit(interaction, action):
@@ -1053,7 +1262,16 @@ def _read_cpu_samples():
             return lines[0], lines[1]
     return None
 
-def get_discord_embed(dev_name, is_paused):
+def _txt_bar(pct, width=8):
+    try:
+        pct = max(0.0, min(100.0, float(pct)))
+    except (TypeError, ValueError):
+        pct = 0.0
+    filled = int(round(pct / 100 * width))
+    return "▰" * filled + "▱" * (width - filled)
+
+def get_discord_embed(dev_name, is_paused, info=None):
+    info = info or {}
     cpu_usage = 0
     try:
         samples = _read_cpu_samples()
@@ -1088,14 +1306,26 @@ def get_discord_embed(dev_name, is_paused):
     except Exception:
         uptime_hrs = 0
 
-    status_color = 0xf1c40f if is_paused else 0x3498db
-    embed = discord.Embed(color=status_color)
-    embed.add_field(name="🔹 Device Name", value=f"`{dev_name}`", inline=True)
-    embed.add_field(name="⚙️ CPU Usage", value=f"`{cpu_usage}%`", inline=True)
-    embed.add_field(name="💾 Memory Usage", value=f"`{mem_usage_pct}%`", inline=True)
-    embed.add_field(name="💾 Memory Available", value=f"`{mem_avail_pct}%`", inline=True)
-    embed.add_field(name="💡 Total Memory", value=f"`{mem_total_gb} GB`", inline=True)
-    embed.add_field(name="⏰ Uptime", value=f"`{uptime_hrs} hours`", inline=True)
+    # สีแถบข้าง: แดง = มีปัญหา / เหลือง = หยุดหรือรอ Key / เขียว = ปกติ
+    if (STATE.get("bot_unresponsive") or STATE.get("net_dropped")
+            or STATE.get("probe_fail", 0) >= PROBE_FAIL_ALERT):
+        color = 0xe74c3c
+    elif is_paused or STATE.get("key_active"):
+        color = 0xf1c40f
+    else:
+        color = 0x2ecc71
+
+    embed = discord.Embed(title="🎮 Roblox Smart Bot", color=color)
+    embed.add_field(name="🗺️ Place ID", value=f"`{info.get('place', '-') or '-'}`", inline=True)
+    embed.add_field(name="🔁 Rejoin", value=f"`{info.get('rejoin', 0)}` ครั้ง", inline=True)
+    embed.add_field(name="🕒 ล่าสุด", value=f"`{info.get('last', '-')}`", inline=True)
+    embed.add_field(name="⏳ บังคับรีจอยอัตโนมัติ", value=f"`{info.get('auto', '-')}`", inline=False)
+    embed.add_field(name="📱 อุปกรณ์", value=f"`{dev_name}`", inline=True)
+    embed.add_field(name="⚙️ CPU", value=f"{_txt_bar(cpu_usage)}\n`{cpu_usage}%`", inline=True)
+    embed.add_field(name="💾 RAM",
+                    value=f"{_txt_bar(mem_usage_pct)}\n`{mem_usage_pct}%` • ว่าง `{mem_avail_pct}%`",
+                    inline=True)
+    embed.set_footer(text=f"Total {mem_total_gb} GB • เครื่องเปิดมา {uptime_hrs} ชม.")
     return embed
 
 # ================= Join Game =================
@@ -1368,119 +1598,171 @@ def discord_configured(cfg):
     return not discord_missing_items(cfg)
 
 # ================= UI เมนู =================
+def _out(*lines):
+    fix_tty()
+    sys.stdout.write("\r\n".join(lines) + "\r\n")
+    sys.stdout.flush()
+
+def ui_ok(msg):
+    _out(f"  {C_OK}✔{RESET} {msg}")
+
+def ui_warn(msg):
+    _out(f"  {C_WARN}⚠ {msg}{RESET}")
+
+def ui_err(msg):
+    _out(f"  {C_ERR}✘ {msg}{RESET}")
+
+def ui_info(msg):
+    _out(f"  {C_ACC}ℹ{RESET} {msg}")
+
+def ask(label, hint="", secret=False):
+    return safe_input(f"  {C_ACC}❯{RESET} {label}{C_DIM}{hint}{RESET} : ", secret=secret)
+
+def pause_enter():
+    safe_input(f"\n  {C_DIM}กด Enter เพื่อกลับ...{RESET}")
+
+def ui_screen(title, sub=""):
+    """ล้างจอแล้ววาดหัวหน้าจอย่อย"""
+    fix_tty()
+    sys.stdout.write("\033[2J\033[H")
+    rows = [b_top(), b_row(f"{C_ACC}◆{RESET} {C_VAL}{title}{RESET}")]
+    if sub:
+        rows.append(b_row(f"{C_DIM}{sub}{RESET}"))
+    rows += [b_bot(), ""]
+    _out(*rows)
+
+def _menu_item(key, text, style=""):
+    return b_row(f"{C_BD}[{C_ACC}{key}{C_BD}]{RESET} {style}{text}{RESET}")
+
 def print_ui(cfg):
     fix_tty()
     dc = discord_configured(cfg)
     missing = discord_missing_items(cfg)
+    inner = _bw() - 4
+
+    place = cfg.get('place_id') or ""
+    place_v = f"{C_VAL}{trim_visible(place, 22)}{RESET}" if place else f"{C_ERR}ยังไม่ได้ตั้งค่า{RESET}"
     if dc:
-        mode_text = f"{GREEN}ใช้ Discord Bot (ตั้งค่าครบ){RESET}"
+        mode_v = f"{dot('ok')} {C_OK}Discord Bot{RESET}"
     else:
-        mode_text = f"{YELLOW}ไม่ใช้ Discord (เฝ้าจอ/Rejoin อย่างเดียว){RESET}"
-    lines = [
+        mode_v = f"{dot('warn')} {C_WARN}Local {C_DIM}(ไม่ใช้ Discord){RESET}"
+    token_v = (f"{C_OK}✔ ติดตั้งแล้ว{RESET}" if cfg.get('bot_token') else f"{C_ERR}✘ ยังไม่มี{RESET}")
+    n_users = len(cfg.get('allowed_users', []))
+    users_v = (f"{C_OK}{n_users} คน{RESET}" if n_users else f"{C_ERR}ยังไม่มี{RESET}")
+    if cfg.get('key_alert_enabled', True):
+        key_v = (f"{dot('ok')} เปิด {C_DIM}(ทุก "
+                 f"{max(15, int(cfg.get('key_alert_seconds', 60)))} วิ){RESET}")
+    else:
+        key_v = f"{dot('err')} {C_DIM}ปิด{RESET}"
+
+    L = [
         "\033[2J\033[H",
-        f"  {BRIGHT_CYAN}╦═╗┌─┐  ╦┌─┐┬┌┐┌{RESET}   {BOLD_WHITE}R O B L O X   S M A R T   B O T{RESET}",
-        f"  {BRIGHT_CYAN}╠╦╝├┤   ║│ │││││{RESET}   {CYAN}Termux • Rooted • Discord Edition{RESET}",
-        f"  {BRIGHT_CYAN}╩╚═└─┘╚═╝└─┘┴┘└┘{RESET}",
-        f"  {BRIGHT_CYAN}──────────────────────────────────────────────{RESET}",
-        f"  {CYAN}• Place ID       :{RESET} {BOLD_WHITE}{cfg['place_id'] or 'ยังไม่ได้ตั้งค่า'}{RESET}",
-        f"  {CYAN}• โหมดการทำงาน  :{RESET} {mode_text}",
-        f"  {CYAN}• Bot Token      :{RESET} "
-        f"{GREEN if cfg['bot_token'] else RED}{'✅ ติดตั้งแล้ว' if cfg['bot_token'] else '❌ ยังไม่มี'}{RESET}",
-        f"  {CYAN}• ผู้มีสิทธิ์สั่งงาน :{RESET} "
-        f"{GREEN if cfg['allowed_users'] else RED}{len(cfg['allowed_users'])} คน{RESET}"
-        + ("" if dc or len(missing) == 3 else f"  {YELLOW}(ขาด: {', '.join(missing)}){RESET}"),
-        f"  {CYAN}• Auto RAM       :{RESET} {GREEN}ทุกๆ {cfg.get('clear_ram_hours', 1)} ชั่วโมง{RESET}",
-        f"  {CYAN}• แจ้งเตือน Key   :{RESET} {GREEN if cfg.get('key_alert_enabled', True) else RED}"
-        f"{('เปิด (แท็กทุก ' + str(max(15, int(cfg.get('key_alert_seconds', 60)))) + ' วิ)') if cfg.get('key_alert_enabled', True) else 'ปิด'}{RESET}",
-        f"  {CYAN}• โฟลเดอร์ข้อมูล :{RESET} {BOLD_WHITE}{DATA_DIR}{RESET}",
-        f"  {BRIGHT_CYAN}──────────────────────────────────────────────{RESET}",
-        f"  {BOLD_WHITE}1) ตั้งค่าแมพที่จะ Rejoin (Place ID / VIP)",
-        f"  2) ตั้งค่า Discord Bot & ผู้มีสิทธิ์สั่งงาน",
-        f"  3) เริ่มเดินระบบบอทเฝ้าจอ",
-        f"  4) ตั้งค่าเวลา Auto Clear RAM",
-        f"  5) อ่านบันทึก (Log) ที่ถูกเข้ารหัส",
-        f"  6) รีสตาร์ตมือถือ (Reboot)",
-        f"  0) ออกจากโปรแกรม{RESET}",
-        ""
+        b_top(),
+        b_row(f"{C_ACC}◆{RESET} {gradient('ROBLOX SMART BOT')}"),
+        b_row(f"{C_DIM}Termux · Root · Auto Rejoin{RESET}"),
+        b_sep("สถานะ"),
+        b_row(kv("Place ID", place_v)),
+        b_row(kv("โหมด", mode_v)),
+        b_row(kv("Bot Token", token_v)),
+        b_row(kv("ผู้ควบคุม", users_v)),
+    ] + ([b_row(kv("ขาด", f"{C_WARN}{', '.join(missing)}{RESET}"))] if (not dc and len(missing) < 3) else []) + [
+        b_row(kv("Auto RAM", f"{C_VAL}{cfg.get('clear_ram_hours', 1)}{RESET} ชม./รอบ")),
+        b_row(kv("แจ้ง Key", key_v)),
+        b_row(kv("ข้อมูล", f"{C_DIM}{short_path(DATA_DIR, max(8, inner - 12))}{RESET}")),
+        b_sep("เมนู"),
+        _menu_item("1", "ตั้งค่าแมพ (Place ID / VIP)"),
+        _menu_item("2", "ตั้งค่า Discord Bot"),
+        _menu_item("3", "เริ่มเฝ้าจอ & Auto Rejoin", C_OK),
+        _menu_item("4", "ตั้งเวลา Auto Clear RAM"),
+        _menu_item("5", "อ่าน Log (เข้ารหัส)"),
+        _menu_item("6", "รีสตาร์ตมือถือ", C_ERR),
+        _menu_item("0", "ออกจากโปรแกรม", C_DIM),
+        b_bot(),
+        "",
     ]
-    sys.stdout.write("\r\n".join(lines) + "\r\n")
+    sys.stdout.write("\r\n".join(L) + "\r\n")
     sys.stdout.flush()
 
 def menu_1_set_map(cfg):
-    print(f"\n{BRIGHT_CYAN}--- [1] ตั้งค่าแมพสำหรับ Rejoin ---{RESET}")
-    pid = safe_input(f"ใส่เลข Place ID [{cfg['place_id']}]: ")
+    ui_screen("ตั้งค่าแมพ", "Place ID และ VIP Link Code ที่จะ Rejoin")
+    pid = ask("Place ID", f" [{cfg['place_id'] or '-'}]")
     if pid:
         if valid_place_id(pid):
             cfg['place_id'] = pid
         else:
-            print(f"{RED}✘ Place ID ต้องเป็นตัวเลขเท่านั้น{RESET}")
-    vip = safe_input("ใส่ VIP Link Code (ถ้าไม่มีกด Enter): ")
+            ui_err("Place ID ต้องเป็นตัวเลขเท่านั้น")
+    vip = ask("VIP Link Code", " (ไม่มี = Enter)")
     if valid_vip(vip):
         cfg['vip_link_code'] = vip
     else:
-        print(f"{RED}✘ VIP Code ไม่ถูกต้อง{RESET}")
+        ui_err("VIP Code ไม่ถูกต้อง")
     save_config(cfg)
-    print(f"{GREEN}✔ บันทึกเรียบร้อย!{RESET}")
+    ui_ok("บันทึกเรียบร้อย")
     time.sleep(1.5)
 
 def menu_2_set_bot(cfg):
-    print(f"\n{BRIGHT_CYAN}--- [2] ตั้งค่า Discord Bot ---{RESET}")
-    token = safe_input("วาง Bot Token (ไม่แสดงตัวอักษร / Enter = ใช้ค่าเดิม): ", secret=True)
+    ui_screen("ตั้งค่า Discord Bot", "ไม่ตั้งก็ได้ — บอทจะรันโหมด Local ให้อัตโนมัติ")
+    token = ask("Bot Token", " (ซ่อนตัวอักษร / Enter = ค่าเดิม)", secret=True)
     if token:
         cfg['bot_token'] = token
-    cid = safe_input(f"Channel ID [{cfg['channel_id']}]: ")
+    cid = ask("Channel ID", f" [{cfg['channel_id'] or '-'}]")
     if cid:
         if cid.isdigit():
             cfg['channel_id'] = cid
         else:
-            print(f"{RED}✘ Channel ID ต้องเป็นตัวเลข{RESET}")
-    print(f"{YELLOW}ผู้มีสิทธิ์: {cfg['allowed_users'] or 'ยังไม่มี'}{RESET}")
-    users = safe_input("Discord User ID (คั่นด้วย , / Enter = คงเดิม): ")
+            ui_err("Channel ID ต้องเป็นตัวเลข")
+    ui_info(f"ผู้ควบคุมปัจจุบัน: {cfg['allowed_users'] or 'ยังไม่มี'}")
+    users = ask("Discord User ID", " (คั่นด้วย , / Enter = คงเดิม)")
     if users:
         ids = [u.strip() for u in users.split(",") if u.strip()]
         if ids and all(u.isdigit() for u in ids):
             cfg['allowed_users'] = [int(u) for u in ids]
         else:
-            print(f"{RED}✘ User ID ต้องเป็นตัวเลข{RESET}")
-    mins = safe_input(f"แคปหน้าจอทุกกี่นาที [{cfg['screenshot_minutes']}]: ")
+            ui_err("User ID ต้องเป็นตัวเลข")
+    mins = ask("แคปหน้าจอทุกกี่นาที", f" [{cfg['screenshot_minutes']}]")
     if mins.isdigit() and int(mins) > 0:
         cfg['screenshot_minutes'] = int(mins)
     save_config(cfg)
-    print(f"{GREEN}✔ บันทึกเรียบร้อย{RESET}")
-    safe_input("\nกด Enter...")
+    ui_ok("บันทึกเรียบร้อย")
+    miss = discord_missing_items(cfg)
+    if miss:
+        ui_warn(f"Discord ยังไม่ครบ (ขาด: {', '.join(miss)}) → จะรันแบบ Local")
+    else:
+        ui_ok("Discord ตั้งค่าครบ → จะใช้ Discord Bot อัตโนมัติ")
+    pause_enter()
 
 def menu_5_log():
-    print(f"\n{BRIGHT_CYAN}--- [5] Log ล่าสุด (ถอดรหัสให้เฉพาะเครื่องนี้) ---{RESET}")
+    ui_screen("Log ล่าสุด", "ถอดรหัสให้เฉพาะเครื่องนี้")
     show_log(40)
-    safe_input("\nกด Enter...")
+    pause_enter()
 
 def menu_6_reboot():
-    print(f"\n{BRIGHT_CYAN}--- [6] รีสตาร์ตมือถือ ---{RESET}")
-    if safe_input(f"{RED}เครื่องจะรีบูตทันที! พิมพ์ yes เพื่อยืนยัน: {RESET}").lower() != "yes":
-        print(f"{YELLOW}ยกเลิกแล้ว{RESET}")
+    ui_screen("รีสตาร์ตมือถือ", "เครื่องจะรีบูตทันที Termux จะปิดไปด้วย")
+    if ask(f"{C_ERR}พิมพ์ yes เพื่อยืนยัน{RESET}").lower() != "yes":
+        ui_warn("ยกเลิกแล้ว")
         time.sleep(1)
         return
     if not has_root():
-        print(f"{RED}✘ ใช้ root ไม่ได้{RESET}")
+        ui_err("ใช้ root ไม่ได้")
         time.sleep(2)
         return
     add_history("Reboot Phone", "สั่งจากเมนูในเครื่อง")
-    print(f"{YELLOW}🔌 กำลังรีสตาร์ต...{RESET}")
+    ui_info("กำลังรีสตาร์ต...")
     reboot_phone()
 
 def menu_4_ram(cfg):
-    print(f"\n{BRIGHT_CYAN}--- [4] ตั้งค่า Auto Clear RAM ---{RESET}")
-    val = safe_input("เคลียร์แคชทุกกี่ชั่วโมง? (ขั้นต่ำ 0.1): ")
+    ui_screen("ตั้งค่า Auto Clear RAM", f"ตอนนี้: ทุก {cfg.get('clear_ram_hours', 1)} ชั่วโมง")
+    val = ask("เคลียร์แคชทุกกี่ชั่วโมง", " (ขั้นต่ำ 0.1)")
     try:
         if float(val) >= 0.1:
             cfg['clear_ram_hours'] = float(val)
             save_config(cfg)
-            print(f"{GREEN}✔ บันทึกแล้ว{RESET}")
+            ui_ok("บันทึกแล้ว")
         else:
-            print(f"{RED}✘ ต้อง ≥ 0.1{RESET}")
+            ui_err("ต้อง ≥ 0.1")
     except ValueError:
-        print(f"{RED}✘ ไม่ใช่ตัวเลข{RESET}")
-    safe_input("\nกด Enter...")
+        ui_err("ไม่ใช่ตัวเลข")
+    pause_enter()
 
 # ================= Discord Messaging =================
 def spawn(coro):
@@ -1562,17 +1844,15 @@ async def _send_bot_report_impl(channel, message="", include_screenshot=False, f
     if STATE.get("last_successful_rejoin", 0.0) > 0:
         last_rejoin_str = datetime.fromtimestamp(STATE["last_successful_rejoin"]).strftime("%Y-%m-%d %H:%M:%S")
 
-    content = f"🤖 **[ORIGINAL REPORT]**{pause_tag} (`{now_str}`)\n"
-    content += f"📌 **สถานะ:** {get_status_text()}\n"
+    content = f"**{get_status_text()}**{pause_tag}\n"
     if message:
-        content += f"📝 **รายละเอียด:** {message}\n"
-    content += (f"🎮 **Place ID:** `{CFG['place_id']}`\n"
-                f"🔁 **Rejoin รวม:** {STATE['rejoin_total']} ครั้ง\n"
-                f"⏱️ **Rejoin ล่าสุด:** `{last_rejoin_str}`\n"
-                f"⏳ **บังคับรีจอยอัตโนมัติ:** `{_format_auto_rejoin_text()}`")
+        content += "> " + str(message).replace("\n", "\n> ") + "\n"
+    content += f"-# 🕒 {now_str}"
+    info = {"place": CFG.get('place_id', ''), "rejoin": STATE['rejoin_total'],
+            "last": last_rejoin_str, "auto": _format_auto_rejoin_text()}
 
     try:
-        embed = await asyncio.to_thread(get_discord_embed, STATE["dev_name"], STATE["paused"])
+        embed = await asyncio.to_thread(get_discord_embed, STATE["dev_name"], STATE["paused"], info)
         view = ControlView()
         img_bytes = await asyncio.to_thread(capture_screenshot_bytes) if include_screenshot else None
 
@@ -2200,30 +2480,32 @@ class ControlView(discord.ui.View):
 def menu_3_start_bot(cfg):
     global DASHBOARD_ACTIVE, LAST_RESULT_TEXT
 
+    ui_screen("เริ่มระบบเฝ้าจอ", "ตรวจความพร้อมก่อนเริ่มทำงาน")
     if not cfg['place_id']:
-        print(f"\n{RED}✘ กรุณาตั้งค่า Place ID ก่อน (เมนู 1)!{RESET}")
+        ui_err("ยังไม่ได้ตั้งค่า Place ID — ไปที่เมนู 1 ก่อน")
         time.sleep(2)
         return
+    ui_ok(f"Place ID: {cfg['place_id']}")
 
     # ตรวจการตั้งค่า Discord อัตโนมัติ: ครบ = ใช้ Discord / ไม่ครบ = ไม่ใช้ (ไม่ถามผู้ใช้)
     use_discord = discord_configured(cfg)
     missing = discord_missing_items(cfg)
-    print(f"\n{BRIGHT_CYAN}--- [3] เริ่มระบบเฝ้าจอ ---{RESET}")
     if use_discord:
-        print(f"{GREEN}✔ ตั้งค่า Discord ครบ → ใช้ Discord Bot อัตโนมัติ{RESET}")
+        ui_ok("ตั้งค่า Discord ครบ → ใช้ Discord Bot อัตโนมัติ")
     elif len(missing) < 3:
-        print(f"{YELLOW}⚠ ตั้งค่า Discord ไม่ครบ (ขาด: {', '.join(missing)}) → รันแบบไม่ใช้ Discord{RESET}")
+        ui_warn(f"ตั้งค่า Discord ไม่ครบ (ขาด: {', '.join(missing)}) → รันแบบ Local")
     else:
-        print(f"{YELLOW}ℹ ยังไม่ได้ตั้งค่า Discord → รันแบบไม่ใช้ Discord{RESET}")
+        ui_info("ยังไม่ได้ตั้งค่า Discord → รันแบบ Local (เฝ้าจอ/Rejoin อย่างเดียว)")
     if use_discord != bool(cfg.get('use_discord', True)):
         cfg['use_discord'] = use_discord
         save_config(cfg)
-    time.sleep(1.5)
 
     if not has_root():
-        print(f"\n{RED}✘ ใช้ root (su) ไม่ได้ — ตรวจสอบสิทธิ์ root ของ Termux ก่อน{RESET}")
+        ui_err("ใช้ root (su) ไม่ได้ — ตรวจสอบสิทธิ์ root ของ Termux ก่อน")
         time.sleep(3)
         return
+    ui_ok("root พร้อมใช้งาน")
+    time.sleep(1.2)
 
     channel_id = int(cfg['channel_id']) if use_discord else 0
 
@@ -2256,12 +2538,14 @@ def menu_3_start_bot(cfg):
         "auto_paused": False, "auto_paused_at": 0.0, "rejoin_started": 0.0,
         "key_hits": 0, "key_active": False, "key_since": 0.0, "last_key_alert": 0.0,
         "key_msgs": [], "hang_count": 0, "cpu_last": None,
+        "mode_discord": use_discord, "session_start": now,
     })
     reset_dash_state()
     _NET_CACHE_UNTIL[0] = 0.0
 
     LAST_RESULT_TEXT = (f"{YELLOW}⏳ กำลังเชื่อมต่อ Discord...{RESET}" if use_discord
                         else f"{YELLOW}⏳ เริ่มโหมดไม่ใช้ Discord...{RESET}")
+    _DASH_FIRST[0] = True
     DASHBOARD_ACTIVE = True
     print_bot_dashboard()
 
@@ -2491,6 +2775,14 @@ def menu_3_start_bot(cfg):
     async def before_watchdog():
         await wait_ready()
 
+    @tasks.loop(seconds=3)
+    async def dash_refresh():
+        """วาด Dashboard ใหม่ทุก 3 วินาที (ให้เวลา/แถบสถานะขยับแม้ไม่มี log ใหม่)"""
+        if DASHBOARD_ACTIVE:
+            _DASH_DIRTY[0] = False
+            _LAST_DASH_RENDER[0] = time.time()
+            print_bot_dashboard()
+
     async def start_services(channel):
         """เริ่มลูปเฝ้าจอ + Watchdog และเข้าแมพครั้งแรกถ้าเกมยังไม่เปิด (ใช้ร่วมกันทั้งสองโหมด)"""
         touch_heartbeat()
@@ -2498,6 +2790,8 @@ def menu_3_start_bot(cfg):
             game_monitor_loop.start()
         if not bot_watchdog.is_running():
             bot_watchdog.start()
+        if not dash_refresh.is_running():
+            dash_refresh.start()
 
         if not await aroot(f"pidof {PACKAGE_NAME}"):
             log("เปิดเกมเข้าแมพครั้งแรก...", CYAN, force_redraw=True)
@@ -2542,7 +2836,7 @@ def menu_3_start_bot(cfg):
         except discord.LoginFailure:
             DASHBOARD_ACTIVE = False
             fix_tty()
-            print(f"\n{RED}❌ Bot Token ไม่ถูกต้อง!{RESET}")
+            ui_err("Bot Token ไม่ถูกต้อง!")
             time.sleep(2)
             return
         except KeyboardInterrupt:
@@ -2567,8 +2861,8 @@ def menu_3_start_bot(cfg):
     except OSError:
         pass
     add_history("Bot Stop", "ปิดระบบ")
-    print(f"\n\n{YELLOW}🛑 ปิดบอท (Offline){RESET}")
-    ans = safe_input("บังคับปิด Roblox ด้วยไหม? (y/n): ").lower()
+    _out("", f"  {C_WARN}■ ปิดบอทแล้ว (Offline){RESET}")
+    ans = ask("บังคับปิด Roblox ด้วยไหม?", " (y/n)").lower()
     if ans == 'y':
         run_root_text(f"am force-stop {PACKAGE_NAME}")
     time.sleep(1)
@@ -2577,7 +2871,7 @@ def menu_3_start_bot(cfg):
 def wait_device_ready(timeout=180):
     """หลังบูตใหม่ root/รหัสเครื่องอาจยังไม่พร้อม: ต้องรอก่อนแตะไฟล์ที่เข้ารหัส
     (ไม่งั้นถอดรหัสไม่ได้แล้วไฟล์ตั้งค่าจะถูกย้ายไปเก็บเป็น .unreadable)"""
-    print(f"{CYAN}⏳ รอ root และรหัสเครื่องพร้อม (สูงสุด {timeout} วินาที)...{RESET}")
+    ui_info(f"รอ root และรหัสเครื่องพร้อม (สูงสุด {timeout} วินาที)...")
     end = time.time() + timeout
     while time.time() < end:
         if run_root_text("id -u", timeout=10) == "0":
@@ -2589,7 +2883,7 @@ def wait_device_ready(timeout=180):
         try:
             with open(p, "rb") as f:
                 if f.read(5) == SEAL_MAGIC + b"D":
-                    print(f"{RED}✘ root ยังไม่พร้อม และไฟล์ตั้งค่าผูกกับเครื่อง จึงไม่เปิดบอท (ไม่แตะไฟล์ใด ๆ){RESET}")
+                    ui_err("root ยังไม่พร้อม และไฟล์ตั้งค่าผูกกับเครื่อง จึงไม่เปิดบอท (ไม่แตะไฟล์ใด ๆ)")
                     return False
         except OSError:
             pass
@@ -2597,7 +2891,7 @@ def wait_device_ready(timeout=180):
 
 def run_autostart():
     """เริ่มเฝ้าจอทันทีตามค่าที่ตั้งไว้ (ไม่ผ่านเมนู) ถ้าเกิดข้อผิดพลาดจะลองใหม่เอง"""
-    print(f"{GREEN}🚀 โหมดเริ่มอัตโนมัติ (--autostart){RESET}")
+    ui_ok("โหมดเริ่มอัตโนมัติ (--autostart)")
     logger.info("autostart: เริ่มระบบ")
     for attempt in range(1, 6):
         try:
@@ -2605,7 +2899,7 @@ def run_autostart():
             return
         except Exception as e:
             logger.error("autostart error:\n%s", traceback.format_exc())
-            print(f"{RED}🔥 autostart ผิดพลาด ({attempt}/5): {e!r} — ลองใหม่ใน 30 วินาที{RESET}")
+            ui_err(f"autostart ผิดพลาด ({attempt}/5): {e!r} — ลองใหม่ใน 30 วินาที")
             time.sleep(30)
 
 # ================= Main =================
@@ -2616,14 +2910,14 @@ def main():
     autostart = "--autostart" in sys.argv
     if autostart and not wait_device_ready():
         return
-    print(f"{CYAN}🔐 กำลังเตรียมระบบเข้ารหัสไฟล์ข้อมูล...{RESET}")
+    ui_info("กำลังเตรียมระบบเข้ารหัสไฟล์ข้อมูล...")
     if seal_mode_now() == b"F":
-        print(f"{YELLOW}⚠️ อ่านรหัสเครื่องผ่าน root ไม่ได้ ใช้โหมดสำรอง (ผูกกับ Termux เท่านั้น) — "
-              f"เปิดโปรแกรมใหม่เมื่อ root พร้อม ไฟล์จะอัปเกรดเป็นโหมดผูกเครื่องอัตโนมัติ{RESET}")
+        ui_warn("อ่านรหัสเครื่องผ่าน root ไม่ได้ ใช้โหมดสำรอง (ผูกกับ Termux เท่านั้น) — "
+                "เปิดโปรแกรมใหม่เมื่อ root พร้อม ไฟล์จะอัปเกรดเป็นโหมดผูกเครื่องอัตโนมัติ")
         time.sleep(1.5)
     if MIGRATED_FILES:
         logger.info(f"ย้ายไฟล์เวอร์ชันเก่าเข้า {DATA_DIR}: {', '.join(MIGRATED_FILES)}")
-        print(f"{GREEN}📁 ย้ายไฟล์ตั้งค่าเดิมเข้าโฟลเดอร์ {DATA_DIR} แล้ว: {', '.join(MIGRATED_FILES)}{RESET}")
+        ui_ok(f"ย้ายไฟล์ตั้งค่าเดิมเข้าโฟลเดอร์ {DATA_DIR} แล้ว: {', '.join(MIGRATED_FILES)}")
         time.sleep(1.5)
     CFG.update(load_config())
     load_history()
@@ -2639,8 +2933,8 @@ def main():
                 pass
     if SECURE_WARNINGS:
         for w in SECURE_WARNINGS:
-            print(f"{RED}🔒 {w}{RESET}")
-        print(f"{YELLOW}   (ไฟล์เดิมไม่ถูกลบ — ถ้าเป็นแค่ root ไม่ตอบสนองชั่วคราว ให้เปลี่ยนชื่อกลับแล้วเปิดใหม่){RESET}")
+            ui_err(f"🔒 {w}")
+        ui_warn("ไฟล์เดิมไม่ถูกลบ — ถ้าเป็นแค่ root ไม่ตอบสนองชั่วคราว ให้เปลี่ยนชื่อกลับแล้วเปิดใหม่")
         time.sleep(4)
     if autostart:
         run_autostart()
@@ -2648,7 +2942,7 @@ def main():
     try:
         while True:
             print_ui(CFG)
-            choice = safe_input(f"  {BOLD_WHITE}เลือกเมนู: {RESET}")
+            choice = ask("เลือกเมนู", " [0-6]")
             if choice == "1":
                 menu_1_set_map(CFG)
             elif choice == "2":
@@ -2664,11 +2958,11 @@ def main():
             elif choice == "0":
                 sys.exit(0)
             elif choice:
-                print(f"{RED}✘ ไม่มีเมนู '{choice}'{RESET}")
+                ui_err(f"ไม่มีเมนู '{choice}'")
                 time.sleep(1)
     except KeyboardInterrupt:
         fix_tty()
-        print(f"\n{YELLOW}👋 ออกจากโปรแกรม{RESET}")
+        _out("", f"  {C_ACC}👋 ออกจากโปรแกรม{RESET}")
 
 if __name__ == "__main__":
     main()
