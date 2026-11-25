@@ -37,7 +37,6 @@ except ImportError:
     import discord
     from discord.ext import commands, tasks
 
-# ================= ตั้งค่าสีหน้าจอ =================
 CYAN = "\033[96m"
 BRIGHT_CYAN = "\033[1;96m"
 BOLD_WHITE = "\033[1;97m"
@@ -47,9 +46,6 @@ ORANGE = "\033[38;5;208m"
 RED = "\033[91m"
 RESET = "\033[0m"
 
-# ================= โฟลเดอร์เก็บข้อมูลของโปรแกรม =================
-# สร้างอัตโนมัติตอนรัน: <โฟลเดอร์ที่วางสคริปต์>/RobloxBotData
-# เก็บ config / log / ประวัติ / dashboard ไว้ที่เดียว หาเจอง่าย
 APP_DIR_NAME = "RobloxBotData"
 
 def _script_dir():
@@ -59,7 +55,6 @@ def _script_dir():
         return os.getcwd()
 
 def _pick_data_dir():
-    """เลือกที่สร้างโฟลเดอร์ข้อมูล: ข้างสคริปต์ → ~ (home) → โฟลเดอร์ปัจจุบัน"""
     for root in (_script_dir(), os.path.expanduser("~"), os.getcwd()):
         d = os.path.join(root, APP_DIR_NAME)
         try:
@@ -72,7 +67,6 @@ def _pick_data_dir():
 
 DATA_DIR = _pick_data_dir()
 
-# ชื่อไฟล์เดิม (เวอร์ชันเก่าวางไว้ข้างสคริปต์) → ชื่อใหม่ในโฟลเดอร์ข้อมูล
 LEGACY_FILES = {
     "original_config.json": "config.json",
     "original_bot.log": "bot.log",
@@ -81,7 +75,6 @@ LEGACY_FILES = {
 }
 
 def migrate_legacy_files():
-    """ย้ายไฟล์ตั้งค่า/ประวัติของเวอร์ชันเก่าเข้าโฟลเดอร์ข้อมูล (ไม่ทับไฟล์ใหม่ที่มีอยู่แล้ว)"""
     moved = []
     for old, new in LEGACY_FILES.items():
         dst = os.path.join(DATA_DIR, new)
@@ -98,7 +91,6 @@ def migrate_legacy_files():
                     continue
     return moved
 
-# ต้องย้ายก่อนสร้าง logger (กันไฟล์ log เก่าถูกเปิดค้าง)
 MIGRATED_FILES = migrate_legacy_files()
 
 CONFIG_FILE = os.path.join(DATA_DIR, "config.json")
@@ -116,16 +108,15 @@ MAX_LOOP_RESTARTS = 5
 DISCORD_OFFLINE_THRESHOLD = 60
 REJOIN_USER_COOLDOWN = 30
 MAX_HISTORY_RECORDS = 50
-PROBE_FAIL_ALERT = 4          # root/probe ล้มเหลวติดกันกี่รอบถึงแจ้งเตือน
+PROBE_FAIL_ALERT = 4
 DISCORD_MSG_LIMIT = 1990
-MONITOR_CYCLE_TIMEOUT = 900     # ลูปเฝ้าจอ 1 รอบ (รวม backoff + Rejoin) ห้ามเกินกี่วินาที
-REPORT_TIMEOUT = 30             # ส่งรายงาน Discord ห้ามเกินกี่วินาที (กันบล็อก Rejoin)
-REJOIN_HARD_TIMEOUT_EXTRA = 150 # เวลาเผื่อของ Rejoin นอกเหนือจาก join_wait_seconds
-FATAL_CONFIRM = 3               # ต้องเจออาการ "ต้องอัปเดต" ซ้ำกี่ครั้งถึงหยุดอัตโนมัติ
-FATAL_RETRY_SECONDS = 1800      # หยุดอัตโนมัติแล้ว ลองกลับมาทำงานเองหลังกี่วินาที
-KEY_PANEL_CONFIRM = 2           # ต้องเจอหน้าต่าง Key ติดกันกี่รอบถึงแจ้งเตือน (กันภาพกระพริบ/แจ้งผิด)
+MONITOR_CYCLE_TIMEOUT = 900
+REPORT_TIMEOUT = 30
+REJOIN_HARD_TIMEOUT_EXTRA = 150
+FATAL_CONFIRM = 3
+FATAL_RETRY_SECONDS = 1800
+KEY_PANEL_CONFIRM = 2
 
-# --- PERFORMANCE TUNABLES ---
 NET_CACHE_SECONDS = 30
 DASH_THROTTLE_SECONDS = 0.5
 ROOT_TIMEOUT_DEFAULT = 15
@@ -151,15 +142,15 @@ DEFAULT_CONFIG = {
     "frozen_screen_checks": 4,
     "ui_check_every_n": 2,
     "screen_check_every_n": 2,
-    "frozen_hard_checks": 12,   # จอนิ่งกี่ครั้ง (ไม่สนว่า Log ขยับ) ถึง Rejoin; 0 = ปิด
-    "device_tweaks": True,      # ตั้งค่าเครื่องกัน Android ฆ่า Termux/ปิดจอ ตอนเริ่มบอท
-    "key_alert_enabled": True,  # ตรวจหน้าต่าง Delta ขอ Key (Welcome Back!) แล้วแท็ก Discord
-    "key_alert_seconds": 60,    # แท็กซ้ำทุกกี่วินาทีตราบที่หน้าต่างยังอยู่ (ขั้นต่ำ 15)
-    "key_alert_delete": True,   # ลบข้อความแท็กเก่าอัตโนมัติ (ลบอันเก่าเมื่อแท็กใหม่ / ลบทั้งหมดเมื่อหน้าต่างหาย)
-    "use_discord": True,        # ระบบตั้งให้เองตอนกดเริ่มบอท: ตั้งค่า Discord ครบ = True / ไม่ครบ = False
-    "cfg_version": 0,           # ใช้ปรับค่าเริ่มต้นใหม่ให้ config เก่าครั้งเดียว
-    "lobby_min_nodes": 25,      # จำนวน UI node ของ Roblox ที่ถือว่าเป็นหน้าเมนู; 0 = ปิด
-    "hang_cpu_checks": 5,       # CPU นิ่งกี่รอบถึงถือว่าค้าง; 0 = ปิด
+    "frozen_hard_checks": 12,
+    "device_tweaks": True,
+    "key_alert_enabled": True,
+    "key_alert_seconds": 60,
+    "key_alert_delete": True,
+    "use_discord": True,
+    "cfg_version": 0,
+    "lobby_min_nodes": 25,
+    "hang_cpu_checks": 5,
 }
 
 CFG = {}
@@ -205,31 +196,25 @@ REJOIN_HISTORY = []
 DASHBOARD_ACTIVE = False
 LAST_RESULT_TEXT = f"{YELLOW}🛡️ รอรับคำสั่ง...{RESET}"
 
-# เหตุผลที่ต้อง "หยุดอัตโนมัติ" แทนการ Rejoin (ใช้ค่าคงที่แทนการค้นหาข้อความภาษาไทย)
 REASON_PLAY_STORE = "เด้งไป Play Store (เกมบังคับอัปเดตแพทช์)"
 REASON_UPGRADE_UI = "หน้าจอแจ้งให้อัปเดตเวอร์ชัน (Upgrade Required)"
 FATAL_REASONS = {REASON_PLAY_STORE, REASON_UPGRADE_UI}
 REASON_PROBE_FAIL = "ข้ามการตรวจ (root ไม่ตอบสนอง)"
 REASON_LOBBY = "เด้งออกกลับมาหน้าเมนูหลัก Roblox"
 REASON_HANG = "Roblox ค้าง (โปรเซสแทบไม่ทำงาน)"
-HANG_CPU_RATE = 1.0   # ticks/วินาที ต่ำกว่านี้ = โปรเซสแทบนิ่ง (100 = 1 คอร์เต็ม)
+HANG_CPU_RATE = 1.0
 
-# ================= เข้ารหัสไฟล์ข้อมูล (config / log / history / dash) =================
-# ใช้ไลบรารีมาตรฐานล้วน (ไม่ต้องติดตั้งเพิ่ม): คีย์ผูกกับ "เครื่องนี้" (Android ID + serial + รุ่น ผ่าน root)
-# → PBKDF2 ; เข้ารหัสด้วย keystream SHAKE-256 + ตรวจความถูกต้องด้วย HMAC-SHA256 (Encrypt-then-MAC)
-# ผลลัพธ์: คัดลอกโฟลเดอร์ RobloxBotData ไปเครื่องอื่นแล้วอ่าน/ใช้ token ไม่ได้ และไฟล์ที่ถูกแก้จะถูกตรวจพบ
 SEAL_MAGIC = b"RBE1"
 _APP_PEPPER = b"rbbot|seal|v1|9f3c1d7ab25e48f0"
 _KEY_CACHE = {}
 _KEY_LOCK = threading.Lock()
-_D_RETRY_AT = [0.0]          # ถ้าอ่านรหัสเครื่องไม่ได้ จะไม่ลองซ้ำถี่ ๆ (กัน su หน่วงทุกครั้งที่เขียน log)
-SECURE_WARNINGS = []         # ข้อความเตือนไว้แสดงตอนเปิดโปรแกรม
+_D_RETRY_AT = [0.0]
+SECURE_WARNINGS = []
 
 class SealError(Exception):
     pass
 
 def _device_fingerprint():
-    """รวมค่าประจำเครื่องผ่าน root; คืน None ถ้าอ่านไม่ได้"""
     try:
         _, out, _ = _su_exec(
             "settings get secure android_id; getprop ro.serialno; getprop ro.boot.serialno; "
@@ -254,7 +239,6 @@ def _master_key(mode):
                 return None
             secret = fp.encode("utf-8")
         elif mode == b"F":
-            # โหมดสำรองเมื่อไม่มี root: ผูกกับ user/โฟลเดอร์ Termux เท่านั้น (อ่อนกว่า)
             secret = f"{os.getuid()}|{os.path.expanduser('~')}".encode("utf-8")
         else:
             return None
@@ -302,7 +286,6 @@ def is_sealed_file(path):
         return False
 
 def _quarantine(path, reason):
-    """ไฟล์ถอดรหัสไม่ได้ → เปลี่ยนชื่อเก็บไว้ (ไม่ลบ/ไม่ทับ) แล้วเตือนผู้ใช้"""
     dst = f"{path}.unreadable-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
     try:
         os.replace(path, dst)
@@ -311,7 +294,6 @@ def _quarantine(path, reason):
         SECURE_WARNINGS.append(f"{os.path.basename(path)}: {reason}")
 
 def read_secure_json(path):
-    """อ่านไฟล์ JSON ที่เข้ารหัส (รองรับไฟล์ JSON ธรรมดาของเวอร์ชันเก่าด้วย)"""
     with open(path, "rb") as f:
         raw = f.read()
     if raw.startswith(SEAL_MAGIC):
@@ -323,7 +305,6 @@ def read_secure_json(path):
     return json.loads(raw.decode("utf-8"))
 
 def seal_plain_files():
-    """เข้ารหัสไฟล์เก่าที่ยังเป็น JSON ธรรมดาให้เรียบร้อย"""
     for p in (CONFIG_FILE, HISTORY_FILE, DASH_FILE):
         try:
             if os.path.isfile(p) and not is_sealed_file(p):
@@ -332,13 +313,12 @@ def seal_plain_files():
             logger.warning(f"เข้ารหัสไฟล์ {os.path.basename(p)} ไม่สำเร็จ: {e!r}")
 
 class SealedFormatter(logging.Formatter):
-    """แต่ละบรรทัดใน bot.log ถูกเข้ารหัส (base64) อ่านผ่านเมนู 5 หรือ python roblox_bot.py --log"""
     def format(self, record):
         try:
             text = super().format(record)
             return base64.b64encode(seal(text.encode("utf-8"))).decode("ascii")
         except Exception:
-            return "[log-seal-error]"   # ห้ามหลุดเป็นข้อความธรรมดา
+            return "[log-seal-error]"
 
 def decode_log_line(line):
     line = line.strip()
@@ -347,10 +327,9 @@ def decode_log_line(line):
     try:
         return unseal(base64.b64decode(line, validate=True)).decode("utf-8", errors="replace")
     except Exception:
-        return line   # บรรทัดเก่าที่ยังไม่เข้ารหัส / ถอดไม่ได้ แสดงตามเดิม
+        return line
 
 def style_log_line(line):
-    """ใส่สีให้บรรทัด log (เวลา = เทาจาง, ผิดพลาด = แดง, เตือน = เหลือง, สำเร็จ = เขียว)"""
     ts, msg = (line[:23], line[23:]) if len(line) > 23 and line[4:5] == "-" else ("", line)
     low = msg.lower()
     if "[audit]" in low:
@@ -379,7 +358,6 @@ def show_log(n=40):
         if out:
             print(style_log_line(out))
 
-# ================= Logging =================
 logger = logging.getLogger("rbbot")
 logger.setLevel(logging.INFO)
 try:
@@ -393,11 +371,9 @@ try:
 except OSError:
     pass
 
-# ================= ตัวตรวจสอบข้อมูล =================
 RE_PLACE = re.compile(r"\d{1,20}")
 RE_VIP = re.compile(r"[A-Za-z0-9_\-]{1,100}")
 RE_FILE = re.compile(r"[\w\-. ]{1,60}\.(?:lua|txt|json|cfg|ini)", re.IGNORECASE)
-# อนุญาตเฉพาะที่เก็บไฟล์ผู้ใช้/ข้อมูลแอปที่จำเป็น (แคบกว่าเดิมที่เปิดทั้ง /system /root /vendor)
 RE_PATH = re.compile(
     r"^/(?:sdcard"
     r"|storage"
@@ -446,10 +422,7 @@ def is_authorized(user_id):
     except (TypeError, ValueError):
         return False
 
-# ================= ไฟล์ JSON แบบ atomic =================
 def atomic_write_json(path, data, **dump_kwargs):
-    """เข้ารหัสแล้วเขียนผ่าน temp + os.replace (กันไฟล์พังเมื่อโปรแกรมถูกปิดกลางคัน)
-    mkstemp สร้างไฟล์สิทธิ์ 600 ให้อยู่แล้ว เหมาะกับ config ที่มี token"""
     directory = os.path.dirname(os.path.abspath(path)) or "."
     payload = seal(json.dumps(data, ensure_ascii=False, **dump_kwargs).encode("utf-8"))
     fd, tmp = tempfile.mkstemp(prefix=".tmp_", dir=directory)
@@ -464,7 +437,6 @@ def atomic_write_json(path, data, **dump_kwargs):
             pass
         raise
 
-# ================= ฟังก์ชันจัดการประวัติ (History) =================
 def load_history():
     try:
         if os.path.exists(HISTORY_FILE):
@@ -492,7 +464,6 @@ def add_history(action, reason="", extra=None):
         del REJOIN_HISTORY[: len(REJOIN_HISTORY) - MAX_HISTORY_RECORDS]
     save_history()
 
-# ================= ฟังก์ชันจัดระเบียบหน้าจอ =================
 def fix_tty():
     try:
         import termios
@@ -504,7 +475,6 @@ def fix_tty():
         pass
 
 def _char_width(ch):
-    # สระ/วรรณยุกต์ไทย, variation selector, ZWJ ฯลฯ กว้าง 0
     if unicodedata.category(ch) in ("Mn", "Me", "Cf"):
         return 0
     if unicodedata.east_asian_width(ch) in ("W", "F") or ord(ch) >= 0x1F000:
@@ -526,27 +496,23 @@ def trim_visible(text, max_vis=26):
         out.append(ch)
     return "".join(out)
 
-# ================= UI Toolkit: ธีมสี / กล่อง / แถบ =================
-# เส้นขอบขวาของทุกกล่องใช้ "ตำแหน่งคอลัมน์สัมบูรณ์" (ESC[nG) จึงไม่เพี้ยนแม้ emoji/ภาษาไทยกว้างไม่เท่ากัน
-C_BD = "\033[38;5;38m"       # เส้นขอบ
-C_DIM = "\033[38;5;244m"     # ข้อความรอง
-C_LBL = "\033[38;5;109m"     # ป้ายชื่อ
-C_VAL = "\033[1;97m"         # ค่า
-C_OK = "\033[38;5;84m"       # สำเร็จ / ปกติ
-C_WARN = "\033[38;5;221m"    # เตือน
-C_ERR = "\033[38;5;203m"     # ผิดพลาด
-C_ACC = "\033[1;38;5;51m"    # สีเน้น
+C_BD = "\033[38;5;38m"
+C_DIM = "\033[38;5;244m"
+C_LBL = "\033[38;5;109m"
+C_VAL = "\033[1;97m"
+C_OK = "\033[38;5;84m"
+C_WARN = "\033[38;5;221m"
+C_ERR = "\033[38;5;203m"
+C_ACC = "\033[1;38;5;51m"
 
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
-RECENT_LOGS = deque(maxlen=60)   # (เวลา, สี, ข้อความ) ไว้โชว์ในหน้า Dashboard
+RECENT_LOGS = deque(maxlen=60)
 _DASH_FIRST = [True]
 
 def vlen(s):
-    """ความกว้างที่มองเห็นจริง (ตัด ANSI ทิ้ง, สระ/วรรณยุกต์ไทยกว้าง 0)"""
     return sum(_char_width(ch) for ch in ANSI_RE.sub("", str(s)))
 
 def fit(s, width):
-    """ตัดข้อความที่มีสี ANSI ให้ไม่เกิน width โดยไม่ทำสีพัง"""
     s = str(s)
     if vlen(s) <= width:
         return s
@@ -583,7 +549,6 @@ def _term_size():
         return 46, 24
 
 def _bw():
-    """ความกว้างกล่อง (ปรับตามจอ: 32-56)"""
     cols, _ = _term_size()
     return max(32, min(cols - 2, 56))
 
@@ -628,7 +593,6 @@ def bar(val, need, width=10):
             f"{C_DIM}{min(val, need)}/{need}{RESET}")
 
 def gradient(text, colors=(51, 45, 39, 33, 27)):
-    """ไล่สีตัวอักษร (ใช้กับข้อความ ASCII เท่านั้น)"""
     n = max(1, len(text))
     out = []
     for i, ch in enumerate(text):
@@ -654,7 +618,6 @@ def short_path(p, maxlen):
     p = str(p)
     return p if len(p) <= maxlen else "…" + p[-(maxlen - 1):]
 
-# ================= หน้า Dashboard ตอนบอททำงาน =================
 _LAST_DASH_RENDER = [0.0]
 _DASH_DIRTY = [False]
 
@@ -750,7 +713,6 @@ def print_bot_dashboard():
     sys.stdout.flush()
 
 def flush_dashboard():
-    """วาดซ้ำถ้ามีข้อความที่ถูก throttle ทิ้งไว้ (กันข้อความสุดท้ายไม่แสดง)"""
     if DASHBOARD_ACTIVE and _DASH_DIRTY[0]:
         _DASH_DIRTY[0] = False
         _LAST_DASH_RENDER[0] = time.time()
@@ -797,7 +759,6 @@ def safe_input(prompt_text, secret=False):
     except EOFError:
         return ""
 
-# ================= จัดการ Config =================
 def _clean_user_ids(raw):
     ids = []
     if isinstance(raw, list):
@@ -818,7 +779,6 @@ def load_config():
         except Exception as e:
             logger.warning(f"อ่านไฟล์ config ไม่ได้: {e}")
 
-    # ตรวจ/แปลงชนิดข้อมูล กันค่าพังจากการแก้ไฟล์มือ
     for key, default in DEFAULT_CONFIG.items():
         if isinstance(default, bool):
             continue
@@ -830,7 +790,6 @@ def load_config():
         elif isinstance(default, str):
             cfg[key] = "" if cfg[key] is None else str(cfg[key]).strip()
 
-    # config เก่า: ปรับค่าตรวจจับให้ไวขึ้นครั้งเดียว (ผู้ใช้แก้เองต่อได้หลังจากนี้)
     if int(cfg.get("cfg_version", 0)) < 2:
         cfg.update({"ui_check_every_n": 2, "frozen_screen_checks": 4,
                     "frozen_hard_checks": 12, "cfg_version": 2})
@@ -842,14 +801,10 @@ def load_config():
 def save_config(cfg):
     atomic_write_json(CONFIG_FILE, cfg, indent=4)
 
-# ================= Core Root =================
-# pool แยกสำหรับงาน root (ไม่ไปแย่ง default executor ของ discord.py/asyncio)
 ROOT_POOL = ThreadPoolExecutor(max_workers=16, thread_name_prefix="root")
-TIMEOUT_BIN = [False]   # เครื่องมีคำสั่ง `timeout` ฝั่ง root ไหม (ตรวจตอนเริ่มบอท)
+TIMEOUT_BIN = [False]
 
 def _t(seconds, cmd):
-    """ครอบคำสั่งที่เสี่ยงค้าง (dumpsys/uiautomator/screencap) ด้วย timeout ฝั่ง root
-    ไม่ให้มีโพรเซสค้างสะสมในเครื่องเวลารันนาน ๆ"""
     return f"timeout {int(seconds)} {cmd}" if TIMEOUT_BIN[0] else cmd
 
 def _kill_group(proc):
@@ -862,9 +817,6 @@ def _kill_group(proc):
             pass
 
 def _su_exec(cmd, timeout, want_stderr=False):
-    """รัน `su -c cmd` และ "ฆ่าทั้ง process group" เมื่อ timeout
-    (subprocess.run ธรรมดาอาจค้างถาวรถ้ามีลูกหลานถือ pipe อยู่)
-    คืน (returncode, stdout_bytes, stderr_bytes) / raise TimeoutExpired เมื่อเกินเวลา"""
     proc = subprocess.Popen(
         ["su", "-c", cmd],
         stdin=subprocess.DEVNULL,
@@ -921,7 +873,6 @@ def batch_root(commands_map: dict, timeout=ROOT_TIMEOUT_DEFAULT) -> dict:
     return results
 
 async def _run_pool(fn, *args, hard_timeout):
-    """รันงานบล็อกใน ROOT_POOL พร้อมเพดานเวลาฝั่ง asyncio (กัน await ค้างตลอดไป)"""
     loop = asyncio.get_running_loop()
     return await asyncio.wait_for(
         loop.run_in_executor(ROOT_POOL, lambda: fn(*args)), timeout=hard_timeout)
@@ -955,7 +906,6 @@ def clear_system_ram():
     run_root_text("sync && echo 3 > /proc/sys/vm/drop_caches")
 
 def reboot_phone():
-    """สั่งรีสตาร์ตเครื่อง (ลองหลายวิธี เพราะแต่ละรอมรองรับไม่เหมือนกัน)"""
     run_root_text("sync; svc power reboot 2>/dev/null || reboot 2>/dev/null || /system/bin/reboot", timeout=10)
 
 def clear_termux_junk():
@@ -994,7 +944,6 @@ def capture_screenshot_bytes():
         pass
     return None
 
-# ================= Screen Capture =================
 def grab_raw_frame():
     try:
         _, buf, _ = _su_exec(_t(12, "screencap"), 15)
@@ -1043,8 +992,6 @@ def frame_signature(frame):
         idx += 3
     return hashlib.md5(bytes(sig)).hexdigest()
 
-# ---------- ตรวจหน้าต่าง Delta ขอ Key ("Welcome Back!" แผงด้านขวา) ----------
-# วัดจากภาพจริง: พื้นแผงสีเทาน้ำเงินเข้มเรียบ ~ (26,28,36) และตัวหนังสือปุ่ม Continue สีฟ้า ~ (140,206,255)
 def _is_key_panel_bg(r, g, b):
     return (14 <= r <= 42 and 16 <= g <= 48 and 24 <= b <= 60
             and b - r >= 6 and b >= g)
@@ -1053,8 +1000,6 @@ def _is_key_button_blue(r, g, b):
     return b >= 225 and g >= 170 and r <= 175 and (b - r) >= 70
 
 def detect_key_panel(buf, w, h, hdr):
-    """True ถ้าแถบด้านขวาของจอเป็นแผง Delta ขอ Key
-    เงื่อนไข 1) พื้นที่ฝั่งขวาส่วนใหญ่เป็นสีพื้นแผงเรียบ  2) มีพิกเซลสีฟ้าของปุ่ม Continue"""
     try:
         def px(x, y):
             i = hdr + (y * w + x) * 4
@@ -1082,7 +1027,6 @@ def detect_key_panel(buf, w, h, hdr):
         return False
 
 def key_panel_in_ui(ui_xml):
-    """ตรวจจากข้อความใน uiautomator dump (เสริมการตรวจด้วยภาพ ถ้า Delta เปิดเผยข้อความให้อ่านได้)"""
     if not ui_xml:
         return False
     ul = ui_xml.lower()
@@ -1091,7 +1035,6 @@ def key_panel_in_ui(ui_xml):
     return "enter key" in ul and "receive key" in ul
 
 def inspect_screen():
-    """คืน (พบกล่อง Disconnected?, signature ของเฟรม, พบหน้าต่าง Delta ขอ Key?)"""
     try:
         frame = grab_raw_frame()
         if not frame:
@@ -1150,7 +1093,6 @@ def inspect_screen():
         logger.warning(f"inspect_screen ผิดพลาด: {e}")
         return False, None, False
 
-# ================= Internet + Discord =================
 _NET_CACHE_UNTIL = [0.0]
 
 async def check_internet():
@@ -1198,7 +1140,6 @@ async def send_reconnect_alert(channel, duration_sec):
         log(f"ส่งแจ้งเตือน reconnect ไม่สำเร็จ: {e}", RED)
 
 async def handle_discord_back(channel):
-    """เรียกเมื่อ Discord กลับมาเชื่อมต่อ (จาก on_ready / on_resumed / health check)"""
     since = STATE.get("discord_offline_since", 0)
     if since > 0:
         STATE["discord_offline_since"] = 0
@@ -1225,7 +1166,6 @@ async def check_discord_health(bot, channel):
         return
     await handle_discord_back(channel)
 
-# ================= Status Logic =================
 def get_status_text():
     if STATE.get("bot_unresponsive", False):
         return "⚠️ สถานะบอทไม่ตอบสนอง (ระบบค้าง)"
@@ -1245,9 +1185,7 @@ def get_status_text():
         return f"🔄 กำลังพยายาม Rejoin (ล้มเหลว {STATE['fail_count']} ครั้ง)"
     return "🟢 บอททำงานปกติ (กำลังเฝ้าดูในเกม)"
 
-# ================= System Stats =================
 def _read_cpu_samples():
-    """อ่าน /proc/stat 2 ครั้ง; ถ้าถูกบล็อก (Android 8+) ให้อ่านผ่าน root ในคำสั่งเดียว"""
     try:
         with open("/proc/stat", "r") as f:
             a = f.readline()
@@ -1306,7 +1244,6 @@ def get_discord_embed(dev_name, is_paused, info=None):
     except Exception:
         uptime_hrs = 0
 
-    # สีแถบข้าง: แดง = มีปัญหา / เหลือง = หยุดหรือรอ Key / เขียว = ปกติ
     if (STATE.get("bot_unresponsive") or STATE.get("net_dropped")
             or STATE.get("probe_fail", 0) >= PROBE_FAIL_ALERT):
         color = 0xe74c3c
@@ -1328,7 +1265,6 @@ def get_discord_embed(dev_name, is_paused, info=None):
     embed.set_footer(text=f"Total {mem_total_gb} GB • เครื่องเปิดมา {uptime_hrs} ชม.")
     return embed
 
-# ================= Join Game =================
 async def join_roblox_async(cfg):
     place_id = str(cfg.get("place_id", "")).strip()
     vip_code = str(cfg.get("vip_link_code", "")).strip()
@@ -1362,7 +1298,6 @@ async def join_roblox_async(cfg):
     await asyncio.sleep(wait)
     return True
 
-# ================= วิเคราะห์สุขภาพเกม =================
 _LOG_RX_273 = re.compile(r"\b(?:error\s*code\s*[:=]\s*(?:273|264)|disconnect[^\n]*\breason\s*[:=]\s*(?:273|264))\b", re.I)
 _LOG_RX_PSS4 = re.compile(r"\berror\s*code\s*[:=]?\s*pss4\b", re.I)
 _LOG_RX_267 = re.compile(r"\b(?:error\s*code\s*[:=]\s*267|disconnect[^\n]*\breason\s*[:=]\s*267)\b", re.I)
@@ -1387,13 +1322,12 @@ def _build_health_commands(cfg, want_ui):
     tail_n = max(800, int(cfg.get("log_tail_lines", 1000)))
     log_expr = f'LATEST=$(ls -t {GAME_LOG_DIR}/*.log {EXT_LOG_DIR}/*.log 2>/dev/null | head -n 1)'
     cmds = {
-        "alive": "echo 1",  # ใช้ยืนยันว่า su ทำงานจริง (แยกจากกรณี pidof ว่าง = เกมปิด)
+        "alive": "echo 1",
         "pidof": f"pidof {PACKAGE_NAME} || true",
         "focus": _t(5, "dumpsys window windows") + " | grep -E 'mCurrentFocus|mFocusedApp' || true",
         "wake": _t(3, "dumpsys power") + " | grep -m1 mWakefulness= || true",
         "log_tail": f'{log_expr}; if [ -n "$LATEST" ]; then tail -n {tail_n} "$LATEST"; fi',
         "log_age": f'{log_expr}; if [ -n "$LATEST" ]; then NOW=$(date +%s); MT=$(stat -c %Y "$LATEST" 2>/dev/null); if [ -n "$MT" ]; then echo $((NOW-MT)); fi; fi',
-        # utime+stime (ticks) ของโปรเซส Roblox จาก /proc/<pid>/stat ฟิลด์ 14,15 ใช้ตรวจอาการค้าง
         "cpu": f"P=$(pidof {PACKAGE_NAME} | cut -d' ' -f1); [ -n \"$P\" ] && cut -d' ' -f14,15 /proc/$P/stat || true",
     }
     if want_ui:
@@ -1406,8 +1340,6 @@ def probe_ok(probe):
 RE_ROBLOX_NODE = re.compile(r'package="com\.roblox\.client"')
 
 def roblox_menu_in_ui(cfg, ui_xml):
-    """หน้าเมนูแอปมี node เยอะ ส่วนในเกมมีแค่ไม่กี่ตัว (ไม่ขึ้นกับภาษาของแอป)
-    คืน (เป็นหน้าเมนูไหม, จำนวน node)"""
     need = int(cfg.get("lobby_min_nodes", 25))
     n = len(RE_ROBLOX_NODE.findall(ui_xml))
     return (need > 0 and n >= need), n
@@ -1468,8 +1400,6 @@ def analyze_probe(cfg, probe):
             return False, "หน้าจอแจ้งเตือนหลุดออกจากเกม (Disconnected)"
         if ("log in" in ul and "sign up" in ul) or ("discover" in ul and "avatar" in ul and "connect" in ul):
             return False, REASON_LOBBY
-        # หน้าเมนูหลัก: นับจำนวน UI node ของ Roblox (ในเกมมีน้อย ในเมนูมีเยอะ)
-        # ข้ามเมื่ออยู่ในช่วงโหลดเกม หรือเจอหน้าต่าง Key ของ Delta (อยู่แอปเดียวกัน ทำให้ node เพิ่ม)
         if not in_grace and not STATE.get("key_active") and not key_panel_in_ui(ui):
             is_menu, n = roblox_menu_in_ui(cfg, ui)
             logger.info(f"[UI] roblox_nodes={n}")
@@ -1479,7 +1409,6 @@ def analyze_probe(cfg, probe):
     return True, "ปกติ"
 
 def _cpu_ticks(probe):
-    """utime+stime ของโปรเซส Roblox (ticks) หรือ None ถ้าอ่านไม่ได้"""
     try:
         u, s = probe.get("cpu", "").split()[:2]
         return int(u) + int(s)
@@ -1509,7 +1438,6 @@ def analyze_stall(cfg, probe):
 
     focus = probe.get("focus", "")
     focus_known = bool(focus.strip())
-    # ถ้าอ่านโฟกัสไม่ได้ ให้ถือว่า Roblox อยู่หน้าจอ (เดิมจะข้ามการเช็ก Log ค้างไปเลย)
     roblox_focused = (PACKAGE_NAME in focus) or not focus_known
 
     if focus_known and not roblox_focused:
@@ -1517,13 +1445,11 @@ def analyze_stall(cfg, probe):
     else:
         STATE["bg_count"] = 0
 
-    # ตรวจโปรเซสค้าง: CPU เกือบไม่ขยับต่อเนื่องหลายรอบ (Log/จออาจยังดูปกติแต่เกมนิ่งสนิท)
     hang_need = int(cfg.get("hang_cpu_checks", 5))
     ticks = _cpu_ticks(probe)
     if hang_need > 0 and ticks is not None and roblox_focused:
         last = STATE.get("cpu_last")
         if last is None or ticks < last[1]:
-            # ตัวอ่านแรก หรือโปรเซสถูกเปิดใหม่ (ค่า tick ลดลง)
             STATE["cpu_last"] = (now, ticks)
             STATE["hang_count"] = 0
         elif now - last[0] >= 5:
@@ -1546,7 +1472,6 @@ def analyze_stall(cfg, probe):
     if STATE.get("frozen_count", 0) >= frozen_need and (log_age is None or log_age >= 60):
         return False, "หน้าจอนิ่งสนิทและไม่มี Log ใหม่ (น่าจะหลุด/ค้าง)"
 
-    # จอนิ่งนานมาก ๆ ให้ Rejoin แม้ Log ยังขยับ (เช่นค้างหน้า Disconnected แต่ Roblox ยังเขียน Log)
     hard_need = int(cfg.get("frozen_hard_checks", 30))
     if hard_need > 0 and STATE.get("frozen_count", 0) >= max(hard_need, frozen_need):
         return False, "หน้าจอนิ่งสนิทนานเกินไป (Log ยังขยับแต่ภาพไม่เปลี่ยน)"
@@ -1554,7 +1479,6 @@ def analyze_stall(cfg, probe):
     return True, "ปกติ"
 
 def update_frozen_state(sig):
-    """อัปเดตตัวนับหน้าจอนิ่งจาก signature ของเฟรม"""
     if not sig:
         return
     if sig == STATE.get("last_frame_sig"):
@@ -1582,9 +1506,7 @@ def analyze_game_health(cfg):
     update_frozen_state(sig)
     return True, "ปกติ"
 
-# ================= ตรวจการตั้งค่า Discord =================
 def discord_missing_items(cfg):
-    """รายการที่ยังไม่ได้ตั้งค่าสำหรับโหมด Discord"""
     miss = []
     if not cfg.get('bot_token'):
         miss.append("Bot Token")
@@ -1597,7 +1519,6 @@ def discord_missing_items(cfg):
 def discord_configured(cfg):
     return not discord_missing_items(cfg)
 
-# ================= UI เมนู =================
 def _out(*lines):
     fix_tty()
     sys.stdout.write("\r\n".join(lines) + "\r\n")
@@ -1622,7 +1543,6 @@ def pause_enter():
     safe_input(f"\n  {C_DIM}กด Enter เพื่อกลับ...{RESET}")
 
 def ui_screen(title, sub=""):
-    """ล้างจอแล้ววาดหัวหน้าจอย่อย"""
     fix_tty()
     sys.stdout.write("\033[2J\033[H")
     rows = [b_top(), b_row(f"{C_ACC}◆{RESET} {C_VAL}{title}{RESET}")]
@@ -1764,7 +1684,6 @@ def menu_4_ram(cfg):
         ui_err("ไม่ใช่ตัวเลข")
     pause_enter()
 
-# ================= Discord Messaging =================
 def spawn(coro):
     t = asyncio.create_task(coro)
     BG_TASKS.add(t)
@@ -1792,7 +1711,6 @@ async def _safe_send(channel, **kwargs):
 DASH = {"msg": None, "lock": None, "shot_time": None}
 
 def reset_dash_state():
-    """เรียกทุกครั้งที่เริ่มบอทใหม่ (event loop ใหม่ ต้องไม่ใช้ Lock/Message ของ loop เก่า)"""
     DASH["msg"] = None
     DASH["lock"] = None
 
@@ -1881,7 +1799,6 @@ async def _send_bot_report_impl(channel, message="", include_screenshot=False, f
                     kwargs = dict(content=content, embed=embed, view=view)
                     if img_bytes:
                         kwargs["attachments"] = [make_file()]
-                    # ถ้าไม่มีภาพใหม่ จะไม่ส่ง attachments → Discord คงภาพเดิมไว้ให้
                     await msg.edit(**kwargs)
                     return
                 except discord.NotFound:
@@ -1901,7 +1818,6 @@ async def _send_bot_report_impl(channel, message="", include_screenshot=False, f
         log(f"ส่งรายงานพลาด: {e}", RED)
 
 async def send_bot_report(channel, message="", include_screenshot=False, force_new=False):
-    """ครอบด้วย timeout: Discord ช้า/ล่ม/โดน rate limit ต้องไม่ทำให้ลูปเฝ้าจอหรือ Rejoin ค้างตาม"""
     try:
         await asyncio.wait_for(
             _send_bot_report_impl(channel, message, include_screenshot, force_new),
@@ -1911,10 +1827,7 @@ async def send_bot_report(channel, message="", include_screenshot=False, force_n
     except Exception as e:
         log(f"ส่งรายงานพลาด: {e}", RED)
 
-# ================= แจ้งเตือนหน้าต่าง Delta ขอ Key =================
 async def delete_key_messages(keep_last=False):
-    """ลบข้อความแท็กเรื่อง Key ที่บอทเคยส่ง (บอทลบข้อความตัวเองได้ ไม่ต้องมีสิทธิ์ Manage Messages)
-    keep_last=True = เก็บอันล่าสุดไว้ ลบเฉพาะอันเก่า"""
     msgs = list(STATE.get("key_msgs", []))
     if keep_last:
         targets, STATE["key_msgs"] = msgs[:-1], msgs[-1:]
@@ -1929,7 +1842,6 @@ async def delete_key_messages(keep_last=False):
             logger.warning(f"ลบข้อความแจ้งเตือน Key ไม่สำเร็จ: {e!r}")
 
 async def send_key_alert(channel, interval):
-    """แท็กผู้มีสิทธิ์ทุกคนใน Discord พร้อมภาพหน้าจอ (ข้อความใหม่ทุกครั้ง เพื่อให้มีแจ้งเตือนเด้งจริง)"""
     mentions = " ".join(f"<@{uid}>" for uid in CFG.get("allowed_users", []))
     since = STATE.get("key_since", 0.0)
     waited = int(time.time() - since) if since > 0 else 0
@@ -1946,7 +1858,6 @@ async def send_key_alert(channel, interval):
         log("🔑 แท็ก Discord: พบหน้าต่าง Key", YELLOW, force_redraw=True)
         if sent is not None and CFG.get("key_alert_delete", True):
             STATE.setdefault("key_msgs", []).append(sent)
-            # ส่งอันใหม่ก่อนค่อยลบอันเก่า เพื่อให้แจ้งเตือนยังเด้งตามปกติ
             await delete_key_messages(keep_last=True)
     except asyncio.TimeoutError:
         log("⚠️ ส่งแจ้งเตือน Key เกินเวลา", YELLOW)
@@ -1954,7 +1865,6 @@ async def send_key_alert(channel, interval):
         log(f"ส่งแจ้งเตือน Key ไม่สำเร็จ: {e}", RED)
 
 async def handle_key_panel(channel, seen, can_clear):
-    """seen = รอบนี้เจอหน้าต่าง Key; can_clear = รอบนี้ตรวจภาพหน้าจอจริง (ถึงจะสรุปได้ว่า 'หายแล้ว')"""
     if seen:
         STATE["key_hits"] = STATE.get("key_hits", 0) + 1
         if STATE["key_hits"] < KEY_PANEL_CONFIRM:
@@ -1991,7 +1901,6 @@ def touch_heartbeat():
     STATE["bot_unresponsive"] = False
 
 async def do_rejoin(channel, done_message, reason="ไม่ระบุสาเหตุ", force=False):
-    """force=True สำหรับคำสั่งจากผู้ใช้ (ไม่ถูก cooldown ของระบบอัตโนมัติบล็อก)"""
     if STATE["lock"] is None:
         STATE["lock"] = asyncio.Lock()
 
@@ -2026,7 +1935,6 @@ async def do_rejoin(channel, done_message, reason="ไม่ระบุสา�
             STATE["bg_count"] = 0
             STATE["cpu_last"] = None
             STATE["hang_count"] = 0
-            # เซสชันใหม่: ถ้าหน้าต่าง Key โผล่อีก ให้แจ้งเตือนใหม่ตั้งแต่ต้น
             STATE["key_hits"] = 0
             STATE["key_active"] = False
             STATE["last_key_alert"] = 0.0
@@ -2059,7 +1967,6 @@ async def do_rejoin(channel, done_message, reason="ไม่ระบุสา�
     touch_heartbeat()
     return ok
 
-# ================= Modals =================
 class MapModal(discord.ui.Modal, title='ตั้งค่าเปลี่ยนแมพ (Change Map)'):
     place_id_input = discord.ui.TextInput(label='Place ID', placeholder='ใส่เลข Place ID...', required=True)
     vip_code_input = discord.ui.TextInput(label='VIP Link Code (ถ้ามี)', placeholder='เว้นว่างได้', required=False)
@@ -2096,7 +2003,7 @@ class AddScriptModal(discord.ui.Modal, title='📝 เพิ่มสคริ�
         if not valid_path(path):
             return await interaction.response.send_message("❌ โฟลเดอร์ไม่ถูกต้อง", ephemeral=True)
 
-        await interaction.response.defer(ephemeral=True)   # งาน root อาจเกิน 3 วินาที
+        await interaction.response.defer(ephemeral=True)
         audit(interaction, f"add_script file={filename}")
         file_path = f"{path}/{filename}"
         encoded = base64.b64encode(self.script_input.value.encode('utf-8')).decode('ascii')
@@ -2202,12 +2109,10 @@ class SettingsModal(discord.ui.Modal, title='⚙️ แก้ไขการต�
             f"✅ **อัปเดตการตั้งค่าสำเร็จ**\n🎮 Place ID: `{CFG['place_id']}`\n⏰ บังคับรีจอย: `{CFG['auto_rejoin_hours']} ชม.`\n📂 AutoExec: `{CFG['autoexec_path']}`", ephemeral=True)
         log("อัปเดตการตั้งค่าผ่าน Discord", GREEN)
 
-# ================= Control Buttons =================
 def _rejoin_in_progress():
     return bool(STATE["lock"] and STATE["lock"].locked())
 
 class RebootConfirmView(discord.ui.View):
-    """ขั้นยืนยันก่อนรีสตาร์ตมือถือ (กันกดพลาด) หมดเวลาใน 30 วินาที"""
     def __init__(self):
         super().__init__(timeout=30)
 
@@ -2312,7 +2217,7 @@ class ControlView(discord.ui.View):
                 pass
             return await interaction.response.send_message("⚠️ Paused อยู่แล้ว", ephemeral=True)
         STATE["paused"] = True
-        STATE["auto_paused"] = False      # หยุดโดยคน = ไม่ resume เอง
+        STATE["auto_paused"] = False
         add_history("Pause", f"โดย {interaction.user.name}")
         log("หยุดพักระบบ", YELLOW, force_redraw=True)
         await interaction.response.send_message("⏸️ Pause แล้ว!", delete_after=30)
@@ -2476,7 +2381,6 @@ class ControlView(discord.ui.View):
         await interaction.response.send_message(
             "⚠️ ต้องการรีสตาร์ตมือถือจริงหรือไม่?", view=RebootConfirmView(), ephemeral=True)
 
-# ================= Start Bot Loop =================
 def menu_3_start_bot(cfg):
     global DASHBOARD_ACTIVE, LAST_RESULT_TEXT
 
@@ -2487,7 +2391,6 @@ def menu_3_start_bot(cfg):
         return
     ui_ok(f"Place ID: {cfg['place_id']}")
 
-    # ตรวจการตั้งค่า Discord อัตโนมัติ: ครบ = ใช้ Discord / ไม่ครบ = ไม่ใช้ (ไม่ถามผู้ใช้)
     use_discord = discord_configured(cfg)
     missing = discord_missing_items(cfg)
     if use_discord:
@@ -2511,7 +2414,6 @@ def menu_3_start_bot(cfg):
 
     TIMEOUT_BIN[0] = bool(run_root_text("command -v timeout", timeout=10))
     if cfg.get("device_tweaks", True):
-        # กัน Android ฆ่า Termux เบื้องหลัง/หน่วงงานตอนรันนาน ๆ (ไม่ถาวรทั้งหมด หายเมื่อรีบูตบางตัว)
         run_root_text(
             "dumpsys deviceidle whitelist +com.termux >/dev/null 2>&1; "
             "settings put global settings_enable_monitor_phantom_procs false >/dev/null 2>&1; "
@@ -2556,11 +2458,9 @@ def menu_3_start_bot(cfg):
     ready_once = {"done": False}
 
     def get_channel():
-        # โหมดไม่ใช้ Discord: ไม่มี channel → ทุกจุดที่ส่งรายงานจะถูกข้ามเอง (โค้ดเดิมเช็ก `if channel` อยู่แล้ว)
         return bot.get_channel(channel_id) if bot else None
 
     async def hb_sleep(seconds):
-        """หน่วงเวลาแบบอัปเดต heartbeat เป็นช่วง ๆ (กัน Watchdog เตือนผิดระหว่าง backoff)"""
         end = time.time() + seconds
         while time.time() < end:
             if STATE["paused"]:
@@ -2570,7 +2470,6 @@ def menu_3_start_bot(cfg):
 
     async def monitor_cycle():
         if STATE["paused"]:
-            # หยุดอัตโนมัติ (เช่น เกมต้องอัปเดต) ไม่ควรหยุดถาวร: ลองกลับมาทำงานเองเป็นระยะ
             if STATE.get("auto_paused") and time.time() - STATE.get("auto_paused_at", 0) >= FATAL_RETRY_SECONDS:
                 STATE.update({"paused": False, "auto_paused": False, "fail_count": 0})
                 add_history("Auto Resume", "ลองใหม่หลังหยุดอัตโนมัติ (เผื่ออัปเดตแล้ว)")
@@ -2604,13 +2503,11 @@ def menu_3_start_bot(cfg):
         screen_n = max(1, int(cfg.get("screen_check_every_n", 2)))
         key_on = bool(cfg.get("key_alert_enabled", True))
         want_ui = (cycle % ui_n == 0)
-        # เจอหน้าต่าง Key แล้ว → ตรวจภาพทุกรอบ จะได้ยืนยัน/รู้ทันทีเมื่อหน้าต่างหาย
         want_screen = (cycle % screen_n == 0) or (key_on and STATE.get("key_hits", 0) > 0)
 
         probe = await abatch_root(_build_health_commands(cfg, want_ui), timeout=20)
         touch_heartbeat()
 
-        # su ไม่ตอบสนอง ≠ เกมปิด: ข้ามรอบนี้ ไม่สั่ง Rejoin มั่ว
         if not probe_ok(probe):
             STATE["probe_fail"] += 1
             log(f"⚠️ ติดต่อ root ไม่ได้ ({STATE['probe_fail']}) ข้ามรอบตรวจ", YELLOW)
@@ -2639,7 +2536,6 @@ def menu_3_start_bot(cfg):
                 update_frozen_state(sig)
             touch_heartbeat()
 
-        # หน้าต่าง Delta ขอ Key: เจอจากภาพหรือข้อความใน UI อย่างใดอย่างหนึ่ง → แท็ก Discord ทุก key_alert_seconds
         if key_on:
             key_seen = key_screen or key_panel_in_ui(probe.get("ui_xml", ""))
             await handle_key_panel(channel, key_seen, can_clear=screen_checked)
@@ -2651,7 +2547,6 @@ def menu_3_start_bot(cfg):
             log(f"⚠️ {reason}", RED, force_redraw=True)
 
             if reason == REASON_LOBBY:
-                # ยืนยันซ้ำก่อน: กันหน้าจอเปลี่ยนชั่วคราว/อ่าน UI พลาดแล้ว Rejoin มั่ว
                 await hb_sleep(8)
                 p2 = await abatch_root(_build_health_commands(cfg, True), timeout=20)
                 if not probe_ok(p2) or analyze_probe(cfg, p2)[1] != REASON_LOBBY:
@@ -2659,7 +2554,6 @@ def menu_3_start_bot(cfg):
                     return
 
             if reason in FATAL_REASONS:
-                # ยืนยันซ้ำก่อน: ป๊อปอัปชั่วคราวไม่ควรทำให้บอทหยุดทำงาน
                 for _ in range(FATAL_CONFIRM - 1):
                     await hb_sleep(20)
                     p2 = await abatch_root(_build_health_commands(cfg, True), timeout=20)
@@ -2738,7 +2632,7 @@ def menu_3_start_bot(cfg):
                 channel = get_channel()
                 if channel:
                     await send_bot_report(channel, f"🚨 **ลูปเฝ้าจอผิดพลาดติดกัน {n} ครั้ง:** `{e!r}`", force_new=True)
-            await hb_sleep(min(60, 5 * n))   # backoff แล้วทำงานต่อ (ไม่หยุดถาวร)
+            await hb_sleep(min(60, 5 * n))
         touch_heartbeat()
 
     @tasks.loop(seconds=WATCHDOG_INTERVAL)
@@ -2747,7 +2641,6 @@ def menu_3_start_bot(cfg):
         if STATE.get("paused") or STATE.get("last_heartbeat", 0) == 0:
             return
         if _rejoin_in_progress():
-            # Rejoin ปกติไม่กี่นาที — ถ้าล็อกค้างเกิน 10 นาทีถือว่าผิดปกติ ต้องไม่เงียบ
             if time.time() - STATE.get("rejoin_started", 0) < 600:
                 return
         elapsed = time.time() - STATE["last_heartbeat"]
@@ -2759,7 +2652,7 @@ def menu_3_start_bot(cfg):
             if channel:
                 await send_bot_report(channel, f"🚨 **บอทไม่ตอบสนอง** (ลูปค้างนาน {int(elapsed)} วินาที) — กำลังรีสตาร์ทลูป", force_new=True)
             try:
-                game_monitor_loop.restart()   # กู้เอง ไม่ต้องรอคนมากดแก้
+                game_monitor_loop.restart()
             except Exception as e:
                 logger.warning(f"restart loop ไม่สำเร็จ: {e!r}")
 
@@ -2777,14 +2670,12 @@ def menu_3_start_bot(cfg):
 
     @tasks.loop(seconds=3)
     async def dash_refresh():
-        """วาด Dashboard ใหม่ทุก 3 วินาที (ให้เวลา/แถบสถานะขยับแม้ไม่มี log ใหม่)"""
         if DASHBOARD_ACTIVE:
             _DASH_DIRTY[0] = False
             _LAST_DASH_RENDER[0] = time.time()
             print_bot_dashboard()
 
     async def start_services(channel):
-        """เริ่มลูปเฝ้าจอ + Watchdog และเข้าแมพครั้งแรกถ้าเกมยังไม่เปิด (ใช้ร่วมกันทั้งสองโหมด)"""
         touch_heartbeat()
         if not game_monitor_loop.is_running():
             game_monitor_loop.start()
@@ -2795,7 +2686,6 @@ def menu_3_start_bot(cfg):
 
         if not await aroot(f"pidof {PACKAGE_NAME}"):
             log("เปิดเกมเข้าแมพครั้งแรก...", CYAN, force_redraw=True)
-            # ใช้ spawn เพื่อไม่บล็อก (lock ถูกจับทันที ลูปหลักจึงข้ามรอบเอง)
             spawn(do_rejoin(channel, "✅ เข้าแมพครั้งแรกเรียบร้อย", "เริ่มระบบครั้งแรก", force=True))
 
     if bot:
@@ -2807,7 +2697,6 @@ def menu_3_start_bot(cfg):
 
         @bot.event
         async def on_resumed():
-            # resume session ไม่ยิง on_ready ซ้ำ จึงต้องเคลียร์สถานะ offline ที่นี่
             log("🔌 Discord resume สำเร็จ", GREEN)
             await handle_discord_back(get_channel())
 
@@ -2847,7 +2736,7 @@ def menu_3_start_bot(cfg):
                 STATE["lock"] = asyncio.Lock()
             log("✅ เริ่มโหมดไม่ใช้ Discord (เฝ้าจอ/Rejoin อย่างเดียว)", GREEN, force_redraw=True)
             await start_services(None)
-            await asyncio.Event().wait()   # รันไปเรื่อย ๆ จนกด Ctrl+C
+            await asyncio.Event().wait()
 
         try:
             asyncio.run(standalone_main())
@@ -2867,10 +2756,7 @@ def menu_3_start_bot(cfg):
         run_root_text(f"am force-stop {PACKAGE_NAME}")
     time.sleep(1)
 
-# ================= โหมดเริ่มเองหลังบูต (--autostart) =================
 def wait_device_ready(timeout=180):
-    """หลังบูตใหม่ root/รหัสเครื่องอาจยังไม่พร้อม: ต้องรอก่อนแตะไฟล์ที่เข้ารหัส
-    (ไม่งั้นถอดรหัสไม่ได้แล้วไฟล์ตั้งค่าจะถูกย้ายไปเก็บเป็น .unreadable)"""
     ui_info(f"รอ root และรหัสเครื่องพร้อม (สูงสุด {timeout} วินาที)...")
     end = time.time() + timeout
     while time.time() < end:
@@ -2890,7 +2776,6 @@ def wait_device_ready(timeout=180):
     return True
 
 def run_autostart():
-    """เริ่มเฝ้าจอทันทีตามค่าที่ตั้งไว้ (ไม่ผ่านเมนู) ถ้าเกิดข้อผิดพลาดจะลองใหม่เอง"""
     ui_ok("โหมดเริ่มอัตโนมัติ (--autostart)")
     logger.info("autostart: เริ่มระบบ")
     for attempt in range(1, 6):
@@ -2902,7 +2787,6 @@ def run_autostart():
             ui_err(f"autostart ผิดพลาด ({attempt}/5): {e!r} — ลองใหม่ใน 30 วินาที")
             time.sleep(30)
 
-# ================= Main =================
 def main():
     if "--log" in sys.argv:
         show_log(80)
@@ -2923,7 +2807,6 @@ def main():
     load_history()
     seal_plain_files()
     if seal_mode_now() == b"D":
-        # ไฟล์ที่เคยเข้ารหัสด้วยโหมดสำรอง → อัปเกรดเป็นโหมดผูกเครื่อง
         for p in (CONFIG_FILE, HISTORY_FILE, DASH_FILE):
             try:
                 with open(p, "rb") as f:
