@@ -19,6 +19,7 @@ import traceback
 import unicodedata
 import signal
 import hmac
+import secrets
 import threading
 import fcntl
 from concurrent.futures import ThreadPoolExecutor
@@ -55,7 +56,7 @@ def _script_dir():
     except NameError:
         return os.getcwd()
 
-def _pick_data_dir():
+def _fallback_dir():
     for root in (_script_dir(), os.path.expanduser("~"), os.getcwd()):
         d = os.path.join(root, APP_DIR_NAME)
         try:
@@ -66,38 +67,182 @@ def _pick_data_dir():
             continue
     return os.getcwd()
 
-DATA_DIR = _pick_data_dir()
+ROLES = ("config", "log", "hist", "dash")
+PLAIN_NAMES = {"config": "config.json", "log": "bot.log", "hist": "rejoin_history.json", "dash": "dash.json"}
+ORIG_NAMES = {"config": "original_config.json", "log": "original_bot.log",
+              "hist": "rejoin_history.json", "dash": "original_dash.json"}
+REGISTRY_FILE = os.path.join(os.path.expanduser("~"), ".rb_loc")
+LOCK_FILE = os.path.join(os.path.expanduser("~"), ".rb_lock")
+STORAGE = {"ok": False, "pending": False, "root": "", "folder": "", "names": dict(PLAIN_NAMES)}
+DATA_DIR = ""
+CONFIG_FILE = LOG_FILE = HISTORY_FILE = DASH_FILE = ""
+MIGRATED_FILES = []
 
-LEGACY_FILES = {
-    "original_config.json": "config.json",
-    "original_bot.log": "bot.log",
-    "rejoin_history.json": "rejoin_history.json",
-    "original_dash.json": "dash.json",
-}
+def _rand_name(n):
+    first = secrets.choice("abcdefghijklmnopqrstuvwxyz")
+    rest = "".join(secrets.choice("abcdefghijklmnopqrstuvwxyz0123456789") for _ in range(n - 1))
+    return first + rest
 
-def migrate_legacy_files():
+def _download_roots():
+    home = os.path.expanduser("~")
+    out = []
+    for c in ("/storage/emulated/0/Download", "/sdcard/Download", os.path.join(home, "storage", "downloads")):
+        if c not in out:
+            out.append(c)
+    return out
+
+def _writable_dir(p):
+    return os.path.isdir(p) and os.access(p, os.W_OK | os.X_OK)
+
+def _try_grant_storage():
+    cmd = ("pm grant com.termux android.permission.WRITE_EXTERNAL_STORAGE; "
+           "pm grant com.termux android.permission.READ_EXTERNAL_STORAGE; "
+           "appops set com.termux MANAGE_EXTERNAL_STORAGE allow; true")
+    try:
+        subprocess.run(["su", "-c", cmd], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                       stderr=subprocess.DEVNULL, timeout=15)
+    except Exception:
+        pass
+
+def _load_registry():
+    try:
+        with open(REGISTRY_FILE, "r", encoding="utf-8") as f:
+            reg = json.load(f)
+        names = reg["names"]
+        if (isinstance(reg["root"], str) and reg["root"] and isinstance(reg["folder"], str) and reg["folder"]
+                and all(isinstance(names.get(k), str) and names[k] for k in ROLES)):
+            return reg
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        pass
+    return None
+
+def _save_registry(reg):
+    try:
+        tmp = REGISTRY_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(reg, f)
+        os.replace(tmp, REGISTRY_FILE)
+        try:
+            os.chmod(REGISTRY_FILE, 0o600)
+        except OSError:
+            pass
+    except OSError:
+        pass
+
+def _legacy_sources(exclude):
+    home = os.path.expanduser("~")
+    ex = os.path.abspath(exclude)
+    out = []
+    for d in (os.path.join(_script_dir(), APP_DIR_NAME), os.path.join(home, APP_DIR_NAME),
+              os.path.join(os.getcwd(), APP_DIR_NAME)):
+        if os.path.isdir(d) and os.path.abspath(d) != ex and all(x[0] != d for x in out):
+            out.append((d, PLAIN_NAMES))
+    for d in dict.fromkeys((_script_dir(), os.getcwd())):
+        if os.path.isdir(d) and os.path.abspath(d) != ex:
+            out.append((d, ORIG_NAMES))
+    return out
+
+def _migrate_into(dst_dir, names):
     moved = []
-    for old, new in LEGACY_FILES.items():
-        dst = os.path.join(DATA_DIR, new)
+    for role in ROLES:
+        dst = os.path.join(dst_dir, names[role])
         if os.path.exists(dst):
             continue
-        for src_dir in dict.fromkeys((_script_dir(), os.getcwd())):
-            src = os.path.join(src_dir, old)
-            if os.path.isfile(src):
-                try:
-                    shutil.move(src, dst)
-                    moved.append(old)
-                    break
-                except OSError:
-                    continue
+        for src_dir, src_names in _legacy_sources(dst_dir):
+            src = os.path.join(src_dir, src_names[role])
+            if not os.path.isfile(src):
+                continue
+            try:
+                shutil.move(src, dst)
+            except OSError:
+                continue
+            moved.append(src_names[role])
+            for suf in (".1", ".2"):
+                if os.path.isfile(src + suf) and not os.path.exists(dst + suf):
+                    try:
+                        shutil.move(src + suf, dst + suf)
+                    except OSError:
+                        pass
+            break
     return moved
 
-MIGRATED_FILES = migrate_legacy_files()
+def _remove_if_empty(d):
+    try:
+        os.rmdir(d)
+    except OSError:
+        pass
 
-CONFIG_FILE = os.path.join(DATA_DIR, "config.json")
-LOG_FILE = os.path.join(DATA_DIR, "bot.log")
-HISTORY_FILE = os.path.join(DATA_DIR, "rejoin_history.json")
-DASH_FILE = os.path.join(DATA_DIR, "dash.json")
+def init_storage():
+    global DATA_DIR, CONFIG_FILE, LOG_FILE, HISTORY_FILE, DASH_FILE, MIGRATED_FILES
+    STORAGE.update(ok=False, pending=False, root="", folder="", names=dict(PLAIN_NAMES))
+    target = None
+    names = dict(PLAIN_NAMES)
+    reg = _load_registry()
+    if reg:
+        root = reg["root"]
+        if not _writable_dir(root):
+            _try_grant_storage()
+        if _writable_dir(root):
+            d = os.path.join(root, reg["folder"])
+            try:
+                os.makedirs(d, exist_ok=True)
+                if os.access(d, os.W_OK):
+                    target, names = d, dict(reg["names"])
+                    STORAGE.update(root=root, folder=reg["folder"])
+            except OSError:
+                pass
+        if target is None:
+            STORAGE["pending"] = True
+    else:
+        root = next((r for r in _download_roots() if _writable_dir(r)), None)
+        if root is None:
+            _try_grant_storage()
+            root = next((r for r in _download_roots() if _writable_dir(r)), None)
+        if root is not None:
+            folder = _rand_name(10)
+            new_names = {role: _rand_name(9) + ".dat" for role in ROLES}
+            d = os.path.join(root, folder)
+            try:
+                os.makedirs(d, exist_ok=True)
+                if os.access(d, os.W_OK):
+                    _save_registry({"root": root, "folder": folder, "names": new_names})
+                    target, names = d, new_names
+                    STORAGE.update(root=root, folder=folder)
+            except OSError:
+                pass
+    if target is None:
+        target = _fallback_dir()
+    else:
+        STORAGE["ok"] = True
+    DATA_DIR = target
+    STORAGE["names"] = names
+    CONFIG_FILE = os.path.join(DATA_DIR, names["config"])
+    LOG_FILE = os.path.join(DATA_DIR, names["log"])
+    HISTORY_FILE = os.path.join(DATA_DIR, names["hist"])
+    DASH_FILE = os.path.join(DATA_DIR, names["dash"])
+    MIGRATED_FILES = _migrate_into(DATA_DIR, names)
+    if STORAGE["ok"]:
+        for d, _ in _legacy_sources(DATA_DIR):
+            if os.path.basename(d) == APP_DIR_NAME:
+                _remove_if_empty(d)
+
+def storage_location_text():
+    if STORAGE["ok"]:
+        base = os.path.basename(STORAGE["root"].rstrip("/")) or "Download"
+        return f"{base}/{STORAGE['folder']}"
+    return DATA_DIR
+
+def storage_report_text():
+    n = STORAGE["names"]
+    files = " • ".join(f"{label} `{n[role]}`" for role, label in
+                       (("config", "ตั้งค่า"), ("log", "log"), ("hist", "ประวัติ"), ("dash", "dash")))
+    if STORAGE["ok"]:
+        head = f"`{storage_location_text()}`"
+    else:
+        head = f"⚠️ ใช้โฟลเดอร์สำรองในเครื่อง `{os.path.basename(DATA_DIR)}` (เข้า Download ไม่ได้)"
+    return f"{head}\n{files}"
+
+init_storage()
 PACKAGE_NAME = "com.roblox.client"
 GAME_LOG_DIR = f"/data/data/{PACKAGE_NAME}/files/appData/logs"
 EXT_LOG_DIR = f"/sdcard/Android/data/{PACKAGE_NAME}/files/appData/logs"
@@ -108,7 +253,7 @@ MAX_FAILS_ALERT = 5
 MAX_LOOP_RESTARTS = 5
 DISCORD_OFFLINE_THRESHOLD = 60
 REJOIN_USER_COOLDOWN = 30
-MAX_HISTORY_RECORDS = 50
+MAX_HISTORY_RECORDS = 200
 PROBE_FAIL_ALERT = 4
 DISCORD_MSG_LIMIT = 1990
 MONITOR_CYCLE_TIMEOUT = 900
@@ -117,6 +262,7 @@ REJOIN_HARD_TIMEOUT_EXTRA = 150
 FATAL_CONFIRM = 3
 FATAL_RETRY_SECONDS = 1800
 KEY_PANEL_CONFIRM = 2
+MSG_TTL = 60
 
 NET_CACHE_SECONDS = 30
 DASH_THROTTLE_SECONDS = 0.5
@@ -361,16 +507,26 @@ def show_log(n=40):
 
 logger = logging.getLogger("rbbot")
 logger.setLevel(logging.INFO)
-try:
-    _fh = RotatingFileHandler(LOG_FILE, maxBytes=512 * 1024, backupCount=2, encoding="utf-8")
-    _fh.setFormatter(SealedFormatter("%(asctime)s %(message)s"))
-    logger.addHandler(_fh)
+
+def setup_log_handler():
+    for h in list(logger.handlers):
+        logger.removeHandler(h)
+        try:
+            h.close()
+        except Exception:
+            pass
     try:
-        os.chmod(LOG_FILE, 0o600)
+        fh = RotatingFileHandler(LOG_FILE, maxBytes=512 * 1024, backupCount=2, encoding="utf-8")
+        fh.setFormatter(SealedFormatter("%(asctime)s %(message)s"))
+        logger.addHandler(fh)
+        try:
+            os.chmod(LOG_FILE, 0o600)
+        except OSError:
+            pass
     except OSError:
         pass
-except OSError:
-    pass
+
+setup_log_handler()
 
 RE_PLACE = re.compile(r"\d{1,20}")
 RE_VIP = re.compile(r"[A-Za-z0-9_\-]{1,100}")
@@ -1124,6 +1280,7 @@ async def check_internet():
     return ok
 
 async def send_reconnect_alert(channel, duration_sec):
+    mentions = " ".join(f"<@{uid}>" for uid in CFG.get("allowed_users", []))
     if duration_sec < 60:
         dur_text = f"{int(duration_sec)} วินาที"
     elif duration_sec < 3600:
@@ -1132,9 +1289,16 @@ async def send_reconnect_alert(channel, duration_sec):
         dur_text = f"{duration_sec / 3600:.1f} ชั่วโมง"
     add_history("Discord Reconnect", f"ขาดการเชื่อมต่อประมาณ {dur_text}")
     log(f"Discord กลับมาเชื่อมต่อ (ขาด {dur_text})", YELLOW, force_redraw=True)
-    await send_bot_report(
+    sent = await _safe_send(
         channel,
-        f"🔌 **กลับมาเชื่อมต่อ Discord แล้ว** (ขาดไปประมาณ {dur_text}) — ระบบเฝ้าจออาจไม่ได้แจ้งเตือนในช่วงนั้น")
+        content=(f"🔌 **บอทกลับมาเชื่อมต่อ Discord แล้ว!**\n"
+                 f"⏱️ ขาดการเชื่อมต่อนานประมาณ **{dur_text}**\n"
+                 f"🔄 ระบบเฝ้าจออาจไม่ได้แจ้งเตือนในช่วงเวลาดังกล่าว\n"
+                 f"{mentions}"),
+        allowed_mentions=discord.AllowedMentions(users=True),
+        delete_after=MSG_TTL)
+    if sent is None:
+        log("ส่งแจ้งเตือน reconnect ไม่สำเร็จ", RED)
 
 async def handle_discord_back(channel):
     since = STATE.get("discord_offline_since", 0)
@@ -1254,6 +1418,8 @@ def get_discord_embed(dev_name, is_paused, info=None):
     embed.add_field(name="🔁 Rejoin", value=f"`{info.get('rejoin', 0)}` ครั้ง", inline=True)
     embed.add_field(name="🕒 ล่าสุด", value=f"`{info.get('last', '-')}`", inline=True)
     embed.add_field(name="⏳ บังคับรีจอยอัตโนมัติ", value=f"`{info.get('auto', '-')}`", inline=False)
+    if info.get("data"):
+        embed.add_field(name="📁 ที่เก็บข้อมูล", value=str(info["data"])[:1000], inline=False)
     embed.add_field(name="📱 อุปกรณ์", value=f"`{dev_name}`", inline=True)
     embed.add_field(name="⚙️ CPU", value=f"{_txt_bar(cpu_usage)}\n`{cpu_usage}%`", inline=True)
     embed.add_field(name="💾 RAM",
@@ -1587,7 +1753,7 @@ def print_ui(cfg):
         b_row(kv("Auto RAM", f"{C_VAL}{cfg.get('clear_ram_hours', 1)}{RESET} ชม./รอบ")),
         b_row(kv("แจ้ง Key", key_v)),
         b_row(kv("บริการ", svc_v)),
-        b_row(kv("ข้อมูล", f"{C_DIM}{short_path(DATA_DIR, max(8, inner - 12))}{RESET}")),
+        b_row(kv("ข้อมูล", f"{C_OK if STORAGE['ok'] else C_WARN}{short_path(storage_location_text(), max(8, inner - 12))}{RESET}")),
         b_sep("เมนู"),
         _menu_item("1", "ตั้งค่าแมพ (Place ID / VIP)"),
         _menu_item("2", "ตั้งค่า Discord Bot"),
@@ -1596,6 +1762,7 @@ def print_ui(cfg):
         _menu_item("5", "อ่าน Log (เข้ารหัส)"),
         _menu_item("6", "รีสตาร์ตมือถือ", C_ERR),
         _menu_item("7", "บริการเบื้องหลัง (Auto-restart)"),
+        _menu_item("8", "ที่เก็บข้อมูล (ตำแหน่ง/ชื่อไฟล์)"),
         _menu_item("0", "ออกจากโปรแกรม", C_DIM),
         b_bot(),
         "",
@@ -1770,7 +1937,8 @@ async def _send_bot_report_impl(channel, message="", include_screenshot=False):
         content += "> " + str(message).replace("\n", "\n> ") + "\n"
     content += f"-# 🕒 {now_str}"
     info = {"place": CFG.get('place_id', ''), "rejoin": STATE['rejoin_total'],
-            "last": last_rejoin_str, "auto": _format_auto_rejoin_text()}
+            "last": last_rejoin_str, "auto": _format_auto_rejoin_text(),
+            "data": storage_report_text()}
 
     try:
         embed = await asyncio.to_thread(get_discord_embed, STATE["dev_name"], STATE["paused"], info)
@@ -1851,7 +2019,8 @@ async def send_key_alert(channel, interval):
                f"{mentions}")[:DISCORD_MSG_LIMIT]
     try:
         img_bytes = await asyncio.to_thread(capture_screenshot_bytes)
-        kwargs = dict(content=content, allowed_mentions=discord.AllowedMentions(users=True))
+        kwargs = dict(content=content, allowed_mentions=discord.AllowedMentions(users=True),
+                      delete_after=MSG_TTL)
         if img_bytes:
             kwargs["file"] = discord.File(io.BytesIO(img_bytes), filename="key_panel.png")
         sent = await asyncio.wait_for(_safe_send(channel, **kwargs), timeout=REPORT_TIMEOUT)
@@ -1893,8 +2062,7 @@ async def handle_key_panel(channel, seen, can_clear):
             log("✅ หน้าต่าง Key หายไปแล้ว", GREEN, force_redraw=True)
             await delete_key_messages()
             if channel:
-                extra = {"delete_after": 30} if CFG.get("key_alert_delete", True) else {}
-                await _safe_send(channel, content=f"✅ **หน้าต่าง Delta ขอ Key หายไปแล้ว** (ค้างอยู่ {waited // 60} นาที {waited % 60} วินาที)", **extra)
+                await _safe_send(channel, content=f"✅ **หน้าต่าง Delta ขอ Key หายไปแล้ว** (ค้างอยู่ {waited // 60} นาที {waited % 60} วินาที)", delete_after=MSG_TTL)
 
 def touch_heartbeat():
     STATE["last_heartbeat"] = time.time()
@@ -1973,11 +2141,11 @@ class MapModal(discord.ui.Modal, title='ตั้งค่าเปลี่ย�
 
     async def on_submit(self, interaction: discord.Interaction):
         if not is_authorized(interaction.user.id):
-            return await interaction.response.send_message("⛔ ไม่มีสิทธิ์", ephemeral=True)
+            return await interaction.response.send_message("⛔ ไม่มีสิทธิ์", ephemeral=True, delete_after=MSG_TTL)
         pid = self.place_id_input.value.strip()
         vip = (self.vip_code_input.value or "").strip()
         if not valid_place_id(pid) or not valid_vip(vip):
-            return await interaction.response.send_message("❌ ค่าไม่ถูกต้อง", ephemeral=True)
+            return await interaction.response.send_message("❌ ค่าไม่ถูกต้อง", ephemeral=True, delete_after=MSG_TTL)
         audit(interaction, f"change_map pid={pid}")
         old_pid = CFG.get('place_id', '-')
         CFG['place_id'] = pid
@@ -1985,7 +2153,7 @@ class MapModal(discord.ui.Modal, title='ตั้งค่าเปลี่ย�
         save_config(CFG)
         add_history("Map Change", f"{old_pid} → {pid} โดย {interaction.user.name}")
         log(f"เปลี่ยนแมพเป็น {pid}", YELLOW)
-        await interaction.response.send_message(f"✅ บันทึกแมพ `{pid}`! กำลังดึงเข้าเกม...", ephemeral=True)
+        await interaction.response.send_message(f"✅ บันทึกแมพ `{pid}`! กำลังดึงเข้าเกม...", ephemeral=True, delete_after=MSG_TTL)
         spawn(do_rejoin(interaction.channel, f"✅ เปลี่ยนเป็นแมพ `{pid}` เสร็จสิ้น",
                         f"เปลี่ยนแมพโดย {interaction.user.name}", force=True))
 
@@ -1995,13 +2163,13 @@ class AddScriptModal(discord.ui.Modal, title='📝 เพิ่มสคริ�
 
     async def on_submit(self, interaction: discord.Interaction):
         if not is_authorized(interaction.user.id):
-            return await interaction.response.send_message("⛔ ไม่มีสิทธิ์", ephemeral=True)
+            return await interaction.response.send_message("⛔ ไม่มีสิทธิ์", ephemeral=True, delete_after=MSG_TTL)
         path = normalize_path(CFG.get("autoexec_path", ""))
         filename = clean_filename(self.filename_input.value)
         if not filename:
-            return await interaction.response.send_message("❌ ชื่อไฟล์ไม่ถูกต้อง (รองรับ .lua, .txt, .json, .cfg, .ini)", ephemeral=True)
+            return await interaction.response.send_message("❌ ชื่อไฟล์ไม่ถูกต้อง (รองรับ .lua, .txt, .json, .cfg, .ini)", ephemeral=True, delete_after=MSG_TTL)
         if not valid_path(path):
-            return await interaction.response.send_message("❌ โฟลเดอร์ไม่ถูกต้อง", ephemeral=True)
+            return await interaction.response.send_message("❌ โฟลเดอร์ไม่ถูกต้อง", ephemeral=True, delete_after=MSG_TTL)
 
         await interaction.response.defer(ephemeral=True)
         audit(interaction, f"add_script file={filename}")
@@ -2013,9 +2181,10 @@ class AddScriptModal(discord.ui.Modal, title='📝 เพิ่มสคริ�
         res = await aroot(cmd)
         if res.strip() != "OK":
             log(f"เพิ่มสคริปต์ไม่สำเร็จ: {filename}", RED)
-            return await interaction.followup.send(f"❌ เขียน `{filename}` ไม่สำเร็จ (ตรวจสิทธิ์ root / path)", ephemeral=True)
+            add_history("Script Failed", f"{filename}: เขียนไฟล์ไม่สำเร็จ โดย {interaction.user.name}")
+            return await interaction.followup.send(f"❌ เขียน `{filename}` ไม่สำเร็จ (ตรวจสิทธิ์ root / path)", ephemeral=True, delete_after=MSG_TTL)
         add_history("Script Added", f"{filename} → {path}")
-        await interaction.followup.send(f"✅ สร้าง `{filename}` สำเร็จ!", ephemeral=True)
+        await interaction.followup.send(f"✅ สร้าง `{filename}` สำเร็จ!", ephemeral=True, delete_after=MSG_TTL)
         log(f"เพิ่มสคริปต์: {filename}", GREEN)
 
 class DeleteScriptModal(discord.ui.Modal, title='🗑️ ลบสคริปต์ฟาร์ม'):
@@ -2023,11 +2192,11 @@ class DeleteScriptModal(discord.ui.Modal, title='🗑️ ลบสคริป�
 
     async def on_submit(self, interaction: discord.Interaction):
         if not is_authorized(interaction.user.id):
-            return await interaction.response.send_message("⛔ ไม่มีสิทธิ์", ephemeral=True)
+            return await interaction.response.send_message("⛔ ไม่มีสิทธิ์", ephemeral=True, delete_after=MSG_TTL)
         path = normalize_path(CFG.get("autoexec_path", ""))
         filename = clean_filename(self.filename_input.value)
         if not filename or not valid_path(path):
-            return await interaction.response.send_message("❌ ไม่ถูกต้อง", ephemeral=True)
+            return await interaction.response.send_message("❌ ไม่ถูกต้อง", ephemeral=True, delete_after=MSG_TTL)
 
         await interaction.response.defer(ephemeral=True)
         audit(interaction, f"del_script file={filename}")
@@ -2035,10 +2204,11 @@ class DeleteScriptModal(discord.ui.Modal, title='🗑️ ลบสคริป�
         res = await aroot(f"if [ -f {q} ]; then rm -f {q} && echo OK; else echo FAIL; fi")
         if res.strip() == 'OK':
             add_history("Script Deleted", f"{filename} → {path}")
-            await interaction.followup.send(f"🗑️ ลบ `{filename}` แล้ว!", ephemeral=True)
+            await interaction.followup.send(f"🗑️ ลบ `{filename}` แล้ว!", ephemeral=True, delete_after=MSG_TTL)
             log(f"ลบสคริปต์: {filename}", YELLOW)
         else:
-            await interaction.followup.send(f"❌ ไม่พบ `{filename}`", ephemeral=True)
+            add_history("Script Delete Failed", f"{filename}: ไม่พบไฟล์ โดย {interaction.user.name}")
+            await interaction.followup.send(f"❌ ไม่พบ `{filename}`", ephemeral=True, delete_after=MSG_TTL)
 
 class SettingsModal(discord.ui.Modal, title='⚙️ แก้ไขการตั้งค่า (Settings)'):
     def __init__(self):
@@ -2053,7 +2223,7 @@ class SettingsModal(discord.ui.Modal, title='⚙️ แก้ไขการต�
 
     async def on_submit(self, interaction: discord.Interaction):
         if not is_authorized(interaction.user.id):
-            return await interaction.response.send_message("⛔ ไม่มีสิทธิ์", ephemeral=True)
+            return await interaction.response.send_message("⛔ ไม่มีสิทธิ์", ephemeral=True, delete_after=MSG_TTL)
         errors, updates = [], {}
 
         pid = self.inp_pid.value.strip()
@@ -2093,7 +2263,7 @@ class SettingsModal(discord.ui.Modal, title='⚙️ แก้ไขการต�
             errors.append("โฟลเดอร์ไม่ถูกต้อง")
 
         if errors:
-            return await interaction.response.send_message("❌ " + ", ".join(errors), ephemeral=True)
+            return await interaction.response.send_message("❌ " + ", ".join(errors), ephemeral=True, delete_after=MSG_TTL)
 
         audit(interaction, "edit_settings")
 
@@ -2104,13 +2274,16 @@ class SettingsModal(discord.ui.Modal, title='⚙️ แก้ไขการต�
 
         CFG.update(updates)
         save_config(CFG)
-        add_history("Settings", f"โดย {interaction.user.name}")
+        add_history("Settings", f"โดย {interaction.user.name}: " + ", ".join(f"{k}={v}" for k, v in updates.items()))
         await interaction.response.send_message(
-            f"✅ **อัปเดตการตั้งค่าสำเร็จ**\n🎮 Place ID: `{CFG['place_id']}`\n⏰ บังคับรีจอย: `{CFG['auto_rejoin_hours']} ชม.`\n📂 AutoExec: `{CFG['autoexec_path']}`", ephemeral=True)
+            f"✅ **อัปเดตการตั้งค่าสำเร็จ**\n🎮 Place ID: `{CFG['place_id']}`\n⏰ บังคับรีจอย: `{CFG['auto_rejoin_hours']} ชม.`\n📂 AutoExec: `{CFG['autoexec_path']}`", ephemeral=True, delete_after=MSG_TTL)
         log("อัปเดตการตั้งค่าผ่าน Discord", GREEN)
 
 def _rejoin_in_progress():
     return bool(STATE["lock"] and STATE["lock"].locked())
+
+async def _followup_temp(interaction, content):
+    return await interaction.followup.send(content, delete_after=MSG_TTL)
 
 class RebootConfirmView(discord.ui.View):
     def __init__(self):
@@ -2119,7 +2292,7 @@ class RebootConfirmView(discord.ui.View):
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if is_authorized(interaction.user.id):
             return True
-        await interaction.response.send_message("⛔ ไม่มีสิทธิ์", ephemeral=True)
+        await interaction.response.send_message("⛔ ไม่มีสิทธิ์", ephemeral=True, delete_after=MSG_TTL)
         return False
 
     @discord.ui.button(label="✅ ยืนยันรีสตาร์ต", style=discord.ButtonStyle.danger)
@@ -2152,7 +2325,7 @@ class ControlView(discord.ui.View):
             except Exception:
                 pass
             return True
-        await interaction.response.send_message("⛔ ไม่มีสิทธิ์", ephemeral=True)
+        await interaction.response.send_message("⛔ ไม่มีสิทธิ์", ephemeral=True, delete_after=MSG_TTL)
         log(f"ปฏิเสธสิทธิ์: {interaction.user}", RED)
         return False
 
@@ -2160,20 +2333,21 @@ class ControlView(discord.ui.View):
     async def btn_stats(self, interaction, button):
         log("เช็คสถานะจากปุ่ม", YELLOW)
         await interaction.response.defer()
+        add_history("Get Stats", f"โดย {interaction.user.name}: {get_status_text()}")
         await send_bot_report(interaction.channel, "ตรวจสอบสถานะจากปุ่มกด", True)
 
     @discord.ui.button(label="🔄 Force Rejoin", style=discord.ButtonStyle.success, row=0, custom_id="btn_rejoin")
     async def btn_rejoin(self, interaction, button):
         if _rejoin_in_progress():
-            return await interaction.response.send_message("⏳ กำลัง Rejoin อยู่", ephemeral=True)
+            return await interaction.response.send_message("⏳ กำลัง Rejoin อยู่", ephemeral=True, delete_after=MSG_TTL)
         uid = interaction.user.id
         now = time.time()
         remain = REJOIN_USER_COOLDOWN - (now - STATE["rejoin_per_user"].get(uid, 0.0))
         if remain > 0:
-            return await interaction.response.send_message(f"⏳ รออีก **{remain:.0f} วินาที**", ephemeral=True)
+            return await interaction.response.send_message(f"⏳ รออีก **{remain:.0f} วินาที**", ephemeral=True, delete_after=MSG_TTL)
         STATE["rejoin_per_user"][uid] = now
         log("Force Rejoin", YELLOW)
-        await interaction.response.send_message("🔄 กำลังบังคับ Rejoin...", delete_after=30)
+        await interaction.response.send_message("🔄 กำลังบังคับ Rejoin...", delete_after=MSG_TTL)
         spawn(do_rejoin(interaction.channel, "✅ Force Rejoin เสร็จสิ้น",
                         f"กดปุ่มโดย {interaction.user.name}", force=True))
 
@@ -2183,7 +2357,7 @@ class ControlView(discord.ui.View):
         await interaction.response.defer()
         await aroot(f"am force-stop {PACKAGE_NAME}")
         add_history("Stop Game", f"โดย {interaction.user.name}")
-        await interaction.followup.send("🛑 ปิดแอปแล้ว", delete_after=30)
+        await interaction.followup.send("🛑 ปิดแอปแล้ว", delete_after=MSG_TTL)
 
     @discord.ui.button(label="🧹 Clear RAM", style=discord.ButtonStyle.secondary, row=1, custom_id="btn_ram")
     async def btn_ram(self, interaction, button):
@@ -2192,7 +2366,7 @@ class ControlView(discord.ui.View):
         await asyncio.to_thread(clear_system_ram)
         STATE["last_ram_clear"] = time.time()
         add_history("Clear RAM", f"โดย {interaction.user.name}")
-        await interaction.followup.send("🧹 เคลียร์ RAM แล้ว!", delete_after=30)
+        await interaction.followup.send("🧹 เคลียร์ RAM แล้ว!", delete_after=MSG_TTL)
 
     @discord.ui.button(label="🧹 Clean Termux", style=discord.ButtonStyle.secondary, row=1, custom_id="btn_termux_junk")
     async def btn_termux_junk(self, interaction, button):
@@ -2200,7 +2374,7 @@ class ControlView(discord.ui.View):
         await interaction.response.defer()
         await asyncio.to_thread(clear_termux_junk)
         add_history("Clean Termux", f"โดย {interaction.user.name}")
-        await interaction.followup.send("🧹 ลบขยะ Termux แล้ว!", delete_after=30)
+        await interaction.followup.send("🧹 ลบขยะ Termux แล้ว!", delete_after=MSG_TTL)
 
     @discord.ui.button(label="🗺️ Change Map", style=discord.ButtonStyle.secondary, row=1, custom_id="btn_map")
     async def btn_map(self, interaction, button):
@@ -2209,18 +2383,18 @@ class ControlView(discord.ui.View):
     @discord.ui.button(label="⏸️ Pause Auto", style=discord.ButtonStyle.secondary, row=2, custom_id="btn_pause")
     async def btn_pause(self, interaction, button):
         if _rejoin_in_progress():
-            return await interaction.response.send_message("⏳ กำลัง Rejoin", ephemeral=True)
+            return await interaction.response.send_message("⏳ กำลัง Rejoin", ephemeral=True, delete_after=MSG_TTL)
         if STATE["paused"]:
             try:
                 await interaction.message.edit(view=ControlView())
             except Exception:
                 pass
-            return await interaction.response.send_message("⚠️ Paused อยู่แล้ว", ephemeral=True)
+            return await interaction.response.send_message("⚠️ Paused อยู่แล้ว", ephemeral=True, delete_after=MSG_TTL)
         STATE["paused"] = True
         STATE["auto_paused"] = False
         add_history("Pause", f"โดย {interaction.user.name}")
         log("หยุดพักระบบ", YELLOW, force_redraw=True)
-        await interaction.response.send_message("⏸️ Pause แล้ว!", delete_after=30)
+        await interaction.response.send_message("⏸️ Pause แล้ว!", delete_after=MSG_TTL)
         try:
             await interaction.message.edit(view=ControlView())
         except Exception:
@@ -2229,13 +2403,13 @@ class ControlView(discord.ui.View):
     @discord.ui.button(label="▶️ Resume Auto", style=discord.ButtonStyle.success, row=2, custom_id="btn_resume")
     async def btn_resume(self, interaction, button):
         if _rejoin_in_progress():
-            return await interaction.response.send_message("⏳ กำลัง Rejoin", ephemeral=True)
+            return await interaction.response.send_message("⏳ กำลัง Rejoin", ephemeral=True, delete_after=MSG_TTL)
         if not STATE["paused"]:
             try:
                 await interaction.message.edit(view=ControlView())
             except Exception:
                 pass
-            return await interaction.response.send_message("⚠️ ทำงานอยู่แล้ว", ephemeral=True)
+            return await interaction.response.send_message("⚠️ ทำงานอยู่แล้ว", ephemeral=True, delete_after=MSG_TTL)
         STATE["paused"] = False
         STATE["auto_paused"] = False
         STATE["fail_count"] = 0
@@ -2247,7 +2421,7 @@ class ControlView(discord.ui.View):
         touch_heartbeat()
         add_history("Resume", f"โดย {interaction.user.name}")
         log("เดินระบบต่อ", GREEN, force_redraw=True)
-        await interaction.response.send_message("▶️ Resume แล้ว!", delete_after=30)
+        await interaction.response.send_message("▶️ Resume แล้ว!", delete_after=MSG_TTL)
         try:
             await interaction.message.edit(view=ControlView())
         except Exception:
@@ -2259,7 +2433,7 @@ class ControlView(discord.ui.View):
         await interaction.response.defer()
         await aroot(f"rm -f {GAME_LOG_DIR}/*.log {EXT_LOG_DIR}/*.log")
         add_history("Clear Logs", f"โดย {interaction.user.name}")
-        await interaction.followup.send("🗑️ ลบ Log แล้ว!", delete_after=30)
+        await interaction.followup.send("🗑️ ลบ Log แล้ว!", delete_after=MSG_TTL)
 
     @discord.ui.button(label="⚙️ Edit Settings", style=discord.ButtonStyle.secondary, row=3, custom_id="btn_settings")
     async def btn_settings(self, interaction, button):
@@ -2268,12 +2442,15 @@ class ControlView(discord.ui.View):
     @discord.ui.button(label="📂 Check AutoExec", style=discord.ButtonStyle.secondary, row=3, custom_id="btn_check_exec")
     async def btn_check_exec(self, interaction, button):
         path = normalize_path(CFG.get("autoexec_path", ""))
+        who = interaction.user.name
         await interaction.response.defer()
 
         if not path:
-            return await interaction.followup.send("❌ ยังไม่ได้ตั้งค่า AutoExec Path")
+            add_history("Check AutoExec", f"โดย {who}: ยังไม่ได้ตั้งค่า AutoExec Path")
+            return await _followup_temp(interaction, "❌ ยังไม่ได้ตั้งค่า AutoExec Path")
         if not valid_path(path):
-            return await interaction.followup.send(
+            add_history("Check AutoExec", f"โดย {who}: Path ไม่ถูกต้อง ({path})")
+            return await _followup_temp(interaction, 
                 f"❌ Path ไม่ถูกต้อง: `{path}`\n"
                 f"💡 ต้องขึ้นต้นด้วย `/sdcard`, `/storage`, `/mnt/sdcard`, `/data/media`, `/data/data/<แอป>` หรือ `/data/local/tmp`"
             )
@@ -2303,10 +2480,14 @@ class ControlView(discord.ui.View):
             msg = f"📂 **พบโฟลเดอร์** `{path}`\n```\n{body[:1600]}\n```"
             if len(lines) <= 1:
                 msg += "\n\n💡 กด **📝 Add Script** เพื่อสร้างไฟล์ (โฟลเดอร์ถูกสร้างให้อัตโนมัติ)"
-            return await interaction.followup.send(msg)
+            names = [ln.split()[-1] for ln in lines if ln.split() and not ln.startswith("total")]
+            listing = (": " + ", ".join(names[:8]) + (" ..." if len(names) > 8 else "")) if names else ""
+            add_history("Check AutoExec", f"โดย {who}: พบโฟลเดอร์ {path} ({len(names)} รายการ{listing})")
+            return await _followup_temp(interaction, msg)
 
         if "STATUS:NOT_DIR" in res:
-            return await interaction.followup.send(
+            add_history("Check AutoExec", f"โดย {who}: {path} มีอยู่แต่ไม่ใช่โฟลเดอร์")
+            return await _followup_temp(interaction, 
                 f"⚠️ `{path}` มีอยู่แต่ **ไม่ใช่โฟลเดอร์**\n"
                 f"💡 ลองแก้ path ใน **⚙️ Edit Settings**"
             )
@@ -2322,7 +2503,9 @@ class ControlView(discord.ui.View):
             p = res.split("PARENT:NOT_FOUND:")[1].split("\n")[0].strip()
             extra = f"\n\n❌ โฟลเดอร์แม่ก็ไม่มี: `{p}`"
 
-        await interaction.followup.send(
+        parent_note = "โฟลเดอร์แม่มีอยู่" if "PARENT:FOUND:" in res else "โฟลเดอร์แม่ก็ไม่มี"
+        add_history("Check AutoExec", f"โดย {who}: ไม่พบโฟลเดอร์ {path} ({parent_note})")
+        await _followup_temp(interaction, 
             f"❌ **ไม่พบโฟลเดอร์** `{path}`{extra}\n\n"
             f"💡 **วิธีสร้าง:**\n"
             f"• กดปุ่ม **📝 Add Script** (จะสร้างโฟลเดอร์ให้อัตโนมัติ)\n"
@@ -2341,7 +2524,8 @@ class ControlView(discord.ui.View):
     async def btn_history(self, interaction, button):
         await interaction.response.defer()
         if not REJOIN_HISTORY:
-            return await interaction.followup.send("📜 ยังไม่มีประวัติการทำงาน")
+            add_history("View History", f"โดย {interaction.user.name}: ยังไม่มีประวัติ")
+            return await interaction.followup.send("📜 ยังไม่มีประวัติการทำงาน", delete_after=MSG_TTL)
 
         counts = {}
         for h in REJOIN_HISTORY:
@@ -2365,7 +2549,8 @@ class ControlView(discord.ui.View):
                 break
             lines.append(entry)
             total += len(entry) + 1
-        await interaction.followup.send("\n".join(lines)[:DISCORD_MSG_LIMIT])
+        await interaction.followup.send("\n".join(lines)[:DISCORD_MSG_LIMIT], delete_after=MSG_TTL)
+        add_history("View History", f"โดย {interaction.user.name}: ดูประวัติ {min(20, len(REJOIN_HISTORY))} จาก {len(REJOIN_HISTORY)} รายการ")
 
     @discord.ui.button(label="🗑️ Clear History", style=discord.ButtonStyle.secondary, row=4, custom_id="btn_clear_history")
     async def btn_clear_history(self, interaction, button):
@@ -2374,26 +2559,29 @@ class ControlView(discord.ui.View):
         save_history()
         log(f"ล้างประวัติ {count} รายการ", YELLOW)
         add_history("History Cleared", f"โดย {interaction.user.name} ({count} รายการ)")
-        await interaction.response.send_message(f"🗑️ ล้างประวัติ {count} รายการแล้ว", delete_after=30)
+        await interaction.response.send_message(f"🗑️ ล้างประวัติ {count} รายการแล้ว", delete_after=MSG_TTL)
 
     @discord.ui.button(label="🔌 Reboot Phone", style=discord.ButtonStyle.danger, row=4, custom_id="btn_reboot")
     async def btn_reboot(self, interaction, button):
         await interaction.response.send_message(
-            "⚠️ ต้องการรีสตาร์ตมือถือจริงหรือไม่?", view=RebootConfirmView(), ephemeral=True)
+            "⚠️ ต้องการรีสตาร์ตมือถือจริงหรือไม่?", view=RebootConfirmView(), ephemeral=True, delete_after=MSG_TTL)
 
 SERVICE_NAME = "rbbot"
 _LOCK_FH = [None]
 
 def acquire_instance_lock():
     try:
-        fh = open(os.path.join(DATA_DIR, "bot.lock"), "a+")
+        fh = open(LOCK_FILE, "a+")
     except OSError:
         return True
     try:
         fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except OSError:
+    except BlockingIOError:
         fh.close()
         return False
+    except OSError:
+        fh.close()
+        return True
     try:
         fh.seek(0)
         fh.truncate()
@@ -2577,6 +2765,23 @@ def menu_3_start_bot(cfg):
 
 def _sigterm_handler(signum, frame):
     raise KeyboardInterrupt()
+
+def menu_8_storage():
+    ui_screen("ที่เก็บข้อมูล", "ตำแหน่งและชื่อไฟล์ที่ระบบสร้างไว้")
+    names = STORAGE["names"]
+    rows = [b_top(), b_row(kv("โฟลเดอร์", f"{C_OK if STORAGE['ok'] else C_WARN}{storage_location_text()}{RESET}")),
+            b_sep("ไฟล์")]
+    for role, label in (("config", "ตั้งค่า"), ("log", "log"), ("hist", "ประวัติ"), ("dash", "dash")):
+        p = os.path.join(DATA_DIR, names[role])
+        size = f"{os.path.getsize(p)} B" if os.path.isfile(p) else "ยังไม่มี"
+        rows.append(b_row(kv(label, f"{names[role]}  {C_DIM}{size}{RESET}")))
+    rows += [b_bot(), f"  {C_DIM}ตำแหน่งเต็ม: {DATA_DIR}{RESET}", ""]
+    _out(*rows)
+    if not STORAGE["ok"]:
+        ui_warn("ตอนนี้ใช้โฟลเดอร์สำรองในเครื่อง เพราะเขียนโฟลเดอร์ Download ไม่ได้")
+    ui_info("บอทแจ้งตำแหน่งนี้ใน Dashboard ของ Discord ด้วย")
+    ui_warn("อย่าลบโฟลเดอร์นี้ ถ้าลบ ค่าตั้งค่าทั้งหมดจะหาย")
+    pause_enter()
 
 def _menu_3_start_bot_impl(cfg):
     global DASHBOARD_ACTIVE, LAST_RESULT_TEXT
@@ -2960,8 +3165,15 @@ def wait_device_ready(timeout=180):
         if run_root_text("id -u", timeout=10) == "0":
             _D_RETRY_AT[0] = 0.0
             if _master_key(b"D"):
-                return True
+                if STORAGE["pending"]:
+                    init_storage()
+                    setup_log_handler()
+                if not STORAGE["pending"]:
+                    return True
         time.sleep(5)
+    if STORAGE["pending"]:
+        ui_err("เข้าถึงโฟลเดอร์ข้อมูลใน Download ไม่ได้ จึงไม่เปิดบอท (ไม่แตะไฟล์ใด ๆ)")
+        return False
     for p in (CONFIG_FILE, HISTORY_FILE, DASH_FILE):
         try:
             with open(p, "rb") as f:
@@ -2998,6 +3210,14 @@ def main():
     autostart = service or "--autostart" in sys.argv
     if autostart and not wait_device_ready():
         return
+    if STORAGE["pending"]:
+        ui_warn("เข้าถึงโฟลเดอร์ข้อมูลใน Download ไม่ได้ตอนนี้ — ใช้โฟลเดอร์สำรองชั่วคราว "
+                "(ตรวจสิทธิ์ที่เก็บข้อมูลของ Termux แล้วเปิดโปรแกรมใหม่)")
+        time.sleep(2.5)
+    elif not STORAGE["ok"]:
+        ui_warn("ไม่มีสิทธิ์เขียนโฟลเดอร์ Download — ใช้โฟลเดอร์ในเครื่องแทน "
+                "(รัน termux-setup-storage แล้วเปิดใหม่ ไฟล์จะย้ายให้เอง)")
+        time.sleep(2.5)
     ui_info("กำลังเตรียมระบบเข้ารหัสไฟล์ข้อมูล...")
     if seal_mode_now() == b"F":
         ui_warn("อ่านรหัสเครื่องผ่าน root ไม่ได้ ใช้โหมดสำรอง (ผูกกับ Termux เท่านั้น) — "
@@ -3009,6 +3229,8 @@ def main():
         time.sleep(1.5)
     CFG.update(load_config())
     load_history()
+    if MIGRATED_FILES and STORAGE["ok"]:
+        add_history("Storage Moved", f"ย้ายไฟล์ข้อมูลไปที่ {storage_location_text()}")
     seal_plain_files()
     if seal_mode_now() == b"D":
         for p in (CONFIG_FILE, HISTORY_FILE, DASH_FILE):
@@ -3029,7 +3251,7 @@ def main():
     try:
         while True:
             print_ui(CFG)
-            choice = ask("เลือกเมนู", " [0-7]")
+            choice = ask("เลือกเมนู", " [0-8]")
             if choice == "1":
                 menu_1_set_map(CFG)
             elif choice == "2":
@@ -3044,6 +3266,8 @@ def main():
                 menu_6_reboot()
             elif choice == "7":
                 menu_7_service()
+            elif choice == "8":
+                menu_8_storage()
             elif choice == "0":
                 sys.exit(0)
             elif choice:
