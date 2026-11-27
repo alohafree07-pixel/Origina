@@ -906,15 +906,19 @@ def audit(interaction, action):
         pass
 
 def safe_input(prompt_text, secret=False):
+    """Read terminal input reliably, including Android/Termux keyboards.
+
+    Termux's mobile IME can behave inconsistently when terminal echo is disabled
+    by getpass. Use normal input there so typed characters are accepted visibly.
+    Do not flush TCIFLUSH: it can discard characters already queued by the IME.
+    """
     fix_tty()
     try:
-        import termios
-        termios.tcflush(sys.stdin.fileno(), termios.TCIFLUSH)
-    except Exception:
-        pass
-    time.sleep(0.1)
-    try:
-        value = getpass.getpass(prompt_text) if secret else input(prompt_text)
+        is_termux = bool(os.environ.get("TERMUX_VERSION")) or "com.termux" in os.environ.get("PREFIX", "").lower()
+        if secret and not is_termux:
+            value = getpass.getpass(prompt_text)
+        else:
+            value = input(prompt_text)
         return value.strip()
     except EOFError:
         return ""
@@ -1789,7 +1793,7 @@ def menu_1_set_map(cfg):
 
 def menu_2_set_bot(cfg):
     ui_screen("ตั้งค่า Discord Bot", "ไม่ตั้งก็ได้ — บอทจะรันโหมด Local ให้อัตโนมัติ")
-    token = ask("Bot Token", " (ซ่อนตัวอักษร / Enter = ค่าเดิม)", secret=True)
+    token = ask("Bot Token", " (Termux: พิมพ์ได้ตามปกติ ตัวอักษรจะแสดงบนจอ / Enter = ค่าเดิม)", secret=True)
     if token:
         cfg['bot_token'] = token
     cid = ask("Channel ID", f" [{cfg['channel_id'] or '-'}]")
